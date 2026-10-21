@@ -344,6 +344,17 @@ final class MarinarUITests: XCTestCase {
         confirmation.buttons["확인"].tap()
         XCTAssertTrue(app.webViews.staticTexts["Confirmation accepted"].waitForExistence(timeout: 10))
 
+        assertActualFilePickerRoundTrip()
+    }
+
+    func testFilePickerWithoutPriorShare() throws {
+        app.launchEnvironment["MARINARA_TEST_FILE_PANEL"] = "1"
+        launchReady()
+        attachScreen("picker-only-before-input")
+        assertActualFilePickerRoundTrip()
+    }
+
+    private func assertActualFilePickerRoundTrip() {
         // Read the exact file created and verified by this installed app.
         // Using its displayed unique filename avoids a stale provider item
         // from an earlier app installation or another test launch.
@@ -360,10 +371,18 @@ final class MarinarUITests: XCTestCase {
         let fixtureStem = (fixtureFilename as NSString).deletingPathExtension
         let file = app.webViews.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'Choose File' OR label CONTAINS[c] 'Choose test file'")).firstMatch
         XCTAssertTrue(file.waitForExistence(timeout: 15), "HTML file input is missing")
+        let picker = app.otherElements["Browse View (Picker)"].firstMatch
         let cancel = openDocumentPicker(file)
         attachScreen("system-file-picker")
         cancel.tap()
-        XCTAssertTrue(export.waitForExistence(timeout: 15), "Cancelling file selection did not return to the page")
+        expectation(for: NSPredicate { _, _ in
+            !cancel.exists && !picker.exists && file.exists && file.isEnabled && file.isHittable
+        }, evaluatedWith: file)
+        waitForExpectations(timeout: 15)
+        let cancelled = XCTAttachment(string: "Native Cancel dismissed the picker; the original HTML file input is enabled and hittable.")
+        cancelled.name = "html-picker-cancelled"
+        cancelled.lifetime = .keepAlways
+        add(cancelled)
         _ = openDocumentPicker(file)
         let fixture = app.staticTexts.matching(NSPredicate(format: "label == %@ OR label == %@", fixtureFilename, fixtureStem)).firstMatch
         if !fixture.waitForExistence(timeout: 3) {
@@ -422,7 +441,6 @@ final class MarinarUITests: XCTestCase {
         // the page must still receive and read the real fixture bytes below.
         let open = app.buttons["Open"].firstMatch
         if open.waitForExistence(timeout: 5) && open.isEnabled { open.tap() }
-        let picker = app.otherElements["Browse View (Picker)"].firstMatch
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: picker)
         waitForExpectations(timeout: 15)
         let expectedJSON = #"{"fixture":"restored-file-fixture","text":"실제 파일 선택 확인"}"#
