@@ -10,8 +10,17 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     private let spinner = UIActivityIndicatorView(style: .large)
     private let retryButton = UIButton(type: .system)
     private var timer: Timer?
+    private var startup = StartupAttempt()
+    private enum StartupPhase: String { case idle, rules, cookie, health, navigation, frontend, ready, failed }
+    private var startupPhase: StartupPhase = .idle
+    private var healthTask: URLSessionDataTask?
+    private var startupNavigation: WKNavigation?
+    private var navigationPending = false
+    private var abandonedNavigations: [WKNavigation] = []
+    private var frontendCheckPending = false
+    private var loopbackRules: WKContentRuleList?
+    private var originHintInstalled = false
     private var probing = false
-    private var loaded = false
     private var webSessionReady = false
     private var active = true
     private var terminalFailure = false
@@ -19,6 +28,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     private var testSelectionInstalled = false
     #if DEBUG
     private var testImportFixtureFilename: String?
+    private var startupStallConsumed = false
     // Test outputs and configuration stay outside the user-visible Documents
     // provider. Preserve them across app launches for independent host checks.
     private static let diagnosticsDirectory: URL = {
@@ -29,8 +39,6 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         return directory
     }()
     #endif
-    private var elapsed: TimeInterval = 0
-    private var lastPoll = Date()
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var downloadURLs: [ObjectIdentifier: URL] = [:]
     private var reportedDownloadFailures = Set<ObjectIdentifier>()
@@ -104,12 +112,56 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     }
 
     func start(configuration: RuntimeConfiguration) {
+        guard !terminalFailure else { return }
+        if let existing = self.configuration,
+           existing.origin != configuration.origin || existing.token != configuration.token
+            || existing.deploymentId != configuration.deploymentId {
+            fail("실행 중인 서버 설정이 변경되었습니다. 앱을 완전히 종료한 뒤 다시 실행해 주세요.")
+            return
+        }
         self.configuration = configuration
-        if let encoded = try? JSONSerialization.data(withJSONObject: [configuration.origin.absoluteString]),
+        if !originHintInstalled,
+           let encoded = try? JSONSerialization.data(withJSONObject: [configuration.origin.absoluteString]),
            let origin = String(data: encoded, encoding: .utf8) {
             let hint = "if (location.origin === \(origin)[0]) window.__MARINARA_IOS_APP__ = true;"
             webView.configuration.userContentController.addUserScript(WKUserScript(source: hint, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+            originHintInstalled = true
         }
+        beginStartup()
+    }
+
+    private var uptime: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    private func beginStartup() {
+        guard configuration != nil, !terminalFailure else { return }
+        startup.cancel(at: uptime)
+        clearStartupWork(stopNavigation: true)
+        webSessionReady = false
+        var budget: TimeInterval = 300
+        var stallRules = false
+        #if DEBUG
+        if !startupStallConsumed && ProcessInfo.processInfo.environment["MARINARA_TEST_STARTUP_STALL"] == "rules" {
+            startupStallConsumed = true
+            stallRules = true
+            budget = 4
+        }
+        #endif
+        let generation = startup.begin(at: uptime, budget: budget, active: active)
+        overlay.isHidden = false
+        retryButton.isHidden = true
+        spinner.startAnimating()
+        status.text = "Marinar를 준비하고 있습니다…"
+        webView.accessibilityValue = "starting"
+        setStartupPhase(.rules)
+        startWatchdog()
+        // Only DEBUG's explicit one-shot test simulates a missing completion.
+        // A user retry always executes the real protected session setup.
+        guard !stallRules else { return }
+        prepareWebSession(generation: generation)
+    }
+
+    private func prepareWebSession(generation: UInt64) {
+        guard acceptsStartup(generation), let configuration = configuration else { return }
         // Only the exact localhost origin receives this HttpOnly cookie. No
         // credential is injected into JavaScript or URL query strings.
         let properties: [HTTPCookiePropertyKey: Any] = [
@@ -119,7 +171,13 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
             HTTPCookiePropertyKey("SameSite"): "Strict"
         ]
         guard let cookie = HTTPCookie(properties: properties), cookie.isHTTPOnly else {
-            fail("로컬 서버 세션을 만들 수 없습니다.")
+            fail("로컬 서버 세션을 만들 수 없습니다.", canRetry: true)
+            return
+        }
+        // This controller's origin cannot change. Keep an installed rule list
+        // active while retrying; old documents may still run subresources.
+        if loopbackRules != nil {
+            installSessionCookie(cookie, generation: generation)
             return
         }
         // HTTP cookies are scoped to hosts, not ports. Prevent an imported
@@ -133,113 +191,177 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         ]
         guard let rulesData = try? JSONSerialization.data(withJSONObject: rules),
               let rulesJSON = String(data: rulesData, encoding: .utf8) else {
-            fail("로컬 서버 세션 보호 규칙을 만들 수 없습니다.")
+            fail("로컬 서버 세션 보호 규칙을 만들 수 없습니다.", canRetry: true)
             return
         }
         WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "marinar-loopback-port", encodedContentRuleList: rulesJSON) { [weak self] list, error in
             DispatchQueue.main.async {
-                guard let self = self else { return }
+                guard let self = self, self.acceptsStartup(generation) else { return }
                 guard let list = list, error == nil else {
-                    self.fail("로컬 서버 세션 보호 규칙을 준비하지 못했습니다.")
+                    self.fail("로컬 서버 세션 보호 규칙을 준비하지 못했습니다.", canRetry: true)
                     return
                 }
                 self.webView.configuration.userContentController.add(list)
-                self.webView.configuration.websiteDataStore.httpCookieStore.setCookie(cookie) {
-                    DispatchQueue.main.async {
-                        self.webSessionReady = true
-                        self.beginPolling()
-                    }
-                }
+                self.loopbackRules = list
+                self.installSessionCookie(cookie, generation: generation)
             }
         }
     }
 
-    private func beginPolling() {
-        guard !terminalFailure else { return }
+    private func installSessionCookie(_ cookie: HTTPCookie, generation: UInt64) {
+        guard acceptsStartup(generation), loopbackRules != nil else { return }
+        setStartupPhase(.cookie)
+        webView.configuration.websiteDataStore.httpCookieStore.setCookie(cookie) { [weak self] in
+            DispatchQueue.main.async {
+                guard let self = self, self.acceptsStartup(generation) else { return }
+                self.webSessionReady = true
+                self.setStartupPhase(.health)
+                self.poll()
+            }
+        }
+    }
+
+    private func startWatchdog() {
         timer?.invalidate()
-        elapsed = 0
-        lastPoll = Date()
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.poll() }
+        let generation = startup.generation
+        let watchdog = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self = self, self.startup.accepts(generation) else { return }
+            self.poll()
+        }
+        timer = watchdog
+        RunLoop.main.add(watchdog, forMode: .common)
         poll()
     }
 
+    private func acceptsStartup(_ generation: UInt64) -> Bool {
+        guard !terminalFailure, startup.accepts(generation) else { return false }
+        if startup.isExpired(at: uptime) {
+            fail("시작 시간이 초과되었습니다. 다시 시도하거나 앱을 완전히 종료한 뒤 실행해 주세요.", canRetry: true)
+            return false
+        }
+        return true
+    }
+
     private func poll() {
-        let now = Date()
-        defer { lastPoll = now }
-        guard active, !terminalFailure, webSessionReady, let configuration = configuration, !probing else { return }
-        elapsed += now.timeIntervalSince(lastPoll)
-        if elapsed > 300 { fail("서버 시작 시간이 초과되었습니다. 다시 시도하거나 앱을 완전히 종료한 뒤 실행해 주세요.", canRetry: true); return }
+        let generation = startup.generation
+        // The deadline applies even while a WebKit or network callback is
+        // outstanding. It is independent of the request's own timeouts.
+        guard active, acceptsStartup(generation) else { return }
+        if startupPhase == .frontend { checkFrontend(generation: generation); return }
+        guard startupPhase == .health, webSessionReady, let configuration = configuration, !probing else { return }
         probing = true
         var request = URLRequest(url: configuration.origin.appendingPathComponent("api/ios/health"))
         request.setValue(configuration.token, forHTTPHeaderField: "x-marinara-ios-token")
-        session.dataTask(with: request) { [weak self] data, response, _ in
+        let task = session.dataTask(with: request) { [weak self] data, response, _ in
             DispatchQueue.main.async {
-                guard let self = self, !self.terminalFailure else { return }
+                guard let self = self, self.acceptsStartup(generation), self.startupPhase == .health else { return }
                 self.probing = false
+                self.healthTask = nil
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200, let data = data,
                       let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       body["ready"] as? Bool == true,
                       body["deploymentId"] as? String == configuration.deploymentId else { return }
-                self.timer?.invalidate()
-                self.timer = nil
-                if !self.loaded {
-                    self.status.text = "화면을 불러오고 있습니다…"
-                    self.loaded = true
-                    self.installRestoreResetIfNeeded(body["restoreAppliedAt"] as? String)
-                    if !self.testSelectionInstalled {
-                        self.installTestSelectionIfNeeded()
-                        self.testSelectionInstalled = true
-                    }
-                    self.webView.load(URLRequest(url: configuration.origin))
-                } else {
-                    self.checkFrontend()
+                self.status.text = "화면을 불러오고 있습니다…"
+                self.installRestoreResetIfNeeded(body["restoreAppliedAt"] as? String)
+                if !self.testSelectionInstalled {
+                    self.installTestSelectionIfNeeded()
+                    self.testSelectionInstalled = true
                 }
+                self.setStartupPhase(.navigation)
+                self.startupNavigation = self.webView.load(URLRequest(url: configuration.origin))
+                self.navigationPending = self.startupNavigation != nil
             }
-        }.resume()
+        }
+        healthTask = task
+        task.resume()
     }
 
-    private func checkFrontend(attempt: Int = 0) {
-        guard active, !terminalFailure else { return }
+    private func checkFrontend(generation: UInt64) {
+        guard active, acceptsStartup(generation), startupPhase == .frontend, !frontendCheckPending else { return }
+        frontendCheckPending = true
+        let navigation = startupNavigation
         webView.evaluateJavaScript("Boolean(document.getElementById('root')?.children.length && document.querySelector('button,textarea,input,a'))") { [weak self] result, _ in
-            guard let self = self, !self.terminalFailure else { return }
+            guard let self = self, self.acceptsStartup(generation), self.startupNavigation === navigation,
+                  self.startupPhase == .frontend else { return }
+            self.frontendCheckPending = false
             if result as? Bool == true {
+                guard self.startup.finish(generation, at: self.uptime) else { return }
+                self.clearStartupWork(stopNavigation: false)
+                self.navigationPending = false
+                self.setStartupPhase(.ready)
                 self.overlay.isHidden = true
+                self.spinner.stopAnimating()
                 self.webView.accessibilityValue = "ready"
                 self.installFileDiagnosticsIfNeeded()
                 self.recordRestoreDiagnosticsIfNeeded()
-            } else if attempt < 120 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.checkFrontend(attempt: attempt + 1) }
-            } else {
-                self.fail("서버는 실행 중이지만 화면을 표시하지 못했습니다. 화면을 다시 불러와 주세요.", canRetry: true)
             }
         }
     }
 
-    func fail(_ message: String, canRetry: Bool = false) {
-        guard !terminalFailure || !canRetry else { return }
+    private func clearStartupWork(stopNavigation: Bool) {
         timer?.invalidate()
         timer = nil
+        healthTask?.cancel()
+        healthTask = nil
+        probing = false
+        frontendCheckPending = false
+        if stopNavigation {
+            if let navigation = startupNavigation {
+                abandonedNavigations.append(navigation)
+                abandonedNavigations = Array(abandonedNavigations.suffix(16))
+            }
+            startupNavigation = nil
+            navigationPending = false
+            webView.stopLoading()
+        }
+    }
+
+    private func setStartupPhase(_ phase: StartupPhase) {
+        startupPhase = phase
+        recordStartupState()
+    }
+
+    private func recordStartupState() {
+        #if DEBUG
+        // No URLs, tokens, API credentials or user content enter diagnostics.
+        NSLog("[Marinar startup] attempt=%llu phase=%@ state=%@ active=%d", startup.generation,
+              startupPhase.rawValue, startup.status.rawValue, active ? 1 : 0)
+        let record: [String: Any] = ["generation": startup.generation, "phase": startupPhase.rawValue,
+            "state": startup.status.rawValue, "active": active, "elapsedActive": startup.elapsed(at: uptime),
+            "budget": startup.budget, "terminalFailure": terminalFailure, "injectedStall": startupStallConsumed,
+            "pid": ProcessInfo.processInfo.processIdentifier]
+        if let data = try? JSONSerialization.data(withJSONObject: record) {
+            try? data.write(to: Self.diagnosticsDirectory.appendingPathComponent("startup-state.json"), options: .atomic)
+        }
+        #endif
+    }
+
+    func fail(_ message: String, canRetry: Bool = false) {
+        guard !terminalFailure || !canRetry else { return }
+        if !startup.fail(startup.generation, at: uptime) {
+            // An external fatal error (for example Node exiting) also retires
+            // a previously ready screen. Its completed attempt cannot resume.
+            startup.cancel(at: uptime)
+        }
+        clearStartupWork(stopNavigation: true)
         overlay.isHidden = false
         spinner.stopAnimating()
         status.text = message
         terminalFailure = !canRetry
         retryButton.isHidden = !canRetry
         webView.accessibilityValue = "failed"
+        setStartupPhase(.failed)
     }
 
     @objc private func retryFrontend() {
-        guard webSessionReady, !terminalFailure else { return }
-        loaded = false
-        webView.stopLoading()
-        retryButton.isHidden = true
-        spinner.startAnimating()
-        status.text = "화면을 다시 불러오고 있습니다…"
-        webView.accessibilityValue = "starting"
-        beginPolling()
+        guard configuration != nil, !terminalFailure else { return }
+        beginStartup()
     }
 
     func enteredBackground() {
         active = false
+        startup.pause(at: uptime)
+        recordStartupState()
         guard let configuration = configuration, backgroundTask == .invalid else { return }
         // iOS may suspend the process shortly. Request an actual durable flush
         // while the finite background grace period is available.
@@ -286,27 +408,66 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
 
     func becameActive() {
         active = true
-        if webSessionReady && !terminalFailure { beginPolling() }
+        startup.resume(at: uptime)
+        recordStartupState()
+        if startup.status == .running && !terminalFailure { poll() }
         presentNextShare()
     }
 
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { checkFrontend() }
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        guard webView === self.webView, let navigation = navigation, !terminalFailure,
+              !abandonedNavigations.contains(where: { $0 === navigation }) else { return }
+        guard startup.status == .ready || (startup.status == .running
+              && (startupPhase == .navigation || startupPhase == .frontend)) else { return }
+        if let previous = startupNavigation, previous !== navigation {
+            abandonedNavigations.append(previous)
+            abandonedNavigations = Array(abandonedNavigations.suffix(16))
+        }
+        startupNavigation = navigation
+        navigationPending = true
+        frontendCheckPending = false
+        if startup.status == .running { setStartupPhase(.navigation) }
+        // A ready page may navigate to a downloadable response. Keep that page
+        // ready until a replacement document actually finishes; WKDownload
+        // conversions never produce didFinish and must not leave an overlay.
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard webView === self.webView, let navigation = navigation, startupNavigation === navigation,
+              navigationPending, !terminalFailure else { return }
+        if startup.status == .ready {
+            startup.begin(at: uptime, active: active)
+            setStartupPhase(.frontend)
+            startWatchdog()
+        }
+        guard acceptsStartup(startup.generation) else { return }
+        setStartupPhase(.frontend)
+        checkFrontend(generation: startup.generation)
+    }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        if (error as NSError).code != NSURLErrorCancelled { fail("화면 연결 실패: \(error.localizedDescription)", canRetry: true) }
+        guard webView === self.webView, let navigation = navigation, startupNavigation === navigation,
+              navigationPending, !terminalFailure, (error as NSError).code != NSURLErrorCancelled else { return }
+        if startup.status == .ready { startup.begin(at: uptime, active: active) }
+        if acceptsStartup(startup.generation) { fail("화면 연결 실패: \(error.localizedDescription)", canRetry: true) }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        if (error as NSError).code != NSURLErrorCancelled { fail("화면 로드 실패: \(error.localizedDescription)", canRetry: true) }
+        guard webView === self.webView, let navigation = navigation, startupNavigation === navigation,
+              navigationPending, !terminalFailure, (error as NSError).code != NSURLErrorCancelled else { return }
+        if startup.status == .ready { startup.begin(at: uptime, active: active) }
+        if acceptsStartup(startup.generation) { fail("화면 로드 실패: \(error.localizedDescription)", canRetry: true) }
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        guard !terminalFailure else { return }
-        loaded = false
-        overlay.isHidden = false
-        spinner.startAnimating()
+        guard webView === self.webView, !terminalFailure,
+              startup.status == .running || startup.status == .ready else { return }
+        if startup.status == .running {
+            fail("화면 준비가 중단되었습니다. 화면을 다시 불러와 주세요.", canRetry: true)
+            return
+        }
+        beginStartup()
         status.text = "화면을 복구하고 있습니다…"
-        beginPolling()
     }
 
     private func isLocal(_ url: URL) -> Bool {

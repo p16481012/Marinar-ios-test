@@ -64,7 +64,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: [primary, compact-phone, ipad]
+        profile: [primary, compact-phone, ipad, startup-recovery]
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
     steps:
@@ -82,6 +82,12 @@ jobs:
           uname -m
           xcodebuild -version
       - run: node ios-app/scripts/download-node.mjs
+      - name: Verify startup deadline state transitions
+        if: matrix.profile == 'startup-recovery'
+        run: |
+          mkdir -p ios-app/build/validation/startup-recovery
+          xcrun swiftc ios-app/App/StartupAttempt.swift ios-app/Tests/StartupAttemptTests.swift -o ios-app/build/startup-state-tests
+          ios-app/build/startup-state-tests > ios-app/build/validation/startup-recovery/startup-state-tests.json
       - run: node ios-app/scripts/validate-simulator.mjs --simulator-ui --software-keyboard --profile ${{ matrix.profile }} --report-dir ios-app/build/validation/${{ matrix.profile }} --derived-data ios-app/build/DerivedData-${{ matrix.profile }}
         timeout-minutes: 28
       - uses: actions/upload-artifact@v4
@@ -91,6 +97,8 @@ jobs:
           path: |
             ios-app/build/validation/**/simulator-validation.json
             ios-app/build/validation/**/*export-events*.json
+            ios-app/build/validation/**/*startup-state*.json
+            ios-app/build/validation/**/*startup-live.log
             ios-app/build/validation/**/*ui-tests.log
             ios-app/build/validation/**/*file-picker.log
             ios-app/build/validation/**/*build.log

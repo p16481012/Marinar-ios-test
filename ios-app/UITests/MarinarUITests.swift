@@ -38,6 +38,47 @@ final class MarinarUITests: XCTestCase {
         waitForExpectations(timeout: 300)
     }
 
+    func testStartupTimeoutCanRetryBeforeSessionReady() throws {
+        app.terminate()
+        app.launchEnvironment["MARINARA_TEST_STARTUP_STALL"] = "rules"
+        defer { app.launchEnvironment.removeValue(forKey: "MARINARA_TEST_STARTUP_STALL") }
+        app.launch()
+
+        let webView = app.webViews["marinar-webview"]
+        let status = app.staticTexts["marinar-startup-status"]
+        let retry = app.buttons["marinar-retry"]
+        // The one-shot DEBUG stall withholds session preparation. Observe the
+        // real watchdog's failure and native control before touching Retry.
+        XCTAssertTrue(retry.waitForExistence(timeout: 120), "Startup before session readiness never exposed Retry")
+        XCTAssertTrue(status.exists)
+        XCTAssertTrue(status.label.contains("초과"), "The startup watchdog did not show its timeout failure")
+        XCTAssertEqual(webView.value as? String, "failed")
+        XCTAssertTrue(retry.isEnabled && retry.isHittable, "Retry was not available before the session was ready")
+        attachScreen("startup-timeout-before-session-ready")
+        attachGeometry("startup-timeout-retry-geometry", elements: [("status", status), ("retry", retry)])
+
+        retry.tap()
+        expectation(for: NSPredicate(format: "value == %@", "ready"), evaluatedWith: webView)
+        waitForExpectations(timeout: 300)
+        // Stay in this process: no second app launch, fake cookie, navigation,
+        // DOM success injection, or automatic retry can complete this check.
+        expectation(for: NSPredicate { _, _ in
+            webView.buttons.allElementsBoundByIndex.contains { button in
+                button.exists && button.isEnabled && button.isHittable
+                    && button.frame.width > 0 && button.frame.height > 0
+            }
+        }, evaluatedWith: webView)
+        waitForExpectations(timeout: 30)
+        XCTAssertEqual(app.state, .runningForeground)
+        XCTAssertFalse(retry.exists, "Retry remained visible after real frontend readiness")
+        XCTAssertFalse(status.isHittable, "The native startup overlay still covered the recovered frontend")
+        attachScreen("startup-recovered-after-native-retry")
+        let hierarchy = XCTAttachment(string: app.debugDescription)
+        hierarchy.name = "startup-recovered-accessibility-hierarchy"
+        hierarchy.lifetime = .keepAlways
+        add(hierarchy)
+    }
+
     private func attachScreen(_ name: String) {
         // Capture the whole display; an application's accessibility frame can
         // retain portrait bounds while UIKit rotates, cropping the evidence.

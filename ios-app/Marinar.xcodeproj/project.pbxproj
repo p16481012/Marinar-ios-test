@@ -12,6 +12,7 @@
   A00000000000000000000006 = {isa = PBXBuildFile; fileRef = B00000000000000000000006; };
   A00000000000000000000007 = {isa = PBXBuildFile; fileRef = B00000000000000000000006; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
   A00000000000000000000008 = {isa = PBXBuildFile; fileRef = B00000000000000000000008; };
+  A0000000000000000000000E = {isa = PBXBuildFile; fileRef = B0000000000000000000000E; };
   B00000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/AppDelegate.swift; sourceTree = "<group>"; };
   B00000000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/Runtime.swift; sourceTree = "<group>"; };
   B00000000000000000000003 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/MarinarViewController.swift; sourceTree = "<group>"; };
@@ -24,9 +25,10 @@
   B0000000000000000000000B = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
   B0000000000000000000000C = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = App/NodeBridge.h; sourceTree = "<group>"; };
   B0000000000000000000000D = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = App/Marinar-Bridging-Header.h; sourceTree = "<group>"; };
-  C00000000000000000000001 = {isa = PBXGroup; children = (B00000000000000000000001, B00000000000000000000002, B00000000000000000000003, B00000000000000000000004, B0000000000000000000000C, B0000000000000000000000D, B00000000000000000000005, B00000000000000000000006, B00000000000000000000008, B0000000000000000000000B, C00000000000000000000002, ); sourceTree = "<group>"; };
+  B0000000000000000000000E = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/StartupAttempt.swift; sourceTree = "<group>"; };
+  C00000000000000000000001 = {isa = PBXGroup; children = (B00000000000000000000001, B00000000000000000000002, B00000000000000000000003, B0000000000000000000000E, B00000000000000000000004, B0000000000000000000000C, B0000000000000000000000D, B00000000000000000000005, B00000000000000000000006, B00000000000000000000008, B0000000000000000000000B, C00000000000000000000002, ); sourceTree = "<group>"; };
   C00000000000000000000002 = {isa = PBXGroup; name = Products; children = (B00000000000000000000009, B0000000000000000000000A, ); sourceTree = "<group>"; };
-  D00000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000001, A00000000000000000000002, A00000000000000000000003, A00000000000000000000004, ); runOnlyForDeploymentPostprocessing = 0; };
+  D00000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000001, A00000000000000000000002, A00000000000000000000003, A0000000000000000000000E, A00000000000000000000004, ); runOnlyForDeploymentPostprocessing = 0; };
   D00000000000000000000002 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000006, ); runOnlyForDeploymentPostprocessing = 0; };
   D00000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000005, ); runOnlyForDeploymentPostprocessing = 0; };
   D00000000000000000000004 = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 10; files = (A00000000000000000000007, ); name = "Embed Frameworks"; runOnlyForDeploymentPostprocessing = 0; };

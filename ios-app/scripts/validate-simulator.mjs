@@ -33,12 +33,13 @@ const option = (name) => options.get(name);
 const profile = option('--profile') ?? 'all';
 const simulatorUI = options.has('--simulator-ui');
 const softwareKeyboard = options.has('--software-keyboard');
-assert.ok(['all', 'primary', 'compact-phone', 'ipad'].includes(profile),
-  '--profile must be all, primary, compact-phone or ipad');
+assert.ok(['all', 'primary', 'compact-phone', 'ipad', 'startup-recovery'].includes(profile),
+  '--profile must be all, primary, compact-phone, ipad or startup-recovery');
 if (options.has('--help')) {
-  console.log('Usage: node ios-app/scripts/validate-simulator.mjs [--profile all|primary|compact-phone|ipad] [--report-dir PATH] [--derived-data PATH] [--device-id UUID] [--simulator-ui] [--software-keyboard]\n'
+  console.log('Usage: node ios-app/scripts/validate-simulator.mjs [--profile all|primary|compact-phone|ipad|startup-recovery] [--report-dir PATH] [--derived-data PATH] [--device-id UUID] [--simulator-ui] [--software-keyboard]\n'
     + 'Default profile: all. primary runs embedded API, chat, file transfer and full restore checks.\n'
     + 'compact-phone and ipad run only their own seeded native UI checks; ipad also checks file transfer.\n'
+    + 'startup-recovery checks a bounded startup failure and manual retry into the real WebView.\n'
     + 'Default mode: headless. --simulator-ui launches the selected Xcode Simulator.app before boot.\n'
     + '--software-keyboard requires CI=true and --simulator-ui, and cannot be used with --device-id. It disables hardware keyboards for fresh CI devices.\n'
     + 'Use a separate --report-dir and --derived-data for each independent worker.');
@@ -50,7 +51,7 @@ if (softwareKeyboard) {
   assert.ok(!option('--device-id'), '--software-keyboard cannot modify an existing --device-id');
 }
 const runsPrimary = profile === 'all' || profile === 'primary';
-const requestedVariants = profile === 'all' ? ['compact-phone', 'ipad'] : runsPrimary ? [] : [profile];
+const requestedVariants = profile === 'all' ? ['compact-phone', 'ipad', 'startup-recovery'] : runsPrimary ? [] : [profile];
 const reportDir = path.resolve(option('--report-dir') ?? path.join(root, 'ios-app/build/validation'));
 const derived = path.resolve(option('--derived-data') ?? path.join(root, 'ios-app/build/DerivedData'));
 const bundleId = 'com.p16481012.marinar.ios.test';
@@ -64,6 +65,7 @@ let container;
 let launchNumber = 0;
 const launchLogs = [];
 const exportedResultBundles = new Set();
+const liveLogs = new Map();
 let attachmentExportSupported;
 const report = { formatVersion: 1, profile, simulatorMode: simulatorUI ? 'simulator-ui' : 'headless',
   requestedSuites: [...(runsPrimary ? ['primary'] : []), ...requestedVariants],
@@ -71,7 +73,7 @@ const report = { formatVersion: 1, profile, simulatorMode: simulatorUI ? 'simula
   actualEmbeddedNode: false, actualWKWebView: false, nativeSendInteraction: false,
   nativeBlobDownload: false, nativeShareSheet: false, systemFilePicker: false, nativeDialogs: false,
   nativeBackgroundFlush: false,
-  nativeFullRestore: false, restoredWebCacheReset: false,
+  nativeFullRestore: false, restoredWebCacheReset: false, startupTimeoutRecovery: false,
   externalProvider: false, physicalDevice: false, provider: 'local OpenAI-compatible fixture',
 } };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -168,10 +170,55 @@ async function run(command, commandArgs, { log, allowFailure = false, env, timeo
   }
   // A timeout is never an acceptable nonzero result (even in best-effort
   // cleanup); its caller can catch it explicitly and retain the failure.
-  if (timedOut) throw new Error(`${commandLabel} timed out after ${timeoutMs} ms${log ? `; see ${log}` : ''}`);
+  if (timedOut) throw Object.assign(new Error(`${commandLabel} timed out after ${timeoutMs} ms${log ? `; see ${log}` : ''}`), { code: 'COMMAND_TIMEOUT' });
   if (spawnError) throw spawnError;
   if (code !== 0 && !allowFailure) throw new Error(`${command} exited ${code}${log ? `; see ${log}` : `: ${text.slice(-2000)}`}`);
   return text;
+}
+
+// Stream sparse native startup messages while the tests are running. A later
+// XCTest/AX stall or workflow cancellation must not erase the last native
+// state. This observes unified logging and never changes the app's behavior.
+async function startLiveLog(targetDeviceId, label) {
+  if (liveLogs.has(targetDeviceId)) return;
+  const filename = `${label}-startup-live.log`;
+  const output = createWriteStream(path.join(reportDir, filename));
+  const child = spawn('xcrun', ['simctl', 'spawn', targetDeviceId, 'log', 'stream',
+    '--style', 'compact', '--level', 'info', '--predicate', 'process == "Marinar"'],
+  { cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  const metadata = { deviceId: targetDeviceId, file: filename, startedAt: new Date().toISOString() };
+  report.liveDiagnostics ??= [];
+  report.liveDiagnostics.push(metadata);
+  const item = { child, output, metadata, stopped: false };
+  liveLogs.set(targetDeviceId, item);
+  for (const pipe of [child.stdout, child.stderr]) pipe.on('data', bytes => output.write(bytes));
+  child.on('error', error => { metadata.error = error.code ?? error.name; });
+  output.on('error', error => { metadata.writeError = error.code ?? error.name; });
+  item.closed = new Promise(resolve => child.once('close', code => {
+    item.exited = true;
+    metadata.exitCode = code;
+    metadata.endedAt = new Date().toISOString();
+    resolve();
+  }));
+  await checkpoint();
+}
+
+async function stopLiveLog(targetDeviceId) {
+  const item = liveLogs.get(targetDeviceId);
+  if (!item || item.stopped) return;
+  item.stopped = true;
+  const signal = name => {
+    if (!item.child.pid || item.exited) return;
+    try { process.kill(-item.child.pid, name); }
+    catch (error) { if (error.code !== 'ESRCH') item.metadata.stopError = error.code ?? error.name; }
+  };
+  signal('SIGTERM');
+  let timer;
+  await Promise.race([item.closed, new Promise(resolve => { timer = setTimeout(resolve, 5_000); })]);
+  clearTimeout(timer);
+  if (item.metadata.exitCode === undefined) signal('SIGKILL');
+  item.child.stdout.destroy(); item.child.stderr.destroy();
+  await new Promise(resolve => item.output.end(resolve));
 }
 
 async function configureSoftwareKeyboard(targetDeviceId) {
@@ -258,6 +305,8 @@ async function runUITests(commandArgs, { phase, log, expectedTests }) {
     if (status !== 'passed') recordFailure(`${phase}/${name}`, new Error(`XCTest ${status}; see ${log}`));
   }
   await checkpoint();
+  // Copy native state before any potentially slow xcresult/AX diagnostics.
+  await preserveLaunchLogs();
   if (['testBlobDownloadShareAndFilePicker', 'testHTMLFilePickerRoundTrip', 'testSystemFilesProviderCanOpenFixture']
     .some((name) => tests[name] && tests[name] !== 'passed')) {
     // The picker is hosted by a system service. App-only logs cannot explain
@@ -274,6 +323,10 @@ async function runUITests(commandArgs, { phase, log, expectedTests }) {
   if (bundleIndex >= 0 && commandArgs[bundleIndex + 1]) {
     await exportTestAttachments(path.resolve(root, commandArgs[bundleIndex + 1]));
   }
+  // A stuck XCTest runner has already failed this profile. Stop here so its
+  // diagnostics can be uploaded instead of exhausting the workflow's limit
+  // in another UI suite. All suites remain mandatory on a successful run.
+  if (commandError?.code === 'COMMAND_TIMEOUT') throw commandError;
   return new Set(Object.keys(tests).filter((name) => tests[name] === 'passed'));
 }
 
@@ -293,6 +346,10 @@ async function launch() {
   await run('xcrun', ['simctl', 'launch', `--stdout=${stdout}`, `--stderr=${stderr}`, deviceId, bundleId], {
     env: { SIMCTL_CHILD_MARINARA_TEST_DIAGNOSTICS: '1' },
   });
+  return await waitForRuntime();
+}
+
+async function waitForRuntime() {
   const deadline = Date.now() + 300_000;
   let lastFailure = 'runtime preparation has not completed';
   while (Date.now() < deadline) {
@@ -334,8 +391,9 @@ async function preserveLaunchLogs() {
   for (const file of launchLogs) await copyFile(file, path.join(reportDir, path.basename(file))).catch(() => {});
   if (deviceId) {
     const current = await run('xcrun', ['simctl', 'get_app_container', deviceId, bundleId, 'data']).catch(() => undefined);
-    if (current) await copyFile(diagnosticFile('ios-export-events.json', current),
-      path.join(reportDir, `${deviceId}-ios-export-events.json`)).catch(() => {});
+    if (current) for (const name of ['ios-export-events.json', 'startup-state.json']) {
+      await copyFile(diagnosticFile(name, current), path.join(reportDir, `${deviceId}-${name}`)).catch(() => {});
+    }
   }
 }
 
@@ -661,6 +719,8 @@ try {
       ?? devicetypes.find((item) => item.identifier.endsWith('.iPhone-13-mini')), files: false },
     { key: 'ipad', type: devicetypes.find((item) => item.identifier.endsWith('.iPad-mini-A17-Pro'))
       ?? devicetypes.find((item) => item.name.startsWith('iPad')), files: true },
+    { key: 'startup-recovery', type: devicetypes.find((item) => item.identifier.endsWith('.iPhone-16-Pro'))
+      ?? devicetypes.find((item) => item.name.startsWith('iPhone')), files: false, startup: true },
   ].filter((variant) => requestedVariants.includes(variant.key));
   const standaloneVariant = runsPrimary ? undefined : variants[0];
   if (standaloneVariant) assert.ok(standaloneVariant.type, `Required ${profile} simulator type is unavailable`);
@@ -693,6 +753,7 @@ try {
   if (simulatorUI) await launchSimulatorUI(deviceId);
   await run('xcrun', ['simctl', 'boot', deviceId], { allowFailure: true });
   await run('xcrun', ['simctl', 'bootstatus', deviceId, '-b'], { log: 'simulator-boot.log' });
+  await startLiveLog(deviceId, profile);
   console.log('Building the native app and UI test bundle.');
   await checkpoint('native-build');
   const buildArgs = ['-project', project, '-scheme', 'Marinar', '-configuration', 'Debug',
@@ -713,7 +774,8 @@ try {
     try {
       await checkpoint(`${variant.key}-setup`);
       assert.ok(variant.type, `Required ${variant.key} simulator type is unavailable`);
-      console.log(`Checking ${variant.key} portrait/landscape keyboard${variant.files ? ', blob export and system picker' : ''} with the existing build.`);
+      console.log(variant.startup ? 'Checking startup timeout and a real manual retry before session preparation.'
+        : `Checking ${variant.key} portrait/landscape keyboard${variant.files ? ', blob export and system picker' : ''} with the existing build.`);
       if (standaloneVariant) variantDevice = deviceId;
       else {
         variantDevice = await run('xcrun', ['simctl', 'create', `Marinar-${variant.key}-${Date.now()}`, variant.type.identifier, selectedRuntime.identifier]);
@@ -722,17 +784,46 @@ try {
         if (simulatorUI) await launchSimulatorUI(deviceId);
         await run('xcrun', ['simctl', 'boot', deviceId], { allowFailure: simulatorUI });
         await run('xcrun', ['simctl', 'bootstatus', deviceId, '-b'], { log: `${variant.key}-boot.log` });
+        await startLiveLog(deviceId, variant.key);
       }
       result.deviceId = deviceId;
       await run('xcrun', ['simctl', 'install', deviceId, path.join(derived, 'Build/Products/Debug-iphonesimulator/Marinar.app')]);
+      const argsForDevice = [...buildArgs];
+      argsForDevice[argsForDevice.indexOf('-destination') + 1] = `platform=iOS Simulator,id=${deviceId}`;
+      if (variant.startup) {
+        await launch();
+        report.coverage.actualEmbeddedNode = true;
+        result.checks.push('native-node-authenticated-health-before-recovery');
+        await stop();
+        await preserveLaunchLogs();
+        const tests = await runUITests(['test-without-building', ...argsForDevice,
+          '-parallel-testing-enabled', 'NO', '-maximum-concurrent-test-simulator-destinations', '1',
+          '-only-testing:MarinarUITests/MarinarUITests/testStartupTimeoutCanRetryBeforeSessionReady',
+          '-resultBundlePath', path.join(reportDir, 'startup-recovery.xcresult')], {
+          phase: 'startup-recovery', log: 'startup-recovery-ui-tests.log',
+          expectedTests: ['testStartupTimeoutCanRetryBeforeSessionReady'],
+        });
+        if (tests.has('testStartupTimeoutCanRetryBeforeSessionReady')) {
+          container = await run('xcrun', ['simctl', 'get_app_container', deviceId, bundleId, 'data']);
+          const finalState = JSON.parse(await readFile(diagnosticFile('startup-state.json'), 'utf8'));
+          assert.equal(finalState.state, 'ready');
+          assert.equal(finalState.phase, 'ready');
+          assert.equal(finalState.budget, 300);
+          assert.equal(finalState.terminalFailure, false);
+          assert.equal(finalState.injectedStall, true, 'Expected the fault/retry process, not the earlier normal launch');
+          assert.ok(finalState.generation >= 2, 'Manual retry did not start a new attempt');
+          Object.assign(report.coverage, { actualWKWebView: true, startupTimeoutRecovery: true });
+          result.checks.push('startup-timeout-before-cookie-shows-retry', 'manual-retry-reaches-real-webview',
+            'recovered-native-state-restores-normal-budget');
+        }
+        continue;
+      }
       const config = await launch();
       report.coverage.actualEmbeddedNode = true;
       result.checks.push('native-node-startup-and-authenticated-health');
       await prepareUI(config, path.join(reportDir, `${variant.key}-seed.json`));
       await stop();
       await preserveLaunchLogs();
-      const argsForDevice = [...buildArgs];
-      argsForDevice[argsForDevice.indexOf('-destination') + 1] = `platform=iOS Simulator,id=${deviceId}`;
       const tests = await runUITests(['test-without-building', ...argsForDevice,
         '-parallel-testing-enabled', 'NO', '-maximum-concurrent-test-simulator-destinations', '1',
         '-only-testing:MarinarUITests/MarinarUITests/testComposerAcrossOrientations',
@@ -758,6 +849,7 @@ try {
     } catch (error) { recordFailure(variant.key, error); }
     finally {
       if (variantDevice) {
+        await stopLiveLog(variantDevice);
         await run('xcrun', ['simctl', 'io', variantDevice, 'screenshot', path.join(reportDir, `${variant.key}-screen.png`)], { allowFailure: true }).catch(() => {});
         await run('xcrun', ['simctl', 'spawn', variantDevice, 'log', 'show', '--last', '15m', '--style', 'compact', '--predicate', 'process == "Marinar"'], { log: `${variant.key}-app.log`, allowFailure: true }).catch(() => {});
         await stop().catch(() => {});
@@ -779,6 +871,7 @@ try {
   process.exitCode = 1;
 } finally {
   await checkpoint('collecting-artifacts');
+  for (const logged of liveLogs.keys()) await stopLiveLog(logged);
   if (process.platform === 'darwin') await exportTestAttachments().catch((error) => {
     console.warn(`Could not export XCTest attachments: ${error.message}`);
   });
