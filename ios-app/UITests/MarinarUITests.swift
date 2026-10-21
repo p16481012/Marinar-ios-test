@@ -74,10 +74,50 @@ final class MarinarUITests: XCTestCase {
             ("input", input), ("keyboard", app.keyboards.firstMatch), ("send", app.webViews.buttons["Send"].firstMatch)])
     }
 
+    private func prepareComposerForInput() -> XCUIElement {
+        let input = app.webViews.textViews.firstMatch
+        let welcome = app.webViews.staticTexts["Welcome to Marinara Engine!"].firstMatch
+        let skipTutorial = app.webViews.buttons["Skip Tutorial"].firstMatch
+        let closeChats = app.webViews.buttons["Close chats"].firstMatch
+        let deadline = Date().addingTimeInterval(60)
+        var readySince: Date?
+        var skippedTutorial = false
+        var closedChats = false
+        while Date() < deadline {
+            // Native "ready" means React has rendered controls, not that its
+            // asynchronously hydrated tutorial and mobile sidebar are closed.
+            // Dismiss only the actual controls observed in the failed UI.
+            if welcome.exists {
+                readySince = nil
+                if !skippedTutorial && skipTutorial.exists && skipTutorial.isEnabled && skipTutorial.isHittable {
+                    attachScreen("composer-before-skip-tutorial")
+                    skipTutorial.tap()
+                    skippedTutorial = true
+                }
+            } else if closeChats.exists {
+                readySince = nil
+                if !closedChats && closeChats.isEnabled && closeChats.isHittable {
+                    attachScreen("composer-before-close-chats")
+                    closeChats.tap()
+                    closedChats = true
+                }
+            } else if input.exists && input.isEnabled && input.isHittable
+                        && input.frame.width > 0 && input.frame.height > 0 {
+                if let readySince, Date().timeIntervalSince(readySince) >= 1 { return input }
+                if readySince == nil { readySince = Date() }
+            } else {
+                readySince = nil
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        }
+        attachKeyboardDiagnostics("composer-input-not-ready")
+        XCTFail("The real chat composer did not become hittable after closing the observed tutorial and chat list")
+        return input
+    }
+
     func testSendPersistsAfterProcessRelaunch() throws {
         launchReady()
-        let input = app.webViews.textViews.firstMatch
-        XCTAssertTrue(input.waitForExistence(timeout: 60), "Actual chat composer missing after fixture chat selection")
+        let input = prepareComposerForInput()
         input.tap()
         prepareSoftwareKeyboard()
         input.typeText(prompt)
@@ -215,8 +255,7 @@ final class MarinarUITests: XCTestCase {
     func testComposerAcrossOrientations() throws {
         launchReady()
         waitForAppOrientation(landscape: false)
-        let input = app.webViews.textViews.firstMatch
-        XCTAssertTrue(input.waitForExistence(timeout: 60))
+        let input = prepareComposerForInput()
         input.tap()
         prepareSoftwareKeyboard()
         input.typeText("Layout check")

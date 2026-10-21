@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { copyFile, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startMockProvider, STREAM_PROMPT, STREAM_REPLY, RESTORE_PROMPT, RESTORE_REPLY } from '../../scripts/ios/mock-openai-provider.mjs';
@@ -18,6 +18,11 @@ const options = new Map();
 for (let index = 0; index < args.length; index += 1) {
   const name = args[index];
   if (name === '--help') { options.set(name, true); continue; }
+  if (name === '--simulator-ui') {
+    assert.ok(!options.has(name), `Duplicate option: ${name}`);
+    options.set(name, true);
+    continue;
+  }
   assert.ok(valueOptions.has(name), `Unknown option: ${name}`);
   assert.ok(!options.has(name), `Duplicate option: ${name}`);
   const value = args[++index];
@@ -26,12 +31,14 @@ for (let index = 0; index < args.length; index += 1) {
 }
 const option = (name) => options.get(name);
 const profile = option('--profile') ?? 'all';
+const simulatorUI = options.has('--simulator-ui');
 assert.ok(['all', 'primary', 'compact-phone', 'ipad'].includes(profile),
   '--profile must be all, primary, compact-phone or ipad');
 if (options.has('--help')) {
-  console.log('Usage: node ios-app/scripts/validate-simulator.mjs [--profile all|primary|compact-phone|ipad] [--report-dir PATH] [--derived-data PATH] [--device-id UUID]\n'
+  console.log('Usage: node ios-app/scripts/validate-simulator.mjs [--profile all|primary|compact-phone|ipad] [--report-dir PATH] [--derived-data PATH] [--device-id UUID] [--simulator-ui]\n'
     + 'Default profile: all. primary runs embedded API, chat, file transfer and full restore checks.\n'
     + 'compact-phone and ipad run only their own seeded native UI checks; ipad also checks file transfer.\n'
+    + 'Default mode: headless. --simulator-ui launches the selected Xcode Simulator.app before boot.\n'
     + 'Use a separate --report-dir and --derived-data for each independent worker.');
   process.exit(0);
 }
@@ -50,7 +57,8 @@ let launchNumber = 0;
 const launchLogs = [];
 const exportedResultBundles = new Set();
 let attachmentExportSupported;
-const report = { formatVersion: 1, profile, requestedSuites: [...(runsPrimary ? ['primary'] : []), ...requestedVariants],
+const report = { formatVersion: 1, profile, simulatorMode: simulatorUI ? 'simulator-ui' : 'headless',
+  requestedSuites: [...(runsPrimary ? ['primary'] : []), ...requestedVariants],
   status: 'running', checks: [], errors: [], uiTests: [], screenVariants: [], coverage: {
   actualEmbeddedNode: false, actualWKWebView: false, nativeSendInteraction: false,
   nativeBlobDownload: false, nativeShareSheet: false, systemFilePicker: false, nativeDialogs: false,
@@ -85,7 +93,10 @@ function commandTimeout(command, commandArgs) {
 
 async function run(command, commandArgs, { log, allowFailure = false, env, timeoutMs = commandTimeout(command, commandArgs) } = {}) {
   assert.ok(Number.isFinite(timeoutMs) && timeoutMs > 0, 'Command timeout must be positive milliseconds');
-  report.command = { name: command, ...(log ? { log } : {}), startedAt: new Date().toISOString(), timeoutMs, status: 'running' };
+  // These arguments are tool names, simulator IDs and paths. Runtime tokens
+  // are passed separately through env and must never enter the report.
+  const commandLabel = [command, ...commandArgs.slice(0, 3)].join(' ');
+  report.command = { name: command, arguments: [...commandArgs], ...(log ? { log } : {}), startedAt: new Date().toISOString(), timeoutMs, status: 'running' };
   await checkpoint();
   const output = [];
   const stream = log ? createWriteStream(path.join(reportDir, log)) : null;
@@ -136,7 +147,7 @@ async function run(command, commandArgs, { log, allowFailure = false, env, timeo
     shutdownDevices.add(commandArgs[2]);
   }
   Object.assign(report.command, { status: timedOut ? 'timed-out' : failed ? 'failed' : 'passed', endedAt: new Date().toISOString(), exitCode: code });
-  if (timedOut) recordFailure('command-timeout', new Error(`${command} timed out after ${timeoutMs} ms${log ? `; see ${log}` : ''}`));
+  if (timedOut) recordFailure('command-timeout', new Error(`${commandLabel} timed out after ${timeoutMs} ms${log ? `; see ${log}` : ''}`));
   await checkpoint();
   const text = Buffer.concat(output).toString('utf8').trim();
   if (failed && log && command === 'xcodebuild') {
@@ -149,10 +160,25 @@ async function run(command, commandArgs, { log, allowFailure = false, env, timeo
   }
   // A timeout is never an acceptable nonzero result (even in best-effort
   // cleanup); its caller can catch it explicitly and retain the failure.
-  if (timedOut) throw new Error(`${command} timed out after ${timeoutMs} ms${log ? `; see ${log}` : ''}`);
+  if (timedOut) throw new Error(`${commandLabel} timed out after ${timeoutMs} ms${log ? `; see ${log}` : ''}`);
   if (spawnError) throw spawnError;
   if (code !== 0 && !allowFailure) throw new Error(`${command} exited ${code}${log ? `; see ${log}` : `: ${text.slice(-2000)}`}`);
   return text;
+}
+
+async function launchSimulatorUI(targetDeviceId) {
+  if (!report.simulatorUI) {
+    const developerDir = process.env.DEVELOPER_DIR || await run('xcode-select', ['-p']);
+    assert.ok(path.isAbsolute(developerDir), 'Selected Xcode developer directory must be absolute');
+    const applicationPath = path.join(developerDir, 'Applications/Simulator.app');
+    assert.ok((await stat(applicationPath)).isDirectory(), `Simulator.app is missing from the selected Xcode: ${applicationPath}`);
+    report.simulatorUI = { applicationPath, launchRequests: [] };
+  }
+  // Use this Xcode's app, not a name-based LaunchServices lookup. Keep the
+  // existing bootstatus wait and native test criteria after the UI launch.
+  await run('open', ['-a', report.simulatorUI.applicationPath, '--args', '-CurrentDeviceUDID', targetDeviceId]);
+  report.simulatorUI.launchRequests.push({ deviceId: targetDeviceId, completedAt: new Date().toISOString() });
+  await checkpoint();
 }
 
 function recordFailure(phase, error) {
@@ -595,6 +621,7 @@ try {
     runtimeIdentifier: selected.runtimeIdentifier, runtimeVersion: selectedRuntime.version,
     runtimeBuildVersion: selectedRuntime.buildversion };
   await checkpoint(`${runsPrimary ? 'primary' : profile}-simulator-boot`);
+  if (simulatorUI) await launchSimulatorUI(deviceId);
   await run('xcrun', ['simctl', 'boot', deviceId], { allowFailure: true });
   await run('xcrun', ['simctl', 'bootstatus', deviceId, '-b'], { log: 'simulator-boot.log' });
   console.log('Building the native app and UI test bundle.');
@@ -623,7 +650,8 @@ try {
         variantDevice = await run('xcrun', ['simctl', 'create', `Marinar-${variant.key}-${Date.now()}`, variant.type.identifier, selectedRuntime.identifier]);
         deviceId = variantDevice;
         ownedDevices.add(deviceId);
-        await run('xcrun', ['simctl', 'boot', deviceId]);
+        if (simulatorUI) await launchSimulatorUI(deviceId);
+        await run('xcrun', ['simctl', 'boot', deviceId], { allowFailure: simulatorUI });
         await run('xcrun', ['simctl', 'bootstatus', deviceId, '-b'], { log: `${variant.key}-boot.log` });
       }
       result.deviceId = deviceId;
