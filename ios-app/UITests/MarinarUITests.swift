@@ -445,8 +445,11 @@ final class MarinarUITests: XCTestCase {
         // the page must still receive and read the real fixture bytes below.
         let open = app.buttons["Open"].firstMatch
         if open.waitForExistence(timeout: 5) && open.isEnabled { open.tap() }
+        // The iPad simulator can take over 20 seconds to copy an already
+        // selected Documents file into Inbox and dismiss Files. Keep this
+        // bounded, and still require dismissal and the exact bytes below.
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: picker)
-        waitForExpectations(timeout: 15)
+        waitForExpectations(timeout: 60)
         let expectedJSON = #"{"fixture":"restored-file-fixture","text":"실제 파일 선택 확인"}"#
         let expectedImport = "Imported: \(fixtureFilename) \(expectedJSON)"
         let imported = app.webViews.staticTexts[expectedImport].firstMatch
