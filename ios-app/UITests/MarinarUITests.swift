@@ -562,19 +562,25 @@ final class MarinarUITests: XCTestCase {
             fixture.tap()
         }
 
-        // QuickLook can expose JSON through either labels or a text value.
-        // Require the bytes' distinctive content, not a filename or thumbnail.
-        let content = NSPredicate { _, _ in
-            guard let snapshot = try? files.snapshot() else { return false }
-            return self.snapshotTree(snapshot).contains { node in
-                node.label.contains("restored-file-fixture")
-                    || (node.value as? String)?.contains("restored-file-fixture") == true
-            }
-        }
-        let opened = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: content, object: files)], timeout: 60)
+        // The root snapshot can omit remote QuickLook text attributes even
+        // while its content is visible. Query the observed TextView directly
+        // and require the full JSON inside QuickLook, not a filename/thumbnail.
+        let expectedJSON = #"{"fixture":"restored-file-fixture","text":"실제 파일 선택 확인"}"#
+        let quickLook = files.otherElements["QLPreviewControllerView"].firstMatch
+        let content = quickLook.textViews.matching(NSPredicate(format:
+            "label == %@ OR value == %@", expectedJSON, expectedJSON)).firstMatch
+        let opened = content.waitForExistence(timeout: 60)
         attachSystemFilesEvidence("system-files-after-open")
-        XCTAssertEqual(opened, .completed,
-                       "Files/QuickLook did not expose the fixture contents; inspect the attached system Files screen and accessibility tree")
+        XCTAssertTrue(opened,
+                      "Files/QuickLook did not expose the full fixture JSON; inspect the attached system Files screen and accessibility tree")
+        let label = content.label
+        let value = content.value as? String ?? ""
+        let evidence = XCTAttachment(string: "label: \(label)\nvalue: \(value)")
+        evidence.name = "system-files-verified-content"
+        evidence.lifetime = .keepAlways
+        add(evidence)
+        XCTAssertTrue(label == expectedJSON || value == expectedJSON,
+                      "The QuickLook TextView does not contain the exact fixture JSON")
     }
 
     private func attachSystemFilesEvidence(_ name: String) {
