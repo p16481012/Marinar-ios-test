@@ -2,8 +2,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { embedCharacterCardPng } from "../../packages/client/src/lib/character-card-png.ts";
 import { ABORT_PROMPT, FIXTURE_KEY, FIXTURE_MODEL, RESTORE_PROMPT, RESTORE_REPLY } from "./mock-openai-provider.mjs";
-import { CHARACTER_CARD, CHARACTER_DESCRIPTION, CHARACTER_NAME, CHAT_LINES, LOREBOOK, LORE_CONTENT, PRESET, makeCharacterPng, readCharacterPng, makeStoredZip } from "./transfer-fixtures.mjs";
+import { CHARACTER_CARD, CHARACTER_DESCRIPTION, CHARACTER_NAME, CHAT_LINES, LOREBOOK, LORE_CONTENT, MINIMAL_PNG, PRESET, makeCharacterPng, readCharacterPng, makeStoredZip } from "./transfer-fixtures.mjs";
 
 const parse = (value) => typeof value === "string" ? JSON.parse(value) : value;
 const messageSnapshot = (items) => items.map(({ id, role, content, characterId }) => ({ id, role, content, characterId }));
@@ -77,6 +78,32 @@ export async function exerciseTransfers({ api, providerUrl }) {
   assert.equal(fromNative.success, true);
   assert.equal(parse((await api.json(`/api/characters/${fromNative.id}`)).data).description, CHARACTER_DESCRIPTION);
   checks.push("character-png-json-native-roundtrip", "embedded-lorebook-and-avatar-preserved");
+
+  // Execute the production Bot Browser encoder, not the independent fixture
+  // encoder above. Its PNG must retain the lorebook through the real importer.
+  const frontendData = { ...structuredClone(CHARACTER_CARD.data), name: "Bot Browser PNG 한글 카드" };
+  const frontendPng = Buffer.from(await embedCharacterCardPng(MINIMAL_PNG, frontendData).arrayBuffer());
+  assert.deepEqual(readCharacterPng(frontendPng).data.character_book, frontendData.character_book,
+    "The frontend PNG must contain its embedded lorebook and a valid metadata CRC");
+  const frontendImport = await api.json("/api/import/st-character",
+    api.upload("bot-browser-roundtrip.png", frontendPng, { importEmbeddedLorebook: true }, "image/png"));
+  assert.equal(frontendImport.success, true, JSON.stringify(frontendImport));
+  assert.ok(frontendImport.lorebook?.lorebookId, "The frontend PNG import must create its embedded lorebook");
+  const frontendCharacter = parse((await api.json(`/api/characters/${frontendImport.characterId}`)).data);
+  assert.equal(frontendCharacter.name, frontendData.name);
+  assert.equal(frontendCharacter.description, frontendData.description);
+  assert.equal(frontendCharacter.first_mes, frontendData.first_mes);
+  const frontendLorebookId = frontendImport.lorebook.lorebookId;
+  const frontendLorebook = await api.json(`/api/lorebooks/${frontendLorebookId}`);
+  assert.ok(frontendLorebook.characterId === frontendImport.characterId
+    || parse(frontendLorebook.characterIds ?? "[]").includes(frontendImport.characterId),
+  "The imported frontend lorebook must be linked to its character");
+  const frontendEntries = await api.json(`/api/lorebooks/${frontendLorebookId}/entries`);
+  assert.deepEqual(frontendEntries.map((entry) => ({ content: entry.content, keys: parse(entry.keys),
+    enabled: String(entry.enabled), order: entry.order })),
+  frontendData.character_book.entries.map((entry) => ({ content: entry.content, keys: entry.keys,
+    enabled: String(entry.enabled), order: entry.insertion_order })));
+  checks.push("frontend-png-export-import-preserves-embedded-lorebook");
 
   const lore = await api.json("/api/import/st-lorebook", LOREBOOK);
   assert.equal(lore.success, true);
