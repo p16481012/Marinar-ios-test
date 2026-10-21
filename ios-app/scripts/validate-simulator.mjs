@@ -304,7 +304,8 @@ async function prepareUI(config, stateFile) {
   const uiStateVersion = Number(persistence.match(/version:\s*(\d+)/)?.[1]);
   assert.ok(Number.isInteger(uiStateVersion), 'Cannot identify current UI preference format');
   await writeFile(path.join(container, 'Documents/ios-test-selection.json'), JSON.stringify({ chatId: uiState.chatId, uiStateVersion }));
-  await writeFile(path.join(container, 'Documents/marinar-ios-import.json'), JSON.stringify({ fixture: 'restored-file-fixture', text: '실제 파일 선택 확인' }));
+  // The DEBUG app creates its import fixture after XCTest has installed and
+  // launched it. Creating it here can leave Files with a pre-install item ID.
   return uiState;
 }
 

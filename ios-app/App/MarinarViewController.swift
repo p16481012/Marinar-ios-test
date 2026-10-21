@@ -17,6 +17,9 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     private var terminalFailure = false
     private var restoreScriptID: String?
     private var testSelectionInstalled = false
+    #if DEBUG
+    private var testImportFixtureFilename: String?
+    #endif
     private var elapsed: TimeInterval = 0
     private var lastPoll = Date()
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
@@ -538,10 +541,34 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         #if DEBUG
         guard ProcessInfo.processInfo.environment["MARINARA_TEST_FILE_PANEL"] == "1" else { return }
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        // Create the fixture inside this installed app, after XCTest has
+        // finished replacing its container. A host-created file was listed
+        // by Files but failed URL lookup with a stale FileProvider item ID.
+        // Cache the successful filename so later page loads never replace it.
+        if testImportFixtureFilename == nil {
+            do {
+                let filename = "marinar-ios-import-\(UUID().uuidString.prefix(8).lowercased()).json"
+                let expected = try JSONSerialization.data(withJSONObject: [
+                    "fixture": "restored-file-fixture", "text": "실제 파일 선택 확인",
+                ], options: [.sortedKeys])
+                let file = documents.appendingPathComponent(filename)
+                try expected.write(to: file, options: .atomic)
+                guard try Data(contentsOf: file) == expected else {
+                    throw NSError(domain: "MarinarTestFixture", code: 1)
+                }
+                testImportFixtureFilename = filename
+                recordExportEventIfNeeded("import-fixture-created", fields: ["bytes": expected.count, "verified": true])
+            } catch {
+                recordExportEventIfNeeded("import-fixture-failed", fields: ["code": (error as NSError).code])
+                return
+            }
+        }
+        guard let fixtureFilename = testImportFixtureFilename else { return }
         let options = (try? Data(contentsOf: documents.appendingPathComponent("ios-file-test-config.json"))).flatMap {
             (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any]
         } ?? [:]
-        guard let encoded = try? JSONSerialization.data(withJSONObject: [options["prepareBackup"] as? Bool == true]),
+        let panelValues: [Any] = [options["prepareBackup"] as? Bool == true, fixtureFilename]
+        guard let encoded = try? JSONSerialization.data(withJSONObject: panelValues),
               let values = String(data: encoded, encoding: .utf8) else { return }
         let script = """
         (() => {
@@ -549,7 +576,8 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
           const panel = document.createElement('section');
           panel.id = 'ios-file-diagnostics';
           panel.style = 'position:fixed;inset:8px;z-index:2147483647;background:white;color:black;padding:16px;overflow:auto';
-          panel.innerHTML = '<h1>iOS file diagnostics</h1><button id="ios-test-export">Export test JSON</button><button id="ios-test-error">Test failed export</button><hr><label>Choose test file<input id="ios-test-file" type="file" accept="application/json,.json"></label><hr><button id="ios-test-confirm">Test confirmation</button><p id="ios-file-result"></p><aside id="ios-event-result" style="position:fixed;bottom:16px;left:24px;right:24px;height:70px;font-size:12px;overflow:auto;pointer-events:none"></aside><p id="ios-export-result" style="position:fixed;bottom:90px;left:24px;right:24px;height:30px;font-size:14px;pointer-events:none">Export handler idle</p>';
+          panel.innerHTML = '<h1>iOS file diagnostics</h1><button id="ios-test-export">Export test JSON</button><button id="ios-test-error">Test failed export</button><hr><p id="ios-import-fixture"></p><label>Choose test file<input id="ios-test-file" type="file" accept="application/json,.json"></label><hr><button id="ios-test-confirm">Test confirmation</button><p id="ios-file-result"></p><aside id="ios-event-result" style="position:fixed;bottom:16px;left:24px;right:24px;height:70px;font-size:12px;overflow:auto;pointer-events:none"></aside><p id="ios-export-result" style="position:fixed;bottom:90px;left:24px;right:24px;height:30px;font-size:14px;pointer-events:none">Export handler idle</p>';
+          panel.querySelector('#ios-import-fixture').textContent = 'Import fixture: ' + \(values)[1];
           const events = [];
           let displayEvents;
           for (const type of ['pointerdown', 'pointerup', 'pointercancel', 'touchstart', 'touchend', 'touchcancel', 'click']) {

@@ -298,8 +298,16 @@ final class MarinarUITests: XCTestCase {
         confirmation.buttons["확인"].tap()
         XCTAssertTrue(app.webViews.staticTexts["Confirmation accepted"].waitForExistence(timeout: 10))
 
-        // Read a real file from the app's Files document provider. The runner
-        // places only this public fixture in Documents before launching tests.
+        // Read the exact file created and verified by this installed app.
+        // Using its displayed unique filename avoids a stale provider item
+        // from an earlier app installation or another test launch.
+        let fixturePrefix = "Import fixture: "
+        let fixtureDescription = app.webViews.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", fixturePrefix)).firstMatch
+        XCTAssertTrue(fixtureDescription.waitForExistence(timeout: 15), "The app did not create and verify the import fixture")
+        let fixtureFilename = String(fixtureDescription.label.dropFirst(fixturePrefix.count))
+        XCTAssertNotNil(fixtureFilename.range(of: "^marinar-ios-import-[0-9a-f]{8}\\.json$", options: .regularExpression),
+                        "The import fixture filename is invalid")
+        let fixtureStem = (fixtureFilename as NSString).deletingPathExtension
         let file = app.webViews.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'Choose File' OR label CONTAINS[c] 'Choose test file'")).firstMatch
         XCTAssertTrue(file.waitForExistence(timeout: 15), "HTML file input is missing")
         let cancel = openDocumentPicker(file)
@@ -307,7 +315,7 @@ final class MarinarUITests: XCTestCase {
         cancel.tap()
         XCTAssertTrue(export.waitForExistence(timeout: 15), "Cancelling file selection did not return to the page")
         _ = openDocumentPicker(file)
-        let fixture = app.staticTexts.matching(NSPredicate(format: "label == 'marinar-ios-import' OR label == 'marinar-ios-import.json'")).firstMatch
+        let fixture = app.staticTexts.matching(NSPredicate(format: "label == %@ OR label == %@", fixtureFilename, fixtureStem)).firstMatch
         if !fixture.waitForExistence(timeout: 3) {
             // The initial picker can be Recents or the last visited directory.
             for _ in 0..<3 {
@@ -321,10 +329,9 @@ final class MarinarUITests: XCTestCase {
             if folder.waitForExistence(timeout: 10) { folder.tap() }
         }
         XCTAssertTrue(fixture.waitForExistence(timeout: 20), "Fixture not found in the app's Files folder")
-        // The Files grid exposes its filename separately. Both its label and
-        // automatic cell hit point left the file unselected. The thumbnail's
-        // AX isHittable is false even when visibly inside the enabled cell;
-        // deliver one real touch at its observed, validated frame center.
+        // Deliver one real touch at the observed thumbnail center. This path
+        // has been confirmed to reach Files' selection handler; keep the
+        // URL delivery and actual byte-reading assertions below as well.
         let fixtureCell = app.cells.containing(.staticText, identifier: fixture.label).firstMatch
         XCTAssertTrue(fixtureCell.waitForExistence(timeout: 10), "Fixture file cell is missing")
         XCTAssertTrue(fixtureCell.isEnabled, "Fixture file cannot be selected")
@@ -366,7 +373,8 @@ final class MarinarUITests: XCTestCase {
         let picker = app.otherElements["Browse View (Picker)"].firstMatch
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: picker)
         waitForExpectations(timeout: 15)
-        let imported = app.webViews.staticTexts.matching(NSPredicate(format: "label CONTAINS 'restored-file-fixture'")).firstMatch
+        let imported = app.webViews.staticTexts.matching(NSPredicate(format:
+            "label CONTAINS %@ AND label CONTAINS 'restored-file-fixture'", fixtureFilename)).firstMatch
         XCTAssertTrue(imported.waitForExistence(timeout: 15), "WKWebView did not receive the selected file bytes")
         attachScreen("system-file-imported")
     }
