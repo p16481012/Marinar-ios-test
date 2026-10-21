@@ -1,28 +1,35 @@
-name: Native document picker control
+name: Native document picker with Node startup control
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: native-file-picker-${{ github.ref }}
+  group: native-picker-node-toggle-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native-control:
-    name: UIKit picker (Xcode 26.2, iOS 26.2)
+    name: Same UIKit binary, Node startup off and on
     runs-on: macos-15
-    timeout-minutes: 35
+    timeout-minutes: 45
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
-      - name: Run one standalone native picker control
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+      - name: Download the unchanged pinned NodeMobile framework
+        run: node ios-app/scripts/download-node.mjs
+      - name: Run one linked Node startup control
         run: python3 diagnostics/native-file-picker/run.py
-        timeout-minutes: 30
+        timeout-minutes: 39
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: native-file-picker-control
+          name: native-picker-node-toggle
           path: diagnostics/native-file-picker/build/report/
           retention-days: 7
           if-no-files-found: error

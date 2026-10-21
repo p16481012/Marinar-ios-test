@@ -24,6 +24,12 @@ final class PickerViewController: UIViewController, UIDocumentPickerDelegate {
     private var reportURL: URL?
     private var report: [String: Any] = [:]
     private var events: [[String: String]] = []
+    private var nodeThread: Thread?
+    private var readinessTimer: Timer?
+    private var readinessDeadline = Date()
+    private var readinessURL: URL?
+    private var startNode = false
+    private var mode = "invalid"
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -49,15 +55,99 @@ final class PickerViewController: UIViewController, UIDocumentPickerDelegate {
             stack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
             stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 24)
         ])
-        createFixture()
+        prepareRuntimeControl()
+    }
+
+    private func prepareRuntimeControl() {
+        do {
+            let flag = ProcessInfo.processInfo.environment["NATIVE_PICKER_START_NODE"]
+            guard flag == "0" || flag == "1" else { throw CocoaError(.fileReadCorruptFile) }
+            startNode = flag == "1"
+            mode = startNode ? "node-on" : "node-off"
+            let manager = FileManager.default
+            let support = try manager.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            reportURL = support.appendingPathComponent("native-picker-result-\(mode).json")
+            let ready = support.appendingPathComponent("native-picker-ready-\(mode).json")
+            readinessURL = ready
+            if manager.fileExists(atPath: ready.path) { try manager.removeItem(at: ready) }
+            let initialWorkingDirectory = manager.currentDirectoryPath
+            // Both processes enter the same private working directory before
+            // the fixture is created. The production bridge repeats this chdir.
+            guard manager.changeCurrentDirectoryPath(support.path) else { throw CocoaError(.fileNoSuchFile) }
+            report = ["mode": mode, "pid": ProcessInfo.processInfo.processIdentifier,
+                      "initialWorkingDirectory": initialWorkingDirectory,
+                      "workingDirectory": manager.currentDirectoryPath,
+                      "executablePath": Bundle.main.executablePath ?? "missing",
+                      "nodeStartRequested": startNode, "nodeStartInvoked": false,
+                      "plainUIWindow": true, "webKitUsed": false]
+            try record("runtime-starting")
+            readinessDeadline = Date().addingTimeInterval(60)
+            if startNode {
+                guard let script = Bundle.main.url(forResource: "minimal-node", withExtension: "cjs") else {
+                    throw CocoaError(.fileNoSuchFile)
+                }
+                report["nodeStartInvoked"] = true
+                try record("node-start-invoked")
+                let thread = Thread { [weak self] in
+                    let code = NodeBridge.run(withArguments: ["node", script.path, ready.path], workingDirectory: support.path)
+                    DispatchQueue.main.async {
+                        guard let self = self else { return }
+                        self.report["nodeExitCode"] = code
+                        self.openButton.isEnabled = false
+                        self.readinessTimer?.invalidate()
+                        self.recordFailure(NSError(domain: "NativePickerNodeControl", code: Int(code),
+                            userInfo: [NSLocalizedDescriptionKey: "Minimal node_start exited unexpectedly"]))
+                    }
+                }
+                thread.name = "Native picker Node control"
+                thread.stackSize = 8 * 1024 * 1024
+                nodeThread = thread
+                thread.start()
+            } else {
+                let readyData = try JSONSerialization.data(withJSONObject: ["ready": true, "mode": mode,
+                    "pid": ProcessInfo.processInfo.processIdentifier, "cwd": manager.currentDirectoryPath,
+                    "nodeStartInvoked": false], options: [.sortedKeys])
+                try readyData.write(to: ready, options: .atomic)
+            }
+            readinessTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+                self?.checkReadiness()
+            }
+            checkReadiness()
+        } catch { recordFailure(error) }
+    }
+
+    private func checkReadiness() {
+        guard let ready = readinessURL else { return }
+        do {
+            guard FileManager.default.fileExists(atPath: ready.path) else {
+                if Date() > readinessDeadline { throw CocoaError(.fileReadUnknown) }
+                return
+            }
+            let data = try Data(contentsOf: ready)
+            guard let body = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  body["ready"] as? Bool == true, body["mode"] as? String == mode,
+                  body["pid"] as? Int == Int(ProcessInfo.processInfo.processIdentifier),
+                  body["cwd"] as? String == FileManager.default.currentDirectoryPath,
+                  body["nodeStartInvoked"] as? Bool == startNode,
+                  !startNode || body["nodeVersion"] as? String == "v24.22.0" else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            readinessTimer?.invalidate()
+            readinessTimer = nil
+            readinessURL = nil
+            report["runtimeReady"] = body
+            try record("runtime-ready")
+            createFixture()
+        } catch {
+            readinessTimer?.invalidate()
+            recordFailure(error)
+        }
     }
 
     private func createFixture() {
         do {
             let manager = FileManager.default
             let documents = try manager.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            let support = try manager.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            reportURL = support.appendingPathComponent("native-picker-result.json")
             let nonce = String(UUID().uuidString.lowercased().prefix(8))
             let filename = "native-picker-\(nonce).json"
             let url = documents.appendingPathComponent(filename)
@@ -70,11 +160,11 @@ final class PickerViewController: UIViewController, UIDocumentPickerDelegate {
             fixtureURL = url
             filenameLabel.text = filename
             contentsLabel.text = text
-            report = ["fixtureFilename": filename, "fixtureURL": url.path,
+            report.merge(["fixtureFilename": filename, "fixtureURL": url.path,
                       "expectedText": text, "expectedBytes": expectedData.count,
                       "sourceReadbackMatches": true, "delegateCallbackCount": 0, "cancelCallbackCount": 0,
                       "systemVersion": UIDevice.current.systemVersion,
-                      "pickerAsCopy": true, "allowedContentType": UTType.json.identifier]
+                      "pickerAsCopy": true, "allowedContentType": UTType.json.identifier], uniquingKeysWith: { _, latest in latest })
             try record("fixture-ready")
             openButton.isEnabled = true
         } catch {

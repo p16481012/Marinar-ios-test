@@ -6,10 +6,12 @@ final class NativePickerUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait
+        if app.state != .notRunning { app.terminate() }
     }
 
     override func tearDownWithError() throws {
         evidence("final")
+        if app.state != .notRunning { app.terminate() }
     }
 
     private func evidence(_ name: String) {
@@ -23,12 +25,22 @@ final class NativePickerUITests: XCTestCase {
         add(hierarchy)
     }
 
-    func testNativeDocumentPickerReturnsExactCreatedBytes() throws {
+    func testNodeNotStartedDocumentPickerReturnsExactCreatedBytes() throws {
+        assertDocumentPickerRoundTrip(startNode: false)
+    }
+
+    func testNodeStartedDocumentPickerReturnsExactCreatedBytes() throws {
+        assertDocumentPickerRoundTrip(startNode: true)
+    }
+
+    private func assertDocumentPickerRoundTrip(startNode: Bool) {
         app.launchArguments = ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
+        app.launchEnvironment["NATIVE_PICKER_START_NODE"] = startNode ? "1" : "0"
         app.launch()
         let status = app.staticTexts["picker-status"]
-        XCTAssertTrue(status.waitForExistence(timeout: 20), "Native app did not launch")
-        XCTAssertEqual(status.label, "fixture-ready", "App did not create and read back its JSON")
+        XCTAssertTrue(status.waitForExistence(timeout: 30), "Native app did not launch")
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == 'fixture-ready'"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 90), .completed, "Runtime and fixture readiness failed")
         let filename = app.staticTexts["fixture-filename"].label
         XCTAssertNotNil(filename.range(of: "^native-picker-[0-9a-f]{8}\\.json$", options: .regularExpression))
         let stem = (filename as NSString).deletingPathExtension
