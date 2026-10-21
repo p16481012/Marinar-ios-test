@@ -476,9 +476,9 @@ final class MarinarUITests: XCTestCase {
                 "label == 'Browse' OR label == 'Locations' OR label == 'Back' OR label == 'On My iPhone' OR label == 'On My iPad'")).firstMatch
             let browseTab = files.tabBars.buttons["Browse"].firstMatch
             let browse = files.buttons["Browse"].firstMatch
-            if back.exists && back.isHittable { back.tap() }
-            else if browseTab.exists && browseTab.isHittable { browseTab.tap() }
-            else if browse.exists && browse.isHittable { browse.tap() }
+            if back.exists && back.isEnabled && back.isHittable { back.tap() }
+            else if browseTab.exists && browseTab.isEnabled && browseTab.isHittable { browseTab.tap() }
+            else if browse.exists && browse.isEnabled && browse.isHittable { browse.tap() }
             else { break }
         }
         attachSystemFilesEvidence("system-files-locations")

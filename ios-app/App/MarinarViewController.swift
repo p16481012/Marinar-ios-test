@@ -487,8 +487,8 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     private func recordExportEventIfNeeded(_ name: String, fields: [String: Any] = [:]) {
         #if DEBUG
         guard ProcessInfo.processInfo.environment["MARINARA_TEST_FILE_PANEL"] == "1" else { return }
-        // Keep URLs, credentials, filenames and server response bodies out of
-        // this small diagnostic artifact. Record only stages and native touch metadata.
+        // Keep URLs, credentials, user filenames and server response bodies out
+        // of this artifact. Test fixture names, stages and native touches are safe diagnostics.
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let file = documents.appendingPathComponent("ios-export-events.json")
         var events = (try? Data(contentsOf: file)).flatMap {
@@ -565,24 +565,50 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     private func installFileDiagnosticsIfNeeded() {
         #if DEBUG
         guard ProcessInfo.processInfo.environment["MARINARA_TEST_FILE_PANEL"] == "1" else { return }
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        // Create the fixture inside this installed app, after XCTest has
-        // finished replacing its container. A host-created file was listed
-        // by Files but failed URL lookup with a stale FileProvider item ID.
-        // Cache the successful filename so later page loads never replace it.
+        let fileManager = FileManager.default
+        let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let filesControl = ProcessInfo.processInfo.environment["MARINARA_TEST_FILES_CONTROL"] == "1"
+        // The picker gets a new fixture on each launch. The separate Files
+        // control reuses that exact verified file when it still exists, so a
+        // successful QuickLook cannot be mistaken for reading a different item.
+        // Store only its name in private tmp, outside user data and backups.
+        // Cache the successful choice so later page loads never replace it.
         if testImportFixtureFilename == nil {
             do {
-                let filename = "marinar-ios-import-\(UUID().uuidString.prefix(8).lowercased()).json"
+                let marker = fileManager.temporaryDirectory.appendingPathComponent("marinar-ios-last-import-fixture.txt")
                 let expected = try JSONSerialization.data(withJSONObject: [
                     "fixture": "restored-file-fixture", "text": "실제 파일 선택 확인",
                 ], options: [.sortedKeys])
+                var filename = "marinar-ios-import-\(UUID().uuidString.prefix(8).lowercased()).json"
+                var reused = false
+                if filesControl && fileManager.fileExists(atPath: marker.path) {
+                    let previous = try String(contentsOf: marker, encoding: .utf8)
+                    guard previous.range(of: "\\Amarinar-ios-import-[0-9a-f]{8}\\.json\\z", options: .regularExpression) != nil else {
+                        throw NSError(domain: "MarinarTestFixture", code: 2)
+                    }
+                    let previousFile = documents.appendingPathComponent(previous)
+                    if fileManager.fileExists(atPath: previousFile.path) {
+                        let attributes = try fileManager.attributesOfItem(atPath: previousFile.path)
+                        guard attributes[.type] as? FileAttributeType == .typeRegular,
+                              (attributes[.size] as? NSNumber)?.intValue == expected.count,
+                              try Data(contentsOf: previousFile) == expected else {
+                            throw NSError(domain: "MarinarTestFixture", code: 3)
+                        }
+                        filename = previous
+                        reused = true
+                    }
+                }
                 let file = documents.appendingPathComponent(filename)
-                try expected.write(to: file, options: .atomic)
-                guard try Data(contentsOf: file) == expected else {
-                    throw NSError(domain: "MarinarTestFixture", code: 1)
+                if !reused {
+                    try expected.write(to: file, options: .atomic)
+                    guard try Data(contentsOf: file) == expected else {
+                        throw NSError(domain: "MarinarTestFixture", code: 1)
+                    }
+                    try Data(filename.utf8).write(to: marker, options: .atomic)
                 }
                 testImportFixtureFilename = filename
-                recordExportEventIfNeeded("import-fixture-created", fields: ["bytes": expected.count, "verified": true])
+                recordExportEventIfNeeded(reused ? "import-fixture-reused" : "import-fixture-created",
+                    fields: ["bytes": expected.count, "verified": true, "reused": reused, "filename": filename])
             } catch {
                 recordExportEventIfNeeded("import-fixture-failed", fields: ["code": (error as NSError).code])
                 return
@@ -592,8 +618,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         let options = (try? Data(contentsOf: documents.appendingPathComponent("ios-file-test-config.json"))).flatMap {
             (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any]
         } ?? [:]
-        let prepareBackup = options["prepareBackup"] as? Bool == true
-            && ProcessInfo.processInfo.environment["MARINARA_TEST_FILES_CONTROL"] != "1"
+        let prepareBackup = options["prepareBackup"] as? Bool == true && !filesControl
         let panelValues: [Any] = [prepareBackup, fixtureFilename]
         guard let encoded = try? JSONSerialization.data(withJSONObject: panelValues),
               let values = String(data: encoded, encoding: .utf8) else { return }

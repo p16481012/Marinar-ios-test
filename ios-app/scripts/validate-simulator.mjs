@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { copyFile, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startMockProvider, STREAM_PROMPT, STREAM_REPLY, RESTORE_PROMPT, RESTORE_REPLY } from '../../scripts/ios/mock-openai-provider.mjs';
@@ -18,7 +18,7 @@ const options = new Map();
 for (let index = 0; index < args.length; index += 1) {
   const name = args[index];
   if (name === '--help') { options.set(name, true); continue; }
-  if (name === '--simulator-ui') {
+  if (['--simulator-ui', '--software-keyboard'].includes(name)) {
     assert.ok(!options.has(name), `Duplicate option: ${name}`);
     options.set(name, true);
     continue;
@@ -32,15 +32,22 @@ for (let index = 0; index < args.length; index += 1) {
 const option = (name) => options.get(name);
 const profile = option('--profile') ?? 'all';
 const simulatorUI = options.has('--simulator-ui');
+const softwareKeyboard = options.has('--software-keyboard');
 assert.ok(['all', 'primary', 'compact-phone', 'ipad'].includes(profile),
   '--profile must be all, primary, compact-phone or ipad');
 if (options.has('--help')) {
-  console.log('Usage: node ios-app/scripts/validate-simulator.mjs [--profile all|primary|compact-phone|ipad] [--report-dir PATH] [--derived-data PATH] [--device-id UUID] [--simulator-ui]\n'
+  console.log('Usage: node ios-app/scripts/validate-simulator.mjs [--profile all|primary|compact-phone|ipad] [--report-dir PATH] [--derived-data PATH] [--device-id UUID] [--simulator-ui] [--software-keyboard]\n'
     + 'Default profile: all. primary runs embedded API, chat, file transfer and full restore checks.\n'
     + 'compact-phone and ipad run only their own seeded native UI checks; ipad also checks file transfer.\n'
     + 'Default mode: headless. --simulator-ui launches the selected Xcode Simulator.app before boot.\n'
+    + '--software-keyboard requires CI=true and --simulator-ui, and cannot be used with --device-id. It disables hardware keyboards for fresh CI devices.\n'
     + 'Use a separate --report-dir and --derived-data for each independent worker.');
   process.exit(0);
+}
+if (softwareKeyboard) {
+  assert.equal(process.env.CI, 'true', '--software-keyboard is restricted to disposable CI hosts (CI=true)');
+  assert.ok(simulatorUI, '--software-keyboard requires --simulator-ui');
+  assert.ok(!option('--device-id'), '--software-keyboard cannot modify an existing --device-id');
 }
 const runsPrimary = profile === 'all' || profile === 'primary';
 const requestedVariants = profile === 'all' ? ['compact-phone', 'ipad'] : runsPrimary ? [] : [profile];
@@ -51,6 +58,7 @@ const project = path.join(root, 'ios-app/Marinar.xcodeproj');
 let deviceId = option('--device-id');
 const ownedDevices = new Set();
 const shutdownDevices = new Set();
+const keyboardConfiguredDevices = new Set();
 let mock;
 let container;
 let launchNumber = 0;
@@ -166,6 +174,44 @@ async function run(command, commandArgs, { log, allowFailure = false, env, timeo
   return text;
 }
 
+async function configureSoftwareKeyboard(targetDeviceId) {
+  assert.ok(softwareKeyboard && process.env.CI === 'true' && simulatorUI, 'Software keyboard configuration requires explicit CI UI mode');
+  assert.ok(ownedDevices.has(targetDeviceId), 'Only newly created CI devices may have their keyboard preferences changed');
+  if (keyboardConfiguredDevices.has(targetDeviceId)) return;
+  const domain = 'com.apple.iphonesimulator';
+  const udid = targetDeviceId.toUpperCase();
+  assert.match(udid, /^[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}$/, 'Invalid simulator UUID');
+  const exportPath = path.join(reportDir, 'simulator-keyboard-preferences.plist');
+  async function readPreferences() {
+    try {
+      await run('defaults', ['export', domain, exportPath]);
+      return JSON.parse(await run('plutil', ['-convert', 'json', '-o', '-', exportPath]));
+    } finally {
+      await rm(exportPath, { force: true });
+    }
+  }
+  // Match Appium's Simulator policy: set both the shared default and the
+  // fresh device override before opening its window. Other UUIDs stay intact.
+  await run('defaults', ['write', domain, 'ConnectHardwareKeyboard', '-bool', 'false']);
+  const before = await readPreferences();
+  assert.equal(before.DevicePreferences?.[udid], undefined, 'New CI device already has Simulator preferences; refusing to replace them');
+  await run('defaults', ['write', domain, 'DevicePreferences', '-dict-add', udid,
+    '<dict><key>ConnectHardwareKeyboard</key><false/></dict>']);
+  const after = await readPreferences();
+  assert.equal(after.ConnectHardwareKeyboard, false, 'Global hardware keyboard preference was not disabled');
+  assert.equal(after.DevicePreferences?.[udid]?.ConnectHardwareKeyboard, false, 'Device hardware keyboard preference was not disabled');
+  for (const [otherId, preferences] of Object.entries(before.DevicePreferences ?? {})) {
+    assert.deepEqual(after.DevicePreferences?.[otherId], preferences, 'An unrelated simulator preference changed');
+  }
+  keyboardConfiguredDevices.add(targetDeviceId);
+  report.simulatorUI.keyboardPreferences ??= [];
+  report.simulatorUI.keyboardPreferences.push({ deviceId: targetDeviceId,
+    globalConnectHardwareKeyboard: after.ConnectHardwareKeyboard,
+    deviceConnectHardwareKeyboard: after.DevicePreferences[udid].ConnectHardwareKeyboard,
+    verifiedAt: new Date().toISOString() });
+  await checkpoint();
+}
+
 async function launchSimulatorUI(targetDeviceId) {
   if (!report.simulatorUI) {
     const developerDir = process.env.DEVELOPER_DIR || await run('xcode-select', ['-p']);
@@ -174,6 +220,7 @@ async function launchSimulatorUI(targetDeviceId) {
     assert.ok((await stat(applicationPath)).isDirectory(), `Simulator.app is missing from the selected Xcode: ${applicationPath}`);
     report.simulatorUI = { applicationPath, launchRequests: [] };
   }
+  if (softwareKeyboard) await configureSoftwareKeyboard(targetDeviceId);
   // Use this Xcode's app, not a name-based LaunchServices lookup. Keep the
   // existing bootstatus wait and native test criteria after the UI launch.
   await run('open', ['-a', report.simulatorUI.applicationPath, '--args', '-CurrentDeviceUDID', targetDeviceId]);
@@ -509,26 +556,18 @@ async function runPrimaryChecks(buildArgs) {
   await preserveLaunchLogs();
   const callsBeforeUI = mock.calls.length;
   console.log('Sending through the real WKWebView composer and checking restoration after app relaunch.');
-  const primaryTests = await runUITests(['test-without-building', ...buildArgs,
+  // Finish chat and cold-restore checks before presenting system file UI.
+  // XCTest's method order otherwise places the file picker before Send.
+  const chatTests = await runUITests(['test-without-building', ...buildArgs,
     '-parallel-testing-enabled', 'NO', '-maximum-concurrent-test-simulator-destinations', '1',
     '-only-testing:MarinarUITests/MarinarUITests/testSendPersistsAfterProcessRelaunch',
-    '-only-testing:MarinarUITests/MarinarUITests/testBlobDownloadShareAndFilePicker',
-    '-only-testing:MarinarUITests/MarinarUITests/testSystemFilesProviderCanOpenFixture',
-    '-resultBundlePath', path.join(reportDir, 'MarinarUITests.xcresult')], {
-    phase: 'primary-ui', log: 'simulator-ui-tests.log',
-    expectedTests: ['testSendPersistsAfterProcessRelaunch', 'testBlobDownloadShareAndFilePicker', 'testSystemFilesProviderCanOpenFixture'],
+    '-resultBundlePath', path.join(reportDir, 'primary-chat.xcresult')], {
+    phase: 'primary-chat-ui', log: 'primary-chat-ui-tests.log',
+    expectedTests: ['testSendPersistsAfterProcessRelaunch'],
   });
   await preserveLaunchLogs();
-  // XCTest runs independent methods in one invocation. An export failure must
-  // remain a failure while allowing a completed chat test to prove restoration.
-  if (primaryTests.has('testBlobDownloadShareAndFilePicker')) await collectCheck('primary-file-integrity', async () => {
-    report.download = await verifyBlobDownload(true);
-    Object.assign(report.coverage, { nativeBlobDownload: true, nativeShareSheet: true, systemFilePicker: true, nativeDialogs: true });
-    report.checks.push('blob-download-byte-integrity', 'streamed-16mib-backup-disk-integrity', 'http-download-error-rejected',
-      'native-export-share-sheet', 'system-file-picker-cancel', 'system-file-picker-read-bytes', 'javascript-confirm-accept-and-cancel');
-  });
   let chatVerified = false;
-  if (primaryTests.has('testSendPersistsAfterProcessRelaunch')) chatVerified = await collectCheck('primary-chat-send', async () => {
+  if (chatTests.has('testSendPersistsAfterProcessRelaunch')) chatVerified = await collectCheck('primary-chat-send', async () => {
     assert.ok(mock.calls.slice(callsBeforeUI).some((call) => call.kind === 'stream' && call.completed
       && call.messages.some((message) => message.role === 'user' && JSON.stringify(message.content).includes(STREAM_PROMPT))),
     'UI test did not send its typed prompt to the mock provider');
@@ -562,6 +601,24 @@ async function runPrimaryChecks(buildArgs) {
         config = await exerciseNativeFullRestore(config, uiState);
       });
     }
+    await stop();
+    await preserveLaunchLogs();
+    console.log('Checking native file download, sharing and the independent system Files control.');
+    const fileTests = await runUITests(['test-without-building', ...buildArgs,
+      '-parallel-testing-enabled', 'NO', '-maximum-concurrent-test-simulator-destinations', '1',
+      '-only-testing:MarinarUITests/MarinarUITests/testBlobDownloadShareAndFilePicker',
+      '-only-testing:MarinarUITests/MarinarUITests/testSystemFilesProviderCanOpenFixture',
+      '-resultBundlePath', path.join(reportDir, 'primary-files.xcresult')], {
+      phase: 'primary-file-ui', log: 'primary-file-ui-tests.log',
+      expectedTests: ['testBlobDownloadShareAndFilePicker', 'testSystemFilesProviderCanOpenFixture'],
+    });
+    await preserveLaunchLogs();
+    if (fileTests.has('testBlobDownloadShareAndFilePicker')) await collectCheck('primary-file-integrity', async () => {
+      report.download = await verifyBlobDownload(true);
+      Object.assign(report.coverage, { nativeBlobDownload: true, nativeShareSheet: true, systemFilePicker: true, nativeDialogs: true });
+      report.checks.push('blob-download-byte-integrity', 'streamed-16mib-backup-disk-integrity', 'http-download-error-rejected',
+        'native-export-share-sheet', 'system-file-picker-cancel', 'system-file-picker-read-bytes', 'javascript-confirm-accept-and-cancel');
+    });
   } finally {
     await run('xcrun', ['simctl', 'io', deviceId, 'screenshot', path.join(reportDir, 'primary-followup-screen.png')], { allowFailure: true }).catch(() => {});
     await run('xcrun', ['simctl', 'spawn', deviceId, 'log', 'show', '--last', '20m', '--style', 'compact', '--predicate', 'process == "Marinar"'], { log: 'primary-app.log', allowFailure: true }).catch(() => {});
