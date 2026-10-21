@@ -48,6 +48,10 @@ async function run(command, commandArgs, { log, allowFailure = false } = {}) {
 }
 
 async function launch() {
+  // XCTest can reinstall the app while preserving its data under a new
+  // container UUID. Resolve the current location before writing logs or
+  // reading this process's launch configuration.
+  container = await run('xcrun', ['simctl', 'get_app_container', deviceId, bundleId, 'data']);
   launchNumber += 1;
   // The simulator can remap /tmp and /var paths. Its real app-container path
   // avoids that ambiguity; copy the logs out before deleting our simulator.
@@ -81,14 +85,20 @@ async function launch() {
 
 async function stop() { await run('xcrun', ['simctl', 'terminate', deviceId, bundleId], { allowFailure: true }); }
 
+async function preserveLaunchLogs() {
+  // Copy before XCTest can migrate the data container, and again after the
+  // final launch. A missing old path must not remove an already copied log.
+  for (const file of launchLogs) await copyFile(file, path.join(reportDir, path.basename(file))).catch(() => {});
+}
+
 try {
   assert.equal(process.platform, 'darwin', 'This validation requires macOS and Xcode');
   assert.equal(process.arch, 'arm64', 'The pinned Node framework has an ARM64 simulator slice only');
   const launchHelp = await run('xcrun', ['simctl', 'help', 'launch']);
   await writeFile(path.join(reportDir, 'simctl-launch-help.txt'), launchHelp + '\n');
   assert.ok(launchHelp.includes('--stdout') && launchHelp.includes('--stderr'), 'Installed simctl lacks file output redirection');
+  const { runtimes } = JSON.parse(await run('xcrun', ['simctl', 'list', 'runtimes', '-j']));
   if (!deviceId) {
-    const { runtimes } = JSON.parse(await run('xcrun', ['simctl', 'list', 'runtimes', '-j']));
     const runtime = runtimes.filter((item) => item.isAvailable && item.identifier.includes('.iOS-'))
       .sort((a, b) => b.version.localeCompare(a.version, undefined, { numeric: true }))[0];
     assert.ok(runtime, 'No available iOS Simulator runtime');
@@ -100,6 +110,15 @@ try {
     ownedDevice = true;
   }
   report.deviceId = deviceId;
+  const { devices } = JSON.parse(await run('xcrun', ['simctl', 'list', 'devices', '-j']));
+  const selected = Object.entries(devices).flatMap(([runtimeIdentifier, items]) =>
+    items.map((device) => ({ ...device, runtimeIdentifier }))).find((device) => device.udid === deviceId);
+  assert.ok(selected, 'Selected simulator is not listed by simctl');
+  const selectedRuntime = runtimes.find((runtime) => runtime.identifier === selected.runtimeIdentifier);
+  assert.ok(selectedRuntime, 'Cannot identify selected simulator runtime');
+  report.simulator = { name: selected.name, deviceTypeIdentifier: selected.deviceTypeIdentifier,
+    runtimeIdentifier: selected.runtimeIdentifier, runtimeVersion: selectedRuntime.version,
+    runtimeBuildVersion: selectedRuntime.buildversion };
   await run('xcrun', ['simctl', 'boot', deviceId], { allowFailure: true });
   await run('xcrun', ['simctl', 'bootstatus', deviceId, '-b'], { log: 'simulator-boot.log' });
   console.log('Building the native app and UI test bundle.');
@@ -108,7 +127,6 @@ try {
     'CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO', 'CODE_SIGN_IDENTITY='];
   await run('xcodebuild', ['build-for-testing', ...buildArgs], { log: 'simulator-build.log' });
   await run('xcrun', ['simctl', 'install', deviceId, path.join(derived, 'Build/Products/Debug-iphonesimulator/Marinar.app')]);
-  container = await run('xcrun', ['simctl', 'get_app_container', deviceId, bundleId, 'data']);
   let config = await launch();
   report.coverage.actualEmbeddedNode = true;
   report.checks.push('native-node-startup-and-authenticated-health');
@@ -142,6 +160,7 @@ try {
   assert.ok(Number.isInteger(uiStateVersion), 'Cannot identify current UI preference format');
   await writeFile(path.join(container, 'Documents/ios-test-selection.json'), JSON.stringify({ chatId: uiState.chatId, uiStateVersion }));
   await stop();
+  await preserveLaunchLogs();
   const callsBeforeUI = mock.calls.length;
   console.log('Sending through the real WKWebView composer and checking restoration after app relaunch.');
   await run('xcodebuild', ['test-without-building', ...buildArgs,
@@ -153,6 +172,8 @@ try {
   'UI test did not send its typed prompt to the mock provider');
   report.coverage.actualWKWebView = true;
   report.coverage.nativeSendInteraction = true;
+  report.checks.push('actual-wkwebview-native-keyboard-and-send');
+  console.log('UI test passed. Verifying its saved messages through the embedded server after another process relaunch.');
   await stop();
   config = await launch();
   const response = await fetch(`${baseUrl}/api/chats/${uiState.chatId}/messages`, {
@@ -163,7 +184,7 @@ try {
   const messages = Array.isArray(messagesBody) ? messagesBody : messagesBody.messages;
   assert.ok(messages.some((item) => item.role === 'user' && item.content === STREAM_PROMPT));
   assert.ok(messages.some((item) => item.role === 'assistant' && item.content === STREAM_REPLY));
-  report.checks.push('actual-wkwebview-native-keyboard-and-send', 'ui-messages-survive-app-process-relaunch');
+  report.checks.push('ui-messages-survive-app-process-relaunch');
   report.providerCalls = mock.calls.map(({ id, kind, streaming, completed, disconnected }) => ({ id, kind, streaming, completed, disconnected }));
   report.status = 'passed';
   console.log('Native simulator validation passed. No external AI service was used.');
@@ -180,7 +201,7 @@ try {
     // Preserve only test diagnostics, not launch-config.json or its boot token.
     await run('xcrun', ['simctl', 'spawn', deviceId, 'log', 'show', '--last', '15m', '--style', 'compact', '--predicate', 'process == "Marinar"'], { log: 'simulator-app.log', allowFailure: true }).catch(() => {});
     await stop().catch(() => {});
-    for (const file of launchLogs) await copyFile(file, path.join(reportDir, path.basename(file))).catch(() => {});
+    await preserveLaunchLogs();
   }
   if (mock) await mock.close();
   if (ownedDevice) {
