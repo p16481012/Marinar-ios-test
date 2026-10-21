@@ -28,6 +28,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     private var testSelectionInstalled = false
     #if DEBUG
     private var testImportFixtureFilename: String?
+    private var testSettingsRestoreFixturePrepared = false
     private var startupStallConsumed = false
     // Test outputs and configuration stay outside the user-visible Documents
     // provider. Preserve them across app launches for independent host checks.
@@ -292,6 +293,9 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
                 self.overlay.isHidden = true
                 self.spinner.stopAnimating()
                 self.webView.accessibilityValue = "ready"
+                #if DEBUG
+                self.prepareSettingsRestoreFixtureIfNeeded()
+                #endif
                 self.installFileDiagnosticsIfNeeded()
                 self.recordRestoreDiagnosticsIfNeeded()
             }
@@ -735,6 +739,72 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         }
         #endif
     }
+
+    #if DEBUG
+    private func prepareSettingsRestoreFixtureIfNeeded() {
+        guard ProcessInfo.processInfo.environment["MARINARA_TEST_SETTINGS_RESTORE"] == "1",
+              !testSettingsRestoreFixturePrepared else { return }
+        testSettingsRestoreFixturePrepared = true
+        let manager = FileManager.default
+        let diagnostics = MarinarViewController.diagnosticsDirectory
+        let resultURL = diagnostics.appendingPathComponent("ios-settings-restore-fixture.json")
+        var result: [String: Any] = ["verified": false, "pid": ProcessInfo.processInfo.processIdentifier]
+        do {
+            let source = diagnostics.appendingPathComponent("ios-settings-restore-source.zip")
+            let attributes = try manager.attributesOfItem(atPath: source.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular,
+                  let size = (attributes[.size] as? NSNumber)?.intValue,
+                  size >= 22, size <= 128 * 1024 * 1024 else {
+                throw NSError(domain: "MarinarSettingsRestoreFixture", code: 1)
+            }
+            func digest(_ url: URL) throws -> (size: Int, sha256: String) {
+                let file = try FileHandle(forReadingFrom: url)
+                defer { try? file.close() }
+                var hash = SHA256()
+                var bytes = 0
+                while let chunk = try file.read(upToCount: 128 * 1024), !chunk.isEmpty {
+                    bytes += chunk.count
+                    guard bytes <= 128 * 1024 * 1024 else {
+                        throw NSError(domain: "MarinarSettingsRestoreFixture", code: 4)
+                    }
+                    hash.update(data: chunk)
+                }
+                return (bytes, hash.finalize().map { String(format: "%02x", $0) }.joined())
+            }
+            let expected = try digest(source)
+            guard expected.size == size else {
+                throw NSError(domain: "MarinarSettingsRestoreFixture", code: 5)
+            }
+            let filename = "marinar-ios-full-restore-ui.zip"
+            let documents = manager.urls(for: .documentDirectory, in: .userDomainMask).first!
+            let destination = documents.appendingPathComponent(filename)
+            let reused = manager.fileExists(atPath: destination.path)
+            // Create this file after XCTest installs and launches the app. A
+            // subsequent cold launch verifies it without replacing its inode.
+            if reused {
+                let existing = try manager.attributesOfItem(atPath: destination.path)
+                guard existing[.type] as? FileAttributeType == .typeRegular,
+                      (existing[.size] as? NSNumber)?.intValue == expected.size else {
+                    throw NSError(domain: "MarinarSettingsRestoreFixture", code: 2)
+                }
+            } else {
+                try manager.copyItem(at: source, to: destination)
+            }
+            let received = try digest(destination)
+            guard received.size == expected.size, received.sha256 == expected.sha256 else {
+                throw NSError(domain: "MarinarSettingsRestoreFixture", code: 3)
+            }
+            result = ["verified": true, "filename": filename, "size": received.size,
+                      "sha256": received.sha256,
+                      "reused": reused, "pid": ProcessInfo.processInfo.processIdentifier]
+        } catch {
+            result["code"] = (error as NSError).code
+        }
+        if let encoded = try? JSONSerialization.data(withJSONObject: result) {
+            try? encoded.write(to: resultURL, options: .atomic)
+        }
+    }
+    #endif
 
     private func installFileDiagnosticsIfNeeded() {
         #if DEBUG

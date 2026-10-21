@@ -33,13 +33,14 @@ const option = (name) => options.get(name);
 const profile = option('--profile') ?? 'all';
 const simulatorUI = options.has('--simulator-ui');
 const softwareKeyboard = options.has('--software-keyboard');
-assert.ok(['all', 'primary', 'compact-phone', 'ipad', 'startup-recovery'].includes(profile),
-  '--profile must be all, primary, compact-phone, ipad or startup-recovery');
+assert.ok(['all', 'primary', 'compact-phone', 'ipad', 'startup-recovery', 'full-restore-ui'].includes(profile),
+  '--profile must be all, primary, compact-phone, ipad, startup-recovery or full-restore-ui');
 if (options.has('--help')) {
-  console.log('Usage: node ios-app/scripts/validate-simulator.mjs [--profile all|primary|compact-phone|ipad|startup-recovery] [--report-dir PATH] [--derived-data PATH] [--device-id UUID] [--simulator-ui] [--software-keyboard]\n'
+  console.log('Usage: node ios-app/scripts/validate-simulator.mjs [--profile all|primary|compact-phone|ipad|startup-recovery|full-restore-ui] [--report-dir PATH] [--derived-data PATH] [--device-id UUID] [--simulator-ui] [--software-keyboard]\n'
     + 'Default profile: all. primary runs embedded API, chat, file transfer and full restore checks.\n'
     + 'compact-phone and ipad run only their own seeded native UI checks; ipad also checks file transfer.\n'
     + 'startup-recovery checks a bounded startup failure and manual retry into the real WebView.\n'
+    + 'full-restore-ui selects a real ZIP through Settings, restarts, and continues the restored chat.\n'
     + 'Default mode: headless. --simulator-ui launches the selected Xcode Simulator.app before boot.\n'
     + '--software-keyboard requires CI=true and --simulator-ui, and cannot be used with --device-id. It disables hardware keyboards for fresh CI devices.\n'
     + 'Use a separate --report-dir and --derived-data for each independent worker.');
@@ -51,7 +52,7 @@ if (softwareKeyboard) {
   assert.ok(!option('--device-id'), '--software-keyboard cannot modify an existing --device-id');
 }
 const runsPrimary = profile === 'all' || profile === 'primary';
-const requestedVariants = profile === 'all' ? ['compact-phone', 'ipad', 'startup-recovery'] : runsPrimary ? [] : [profile];
+const requestedVariants = profile === 'all' ? ['compact-phone', 'ipad', 'startup-recovery', 'full-restore-ui'] : runsPrimary ? [] : [profile];
 const reportDir = path.resolve(option('--report-dir') ?? path.join(root, 'ios-app/build/validation'));
 const derived = path.resolve(option('--derived-data') ?? path.join(root, 'ios-app/build/DerivedData'));
 const bundleId = 'com.p16481012.marinar.ios.test';
@@ -73,7 +74,7 @@ const report = { formatVersion: 1, profile, simulatorMode: simulatorUI ? 'simula
   actualEmbeddedNode: false, actualWKWebView: false, nativeSendInteraction: false,
   nativeBlobDownload: false, nativeShareSheet: false, systemFilePicker: false, nativeDialogs: false,
   nativeBackgroundFlush: false,
-  nativeFullRestore: false, restoredWebCacheReset: false, startupTimeoutRecovery: false,
+  nativeFullRestore: false, nativeSettingsFullRestore: false, restoredWebCacheReset: false, startupTimeoutRecovery: false,
   externalProvider: false, physicalDevice: false, provider: 'local OpenAI-compatible fixture',
 } };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -307,7 +308,8 @@ async function runUITests(commandArgs, { phase, log, expectedTests }) {
   await checkpoint();
   // Copy native state before any potentially slow xcresult/AX diagnostics.
   await preserveLaunchLogs();
-  if (['testBlobDownloadShareAndFilePicker', 'testHTMLFilePickerRoundTrip', 'testSystemFilesProviderCanOpenFixture']
+  if (['testBlobDownloadShareAndFilePicker', 'testHTMLFilePickerRoundTrip', 'testSystemFilesProviderCanOpenFixture',
+    'testSettingsFullBackupRestoresAfterProcessRelaunch']
     .some((name) => tests[name] && tests[name] !== 'passed')) {
     // The picker is hosted by a system service. App-only logs cannot explain
     // a visible file that never reaches WebKit's file-input callback.
@@ -391,7 +393,7 @@ async function preserveLaunchLogs() {
   for (const file of launchLogs) await copyFile(file, path.join(reportDir, path.basename(file))).catch(() => {});
   if (deviceId) {
     const current = await run('xcrun', ['simctl', 'get_app_container', deviceId, bundleId, 'data']).catch(() => undefined);
-    if (current) for (const name of ['ios-export-events.json', 'startup-state.json']) {
+    if (current) for (const name of ['ios-export-events.json', 'startup-state.json', 'ios-settings-restore-fixture.json']) {
       await copyFile(diagnosticFile(name, current), path.join(reportDir, `${deviceId}-${name}`)).catch(() => {});
     }
   }
@@ -500,6 +502,111 @@ async function waitRestoreCache(restoreID, skipped) {
     await sleep(500);
   }
   throw new Error('The real WKWebView did not acknowledge the restore cache marker');
+}
+
+async function prepareSettingsRestore(config, stateFile) {
+  const uiState = await prepareUI(config, stateFile);
+  const api = createTestApi(`http://127.0.0.1:${config.port}`, config.token);
+  assert.equal((await api.json('/api/ios/restore/status')).status, 'idle');
+  const chatPath = `/api/chats/${uiState.chatId}`;
+  await api.json(chatPath, { name: 'iOS full restore UI original chat' }, 'PATCH');
+  const response = await api.request('/api/generate/', { body: { chatId: uiState.chatId,
+    userMessage: STREAM_PROMPT, streaming: true, submissionId: randomUUID(), skipPresenceDelay: true } });
+  assert.ok(response.ok, 'Cannot generate the saved conversation for Settings restore');
+  const events = (await response.text()).split('\n').filter(line => line.startsWith('data:'))
+    .map(line => JSON.parse(line.slice(5).trim()));
+  assert.ok(events.some(event => event.type === 'done') && !events.some(event => event.type === 'error'));
+  const idleDeadline = Date.now() + 15_000;
+  let generation;
+  do {
+    generation = await api.json(`/api/generate/status/${uiState.chatId}`);
+    if (!generation.active && !generation.translating) break;
+    await sleep(100);
+  } while (Date.now() < idleDeadline);
+  assert.ok(!generation.active && !generation.translating, 'Fixture generation never released the chat');
+  const originalMessages = await api.json(`${chatPath}/messages`);
+  assert.ok(originalMessages.some(message => message.role === 'assistant' && message.content === STREAM_REPLY));
+  const originalChat = await api.json(chatPath);
+  const preference = JSON.parse((await api.json('/api/app-settings/ui')).value || '{}');
+  const opacity = 47;
+  await api.json('/api/app-settings/ui', { value: JSON.stringify({ ...preference,
+    chatFontOpacity: opacity, __updatedAt: Date.now() }) }, 'PUT');
+  const asset = path.join('knowledge-sources', 'ios-settings-restore-fixture.txt');
+  const assetFile = path.join(config.dataDir, asset);
+  await mkdir(path.dirname(assetFile), { recursive: true });
+  await writeFile(assetFile, Buffer.from('A saved attachment from before the Settings restore.\n'.repeat(1024)));
+  const assetHash = await hashFile(assetFile);
+  await api.json('/api/ios/flush', {});
+  await api.json('/api/ios/backup/start', {});
+  const deadline = Date.now() + 180_000;
+  let backup;
+  while (Date.now() < deadline) {
+    backup = await api.json('/api/ios/backup/status');
+    assert.notEqual(backup.status, 'failed', backup.error ?? 'Settings restore fixture backup failed');
+    if (backup.status === 'ready') break;
+    await sleep(500);
+  }
+  assert.equal(backup?.status, 'ready', 'Settings restore fixture backup timed out');
+  const download = await api.request(backup.downloadUrl);
+  assert.ok(download.ok);
+  const source = diagnosticFile('ios-settings-restore-source.zip');
+  await writeFile(source, Buffer.from(await download.arrayBuffer()));
+  const archiveHash = await hashFile(source);
+  assert.ok(archiveHash.size > 0 && archiveHash.size <= 128 * 1024 * 1024, 'Unexpected Settings backup fixture size');
+  // Only preparation uses the server API. The restore must be staged by the
+  // actual Settings file input, confirmation dialog and multipart request.
+  await api.json(chatPath, { name: 'Changed before native Settings restore' }, 'PATCH');
+  const assistantMessage = originalMessages.find(message => message.role === 'assistant' && message.content === STREAM_REPLY);
+  await api.json(`${chatPath}/messages/${assistantMessage.id}`, { content: 'Changed after backup; the saved blue lantern reply must return.' }, 'PATCH');
+  assert.ok(!(await api.json(`${chatPath}/messages`)).some(message => message.content === STREAM_REPLY));
+  await api.json(`/api/connections/${uiState.connectionId}`, { apiKey: 'intentionally-invalid-after-backup-fixture' }, 'PATCH');
+  await api.json('/api/app-settings/ui', { value: JSON.stringify({ ...preference,
+    chatFontOpacity: 83, __updatedAt: Date.now() + 1000 }) }, 'PUT');
+  await writeFile(assetFile, 'Changed after the backup; this must not survive restoration.');
+  await api.json('/api/ios/flush', {});
+  assert.equal((await api.json('/api/ios/restore/status')).status, 'idle');
+  report.settingsRestore = { archive: archiveHash, attachment: assetHash, preparedAt: new Date().toISOString() };
+  return { uiState, originalChat, originalMessages, opacity, asset, assetHash, archiveHash,
+    callsBeforeUI: mock.calls.length };
+}
+
+async function verifySettingsRestore(expected) {
+  // XCTest may terminate its app at completion. A separate real launch also
+  // verifies that the completed UI restore and its new reply stayed durable.
+  await stop();
+  const config = await launch();
+  const api = createTestApi(`http://127.0.0.1:${config.port}`, config.token);
+  const restored = await api.json('/api/ios/restore/status');
+  assert.equal(restored.status, 'applied', 'The Settings ZIP was never cold-restored');
+  assert.equal(restored.restartRequired, false);
+  const health = await api.json('/api/ios/health');
+  assert.ok(health.restoreAppliedAt && health.restoreAppliedAt === restored.createdAt);
+  const chatPath = `/api/chats/${expected.uiState.chatId}`;
+  assert.equal((await api.json(chatPath)).name, expected.originalChat.name);
+  const messages = await api.json(`${chatPath}/messages`);
+  for (const saved of expected.originalMessages) {
+    assert.deepEqual(messages.find(message => message.id === saved.id), saved,
+      'The UI restore lost or changed an original saved message');
+  }
+  assert.ok(messages.some(message => message.role === 'user' && message.content === RESTORE_PROMPT));
+  assert.ok(messages.some(message => message.role === 'assistant' && message.content === RESTORE_REPLY));
+  const calls = mock.calls.slice(expected.callsBeforeUI).filter(call => call.kind === 'restore');
+  assert.equal(calls.length, 1, 'The restored UI must send exactly one authenticated continuation');
+  assert.equal(calls[0].completed, true);
+  assert.ok(JSON.stringify(calls[0].messages).includes(STREAM_REPLY), 'The saved history was absent from the restored UI request');
+  const preference = JSON.parse((await api.json('/api/app-settings/ui')).value || '{}');
+  assert.equal(preference.chatFontOpacity, expected.opacity);
+  assert.deepEqual(await hashFile(path.join(config.dataDir, expected.asset)), expected.assetHash);
+  assert.deepEqual(await hashFile(path.join(container.trim(), 'Documents', 'marinar-ios-full-restore-ui.zip')), expected.archiveHash,
+    'The selected Documents ZIP differs from the actual server backup');
+  const fixture = JSON.parse(await readFile(diagnosticFile('ios-settings-restore-fixture.json'), 'utf8'));
+  assert.equal(fixture.verified, true);
+  assert.equal(fixture.filename, 'marinar-ios-full-restore-ui.zip');
+  assert.deepEqual({ size: fixture.size, sha256: fixture.sha256 }, expected.archiveHash);
+  await waitRestoreCache(restored.createdAt, true);
+  report.settingsRestore = { ...report.settingsRestore, restoreAppliedAt: restored.createdAt,
+    originalMessagesPreserved: expected.originalMessages.length, continuedViaNativeSend: true,
+    settingsAndAttachmentRestored: true, repeatedLaunchPreservedReply: true };
 }
 
 async function exerciseNativeFullRestore(config, uiState) {
@@ -721,6 +828,8 @@ try {
       ?? devicetypes.find((item) => item.name.startsWith('iPad')), files: true },
     { key: 'startup-recovery', type: devicetypes.find((item) => item.identifier.endsWith('.iPhone-16-Pro'))
       ?? devicetypes.find((item) => item.name.startsWith('iPhone')), files: false, startup: true },
+    { key: 'full-restore-ui', type: devicetypes.find((item) => item.identifier.endsWith('.iPhone-16-Pro'))
+      ?? devicetypes.find((item) => item.name.startsWith('iPhone')), files: false, settingsRestore: true },
   ].filter((variant) => requestedVariants.includes(variant.key));
   const standaloneVariant = runsPrimary ? undefined : variants[0];
   if (standaloneVariant) assert.ok(standaloneVariant.type, `Required ${profile} simulator type is unavailable`);
@@ -765,7 +874,7 @@ try {
 
   // "all" reuses the built bundle on additional devices. Standalone variants
   // reuse only their own already booted build destination and seed fresh data;
-  // they do not run or claim the primary API, send or full restore suite.
+  // Each declares only its own coverage, independently of the primary suite.
   for (const variant of variants) {
     const errorsBefore = report.errors.length;
     const result = { key: variant.key, name: variant.type?.name, runtimeVersion: selectedRuntime.version, checks: [], status: 'running' };
@@ -775,6 +884,7 @@ try {
       await checkpoint(`${variant.key}-setup`);
       assert.ok(variant.type, `Required ${variant.key} simulator type is unavailable`);
       console.log(variant.startup ? 'Checking startup timeout and a real manual retry before session preparation.'
+        : variant.settingsRestore ? 'Restoring a real backup through Settings, the system ZIP picker and a cold launch.'
         : `Checking ${variant.key} portrait/landscape keyboard${variant.files ? ', blob export and system picker' : ''} with the existing build.`);
       if (standaloneVariant) variantDevice = deviceId;
       else {
@@ -815,6 +925,30 @@ try {
           Object.assign(report.coverage, { actualWKWebView: true, startupTimeoutRecovery: true });
           result.checks.push('startup-timeout-before-cookie-shows-retry', 'manual-retry-reaches-real-webview',
             'recovered-native-state-restores-normal-budget');
+        }
+        continue;
+      }
+      if (variant.settingsRestore) {
+        const config = await launch();
+        report.coverage.actualEmbeddedNode = true;
+        result.checks.push('native-node-authenticated-health-before-settings-restore');
+        const expected = await prepareSettingsRestore(config, path.join(reportDir, 'settings-restore-seed.json'));
+        await stop();
+        await preserveLaunchLogs();
+        const tests = await runUITests(['test-without-building', ...argsForDevice,
+          '-parallel-testing-enabled', 'NO', '-maximum-concurrent-test-simulator-destinations', '1',
+          '-only-testing:MarinarUITests/MarinarUITests/testSettingsFullBackupRestoresAfterProcessRelaunch',
+          '-resultBundlePath', path.join(reportDir, 'settings-full-restore.xcresult')], {
+          phase: 'settings-full-restore', log: 'settings-full-restore-ui-tests.log',
+          expectedTests: ['testSettingsFullBackupRestoresAfterProcessRelaunch'],
+        });
+        if (tests.has('testSettingsFullBackupRestoresAfterProcessRelaunch')) {
+          await verifySettingsRestore(expected);
+          Object.assign(report.coverage, { actualWKWebView: true, nativeSendInteraction: true,
+            systemFilePicker: true, nativeFullRestore: true, nativeSettingsFullRestore: true });
+          result.checks.push('settings-zip-picker-confirm-and-pending-restore', 'settings-restore-cold-launch-and-success-message',
+            'settings-restore-preserves-original-messages', 'settings-restore-preserves-preferences-and-attachment',
+            'settings-restore-native-send-uses-restored-key-and-history', 'settings-restore-continuation-survives-another-launch');
         }
         continue;
       }

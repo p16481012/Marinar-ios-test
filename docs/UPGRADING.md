@@ -1,5 +1,7 @@
 # Upgrading Marinara Engine
 
+> **iOS 앱 사용자:** 아래 내용은 원본 PC·서버 설치의 업데이트 안내입니다. 이 저장소의 iOS 앱은 전체 백업을 앱 밖에 보관한 뒤 새 IPA 또는 Xcode 빌드를 설치하여 업데이트합니다. 앱 내부의 서버 업데이트·재시작이나 다운로드형 기능 패키지는 지원하지 않습니다. [iOS 설치와 백업 안내](../README.md)를 먼저 확인하세요.
+
 This guide shows you how to update Marinara Engine to a newer version. It covers every install type, the in-app update tools, and what to do if an upgrade fails. Your chats and settings are kept when you upgrade.
 
 ## Your data is preserved

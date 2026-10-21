@@ -156,6 +156,141 @@ final class MarinarUITests: XCTestCase {
         return input
     }
 
+    func testSettingsFullBackupRestoresAfterProcessRelaunch() throws {
+        app.terminate()
+        app.launchEnvironment["MARINARA_TEST_SETTINGS_RESTORE"] = "1"
+        defer { app.launchEnvironment.removeValue(forKey: "MARINARA_TEST_SETTINGS_RESTORE") }
+        launchReady()
+        _ = prepareComposerForInput()
+        openSettingsBackupSection()
+
+        let filename = "marinar-ios-full-restore-ui.zip"
+        let restore = hittableWebElement(named: "Restore full iOS backup")
+        let expectedFile = XCTAttachment(string: filename)
+        expectedFile.name = "settings-restore-expected-archive"
+        expectedFile.lifetime = .keepAlways
+        add(expectedFile)
+        // This opens the product's hidden ZIP input through its real button.
+        // No DEBUG HTML panel, file-input injection or direct stage API is used.
+        _ = openDocumentPicker(restore)
+        selectSystemDocument(named: filename)
+        let confirmationText = "Restore \(filename)? This replaces current data at the next complete app restart. Save a backup of your current data first. The file will be validated before anything is replaced, and you can cancel the pending restore before restarting."
+        let confirmation = app.webViews.staticTexts[confirmationText].firstMatch
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 30), "The real restore confirmation did not name the selected ZIP")
+        XCTAssertEqual(confirmation.label, confirmationText)
+        attachScreen("settings-restore-confirmation")
+        let confirmEvidence = XCTAttachment(string: confirmation.label)
+        confirmEvidence.name = "settings-restore-confirmed-filename"
+        confirmEvidence.lifetime = .keepAlways
+        add(confirmEvidence)
+        hittableWebElement(named: "Validate and prepare restore").tap()
+
+        let pending = app.webViews.staticTexts["Backup ready to restore"].firstMatch
+        XCTAssertTrue(pending.waitForExistence(timeout: 180), "The selected ZIP was not uploaded, validated and staged by Settings")
+        _ = hittableWebElement(named: "Cancel restore and keep current data")
+        let restartText = "Fully close Marinar from the app switcher, then reopen it. The validated backup will replace current data before the server starts. Editing is paused until you restart or cancel this restore. Reloading the page or briefly going to the Home Screen is not enough."
+        XCTAssertTrue(app.webViews.staticTexts[restartText].firstMatch.exists, "The product did not explain that a full process restart is required")
+        attachScreen("settings-restore-pending-before-cold-launch")
+        let pendingEvidence = XCTAttachment(string: app.debugDescription)
+        pendingEvidence.name = "settings-restore-pending-accessibility-hierarchy"
+        pendingEvidence.lifetime = .keepAlways
+        add(pendingEvidence)
+
+        app.terminate()
+        launchReady()
+        _ = prepareComposerForInput()
+        XCTAssertFalse(app.webViews.staticTexts["Backup ready to restore"].firstMatch.exists,
+                       "The pending restore did not apply at the actual cold launch")
+        openSettingsBackupSection()
+        let applied = app.webViews.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "The full backup was restored.")).firstMatch
+        XCTAssertTrue(applied.waitForExistence(timeout: 30), "Settings did not report that the archive was restored")
+        attachScreen("settings-restore-applied-after-cold-launch")
+        let appliedEvidence = XCTAttachment(string: applied.label)
+        appliedEvidence.name = "settings-restore-applied-status"
+        appliedEvidence.lifetime = .keepAlways
+        add(appliedEvidence)
+        hittableWebElement(named: "Close panel").tap()
+
+        // Select the restored chat from the real list even if DEBUG setup also
+        // selected it. Merely reaching the restore-success banner is not enough.
+        hittableWebElement(named: "Chats").tap()
+        let chat = app.webViews.staticTexts["iOS full restore UI original chat"].firstMatch
+        XCTAssertTrue(chat.waitForExistence(timeout: 30), "The original backup chat did not return to the actual chat list")
+        XCTAssertTrue(chat.isHittable, "The restored chat cannot be selected")
+        chat.tap()
+        let input = prepareComposerForInput()
+        let originalReply = "The blue lantern is remembered. 대화 저장을 확인했습니다."
+        let restored = app.webViews.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", originalReply)).firstMatch
+        XCTAssertTrue(restored.waitForExistence(timeout: 30), "The selected restored chat lost its original assistant reply")
+        attachScreen("settings-restore-original-chat-and-reply")
+        input.tap()
+        prepareSoftwareKeyboard()
+        input.typeText("[IOS_RESTORE_TEST] What did we remember before restarting?")
+        let send = hittableWebElement(named: "Send")
+        assertComposerAboveKeyboard()
+        send.tap()
+        let followup = "After restarting, I still remember the blue lantern."
+        let received = app.webViews.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", followup)).firstMatch
+        XCTAssertTrue(received.waitForExistence(timeout: 90), "The restored connection could not send and display a new real mock-provider reply")
+        attachScreen("settings-restore-followup-with-recovered-connection")
+        let replyEvidence = XCTAttachment(string: received.label)
+        replyEvidence.name = "settings-restore-followup-reply"
+        replyEvidence.lifetime = .keepAlways
+        add(replyEvidence)
+        XCUIDevice.shared.press(.home)
+        sleep(2)
+    }
+
+    private func hittableWebElement(named label: String, timeout: TimeInterval = 20) -> XCUIElement {
+        let web = app.webViews["marinar-webview"]
+        let buttons = web.buttons.matching(NSPredicate(format: "label == %@", label))
+        let elements = web.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label))
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            // WebKit maps ordinary buttons, role=tab and role=menuitem to
+            // different AX types. All candidates still use the exact product label.
+            if let element = buttons.allElementsBoundByIndex.first(where: { $0.isEnabled && $0.isHittable }) {
+                return element
+            }
+            if let element = elements.allElementsBoundByIndex.first(where: {
+                $0.elementType != .staticText && $0.isEnabled && $0.isHittable
+            }) { return element }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        }
+        attachScreen("settings-control-unavailable")
+        XCTFail("The actual product control is not enabled and hittable: \(label)")
+        return elements.firstMatch
+    }
+
+    private func openSettingsBackupSection() {
+        let web = app.webViews["marinar-webview"]
+        let settings = web.buttons["Settings"].firstMatch
+        if !(settings.exists && settings.isEnabled && settings.isHittable) {
+            hittableWebElement(named: "More").tap()
+        }
+        hittableWebElement(named: "Settings").tap()
+        hittableWebElement(named: "Advanced").tap()
+        let quickAccess = web.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Quick Access' OR label == 'Expand Quick Access' OR label == 'Collapse Quick Access'")).firstMatch
+        XCTAssertTrue(quickAccess.waitForExistence(timeout: 20), "Settings Quick Access is missing")
+        let backupShortcut = web.buttons["Backup & Export"].firstMatch
+        if !(backupShortcut.exists && backupShortcut.isHittable) {
+            XCTAssertTrue(quickAccess.isEnabled && quickAccess.isHittable)
+            quickAccess.tap()
+        }
+        hittableWebElement(named: "Backup & Export").tap()
+        // Collapse the observed shortcuts to leave space for the real backup
+        // controls. This preserves the user's own section-navigation behavior.
+        if backupShortcut.exists && backupShortcut.isHittable && quickAccess.isHittable { quickAccess.tap() }
+        let restore = web.buttons["Restore full iOS backup"].firstMatch
+        XCTAssertTrue(restore.waitForExistence(timeout: 30), "The real iOS full-backup section did not render")
+        for _ in 0..<3 {
+            if restore.isHittable { break }
+            web.swipeUp()
+        }
+        XCTAssertTrue(restore.isEnabled && restore.isHittable, "The Settings restore action is outside the visible panel")
+        attachScreen("settings-full-backup-section")
+    }
+
     func testSendPersistsAfterProcessRelaunch() throws {
         launchReady()
         let input = prepareComposerForInput()
@@ -413,7 +548,6 @@ final class MarinarUITests: XCTestCase {
         filenameEvidence.name = "html-picker-expected-fixture"
         filenameEvidence.lifetime = .keepAlways
         add(filenameEvidence)
-        let fixtureStem = (fixtureFilename as NSString).deletingPathExtension
         let file = app.webViews.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'Choose File' OR label CONTAINS[c] 'Choose test file'")).firstMatch
         XCTAssertTrue(file.waitForExistence(timeout: 15), "HTML file input is missing")
         let picker = app.otherElements["Browse View (Picker)"].firstMatch
@@ -429,7 +563,23 @@ final class MarinarUITests: XCTestCase {
         cancelled.lifetime = .keepAlways
         add(cancelled)
         _ = openDocumentPicker(file)
-        let fixture = app.staticTexts.matching(NSPredicate(format: "label == %@ OR label == %@", fixtureFilename, fixtureStem)).firstMatch
+        selectSystemDocument(named: fixtureFilename)
+        let expectedJSON = #"{"fixture":"restored-file-fixture","text":"실제 파일 선택 확인"}"#
+        let expectedImport = "Imported: \(fixtureFilename) \(expectedJSON)"
+        let imported = app.webViews.staticTexts[expectedImport].firstMatch
+        XCTAssertTrue(imported.waitForExistence(timeout: 15), "WKWebView did not receive the selected file bytes")
+        XCTAssertEqual(imported.label, expectedImport, "File.text() did not return the exact selected filename and JSON")
+        let importedEvidence = XCTAttachment(string: imported.label)
+        importedEvidence.name = "html-file-reader-verified-content"
+        importedEvidence.lifetime = .keepAlways
+        add(importedEvidence)
+        attachScreen("system-file-imported")
+    }
+
+    private func selectSystemDocument(named filename: String) {
+        let stem = (filename as NSString).deletingPathExtension
+        let picker = app.otherElements["Browse View (Picker)"].firstMatch
+        let fixture = app.staticTexts.matching(NSPredicate(format: "label == %@ OR label == %@", filename, stem)).firstMatch
         if !fixture.waitForExistence(timeout: 3) {
             // The initial picker can be Recents or the last visited directory.
             for _ in 0..<3 {
@@ -491,16 +641,6 @@ final class MarinarUITests: XCTestCase {
         // bounded, and still require dismissal and the exact bytes below.
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: picker)
         waitForExpectations(timeout: 60)
-        let expectedJSON = #"{"fixture":"restored-file-fixture","text":"실제 파일 선택 확인"}"#
-        let expectedImport = "Imported: \(fixtureFilename) \(expectedJSON)"
-        let imported = app.webViews.staticTexts[expectedImport].firstMatch
-        XCTAssertTrue(imported.waitForExistence(timeout: 15), "WKWebView did not receive the selected file bytes")
-        XCTAssertEqual(imported.label, expectedImport, "File.text() did not return the exact selected filename and JSON")
-        let importedEvidence = XCTAttachment(string: imported.label)
-        importedEvidence.name = "html-file-reader-verified-content"
-        importedEvidence.lifetime = .keepAlways
-        add(importedEvidence)
-        attachScreen("system-file-imported")
     }
 
     private func filePickerViewport(_ fileView: XCUIElement) -> CGRect {
