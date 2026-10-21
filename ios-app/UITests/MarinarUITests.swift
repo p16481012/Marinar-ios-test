@@ -155,6 +155,16 @@ final class MarinarUITests: XCTestCase {
         }
         XCTAssertTrue(fixture.waitForExistence(timeout: 20), "Fixture not found in the app's Files folder")
         fixture.tap()
+        attachScreen("system-file-selected")
+        let selection = XCTAttachment(string: app.debugDescription)
+        selection.name = "system-file-selected-accessibility-hierarchy"
+        selection.lifetime = .keepAlways
+        add(selection)
+        // Some Files picker presentations select the file first and expose a
+        // separate Open action. Complete that visible action when available;
+        // the page must still receive and read the real fixture bytes below.
+        let open = app.buttons["Open"].firstMatch
+        if open.waitForExistence(timeout: 5) && open.isEnabled { open.tap() }
         let imported = app.webViews.staticTexts.matching(NSPredicate(format: "label CONTAINS 'restored-file-fixture'")).firstMatch
         XCTAssertTrue(imported.waitForExistence(timeout: 15), "WKWebView did not receive the selected file bytes")
         attachScreen("system-file-imported")

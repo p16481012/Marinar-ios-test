@@ -24,6 +24,8 @@ let mock;
 let container;
 let launchNumber = 0;
 const launchLogs = [];
+const exportedResultBundles = new Set();
+let attachmentExportSupported;
 const report = { formatVersion: 1, status: 'running', checks: [], errors: [], uiTests: [], coverage: {
   actualEmbeddedNode: false, actualWKWebView: false, nativeSendInteraction: false,
   nativeBlobDownload: false, nativeShareSheet: false, systemFilePicker: false, nativeDialogs: false,
@@ -155,6 +157,12 @@ async function runUITests(commandArgs, { phase, log, expectedTests }) {
     if (status !== 'passed') recordFailure(`${phase}/${name}`, new Error(`XCTest ${status}; see ${log}`));
   }
   await checkpoint();
+  // Preserve each completed suite's PNG/text evidence now. Later device
+  // startup or cancellation must not hide an earlier test's failure screen.
+  const bundleIndex = commandArgs.indexOf('-resultBundlePath');
+  if (bundleIndex >= 0 && commandArgs[bundleIndex + 1]) {
+    await exportTestAttachments(path.resolve(root, commandArgs[bundleIndex + 1]));
+  }
   return new Set(Object.keys(tests).filter((name) => tests[name] === 'passed'));
 }
 
@@ -210,17 +218,33 @@ async function preserveLaunchLogs() {
   }
 }
 
-async function exportTestAttachments() {
+async function exportTestAttachments(resultBundle) {
   // Keep ordinary PNG/text attachments beside xcresult so failure evidence
   // can be inspected from Windows without Apple's xcresulttool.
-  const help = await run('xcrun', ['xcresulttool', 'export', 'attachments', '--help'], { allowFailure: true });
-  await writeFile(path.join(reportDir, 'xcresult-attachments-help.txt'), help + '\n');
-  if (!help.includes('--path') || !help.includes('--output-path')) return;
-  for (const entry of await readdir(reportDir, { withFileTypes: true })) {
-    if (!entry.isDirectory() || !entry.name.endsWith('.xcresult')) continue;
-    const key = path.basename(entry.name, '.xcresult');
-    await run('xcrun', ['xcresulttool', 'export', 'attachments', '--path', path.join(reportDir, entry.name),
-      '--output-path', path.join(reportDir, 'attachments', key)], { log: `${key}-attachments.log`, allowFailure: true });
+  if (attachmentExportSupported === undefined) {
+    try {
+      const help = await run('xcrun', ['xcresulttool', 'export', 'attachments', '--help']);
+      await writeFile(path.join(reportDir, 'xcresult-attachments-help.txt'), help + '\n');
+      attachmentExportSupported = help.includes('--path') && help.includes('--output-path');
+    } catch (error) {
+      console.warn(`Could not check XCTest attachment export support: ${error.message}`);
+      return; // A later suite/finally can retry a transient failure.
+    }
+  }
+  if (!attachmentExportSupported) return;
+  const bundles = resultBundle ? [resultBundle] : (await readdir(reportDir, { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory() && entry.name.endsWith('.xcresult')).map((entry) => path.join(reportDir, entry.name));
+  for (const bundle of bundles) {
+    if (exportedResultBundles.has(bundle)) continue;
+    const key = path.basename(bundle, '.xcresult');
+    try {
+      await run('xcrun', ['xcresulttool', 'export', 'attachments', '--path', bundle,
+        '--output-path', path.join(reportDir, 'attachments', key)], { log: `${key}-attachments.log` });
+      exportedResultBundles.add(bundle);
+    } catch (error) {
+      console.warn(`Could not export ${key} XCTest attachments: ${error.message}`);
+      // Do not mark unsuccessful exports complete; the final sweep retries.
+    }
   }
 }
 
@@ -403,15 +427,20 @@ try {
   await checkpoint('environment');
   assert.equal(process.platform, 'darwin', 'This validation requires macOS and Xcode');
   assert.equal(process.arch, 'arm64', 'The pinned Node framework has an ARM64 simulator slice only');
+  const xcodeVersion = await run('xcodebuild', ['-version']);
+  const simulatorSDK = await run('xcrun', ['--sdk', 'iphonesimulator', '--show-sdk-version']);
+  const sdkFamily = simulatorSDK.split('.').slice(0, 2).join('.');
+  report.toolchain = { xcodeVersion, simulatorSDK };
   const launchHelp = await run('xcrun', ['simctl', 'help', 'launch']);
   await writeFile(path.join(reportDir, 'simctl-launch-help.txt'), launchHelp + '\n');
   assert.ok(launchHelp.includes('--stdout') && launchHelp.includes('--stderr'), 'Installed simctl lacks file output redirection');
   const { runtimes } = JSON.parse(await run('xcrun', ['simctl', 'list', 'runtimes', '-j']));
   const { devicetypes } = JSON.parse(await run('xcrun', ['simctl', 'list', 'devicetypes', '-j']));
   if (!deviceId) {
-    const runtime = runtimes.filter((item) => item.isAvailable && item.identifier.includes('.iOS-'))
+    const runtime = runtimes.filter((item) => item.isAvailable && item.identifier.includes('.iOS-')
+      && item.version.split('.').slice(0, 2).join('.') === sdkFamily)
       .sort((a, b) => b.version.localeCompare(a.version, undefined, { numeric: true }))[0];
-    assert.ok(runtime, 'No available iOS Simulator runtime');
+    assert.ok(runtime, `No available iOS Simulator runtime matching SDK ${simulatorSDK}; select the matching Xcode or install its runtime`);
     const type = devicetypes.find((item) => item.identifier.endsWith('.iPhone-16-Pro'))
       ?? devicetypes.filter((item) => item.name.startsWith('iPhone')).at(-1);
     assert.ok(type, 'No iPhone simulator device type');
@@ -425,6 +454,8 @@ try {
   assert.ok(selected, 'Selected simulator is not listed by simctl');
   const selectedRuntime = runtimes.find((runtime) => runtime.identifier === selected.runtimeIdentifier);
   assert.ok(selectedRuntime, 'Cannot identify selected simulator runtime');
+  assert.equal(selectedRuntime.version.split('.').slice(0, 2).join('.'), sdkFamily,
+    'Selected simulator runtime must match the current Xcode simulator SDK');
   report.simulator = { name: selected.name, deviceTypeIdentifier: selected.deviceTypeIdentifier,
     runtimeIdentifier: selected.runtimeIdentifier, runtimeVersion: selectedRuntime.version,
     runtimeBuildVersion: selectedRuntime.buildversion };

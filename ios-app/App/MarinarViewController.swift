@@ -598,7 +598,10 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
           };
           panel.querySelector('#ios-test-file').onchange = async (event) => {
             const file = event.target.files[0];
-            panel.querySelector('#ios-file-result').textContent = file ? 'Imported: ' + file.name + ' ' + await file.text() : 'No file selected';
+            const result = panel.querySelector('#ios-file-result');
+            try {
+              result.textContent = file ? 'Imported: ' + file.name + ' ' + await file.text() : 'No file selected';
+            } catch (error) { result.textContent = 'Import failed: ' + error.message; }
           };
           panel.querySelector('#ios-test-confirm').onclick = () => {
             panel.querySelector('#ios-file-result').textContent = confirm('Confirm the iOS test?') ? 'Confirmation accepted' : 'Confirmation cancelled';
