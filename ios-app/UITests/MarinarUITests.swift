@@ -250,9 +250,9 @@ final class MarinarUITests: XCTestCase {
         attachScreen("settings-restore-original-chat-and-reply")
         input.tap()
         prepareSoftwareKeyboard()
-        input.typeText("[IOS_RESTORE_TEST] What did we remember before restarting?")
-        let send = hittableWebElement(named: "Send")
-        assertComposerAboveKeyboard()
+        let restoredPrompt = "[IOS_RESTORE_TEST] What did we remember before restarting?"
+        input.typeText(restoredPrompt)
+        let send = prepareSendForPrompt(restoredPrompt, input: input)
         send.tap()
         let followup = "After restarting, I still remember the blue lantern."
         let received = app.webViews.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", followup)).firstMatch
@@ -421,11 +421,7 @@ final class MarinarUITests: XCTestCase {
         input.tap()
         prepareSoftwareKeyboard()
         input.typeText(prompt)
-        let send = app.webViews.buttons["Send"].firstMatch
-        XCTAssertTrue(send.waitForExistence(timeout: 15))
-        XCTAssertTrue(send.isEnabled)
-        XCTAssertTrue(send.isHittable, "Send is covered by the keyboard or outside the safe area")
-        assertComposerAboveKeyboard()
+        let send = prepareSendForPrompt(prompt, input: input)
         send.tap()
         let response = app.webViews.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", reply)).firstMatch
         XCTAssertTrue(response.waitForExistence(timeout: 90), "Real UI send did not display the mock provider response")
@@ -550,6 +546,22 @@ final class MarinarUITests: XCTestCase {
         }
         attachKeyboardDiagnostics("composer-keyboard-layout-not-ready")
         XCTFail("The composer did not settle fully inside the WebView above the keyboard: \(lastObservation)")
+    }
+
+    private func prepareSendForPrompt(_ expected: String, input: XCUIElement) -> XCUIElement {
+        // The native QuickPath introduction can appear after typeText returns.
+        // Dismiss that observed UI and settle the keyboard before checking Send.
+        // Never retype: require the original input to contain the whole prompt.
+        assertComposerAboveKeyboard()
+        let send = app.webViews.buttons["Send"].firstMatch
+        expectation(for: NSPredicate { _, _ in
+            input.exists && (input.value as? String) == expected
+                && send.exists && send.isEnabled && send.isHittable
+        }, evaluatedWith: send)
+        waitForExpectations(timeout: 20)
+        XCTAssertEqual(input.value as? String, expected, "The real composer lost or changed the typed prompt")
+        XCTAssertTrue(send.isEnabled && send.isHittable, "Send is disabled, covered by the keyboard or outside the safe area")
+        return send
     }
 
     func testComposerAcrossOrientations() throws {
