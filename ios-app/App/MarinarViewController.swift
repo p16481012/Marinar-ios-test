@@ -486,6 +486,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
 
     private func recordExportEventIfNeeded(_ name: String, fields: [String: Any] = [:]) {
         #if DEBUG
+        guard ProcessInfo.processInfo.environment["MARINARA_TEST_NO_FILE_TRACING"] != "1" else { return }
         guard ProcessInfo.processInfo.environment["MARINARA_TEST_FILE_PANEL"] == "1" else { return }
         // Keep URLs, credentials, user filenames and server response bodies out
         // of this artifact. Test fixture names, stages and native touches are safe diagnostics.
@@ -703,6 +704,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
 
     private func recordTestDownloadIfNeeded(_ url: URL) {
         #if DEBUG
+        guard ProcessInfo.processInfo.environment["MARINARA_TEST_NO_FILE_TRACING"] != "1" else { return }
         guard ProcessInfo.processInfo.environment["MARINARA_TEST_FILE_PANEL"] == "1",
               let handle = try? FileHandle(forReadingFrom: url) else { return }
         defer { try? handle.close() }

@@ -11,7 +11,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         self.controller = controller
         #if DEBUG
         let window: UIWindow
-        if ProcessInfo.processInfo.environment["MARINARA_TEST_FILE_PANEL"] == "1" {
+        if ProcessInfo.processInfo.environment["MARINARA_TEST_FILE_PANEL"] == "1"
+            && ProcessInfo.processInfo.environment["MARINARA_TEST_NO_FILE_TRACING"] != "1" {
             let diagnosticWindow = MarinarDiagnosticWindow(frame: UIScreen.main.bounds)
             diagnosticWindow.diagnosticsController = controller
             window = diagnosticWindow

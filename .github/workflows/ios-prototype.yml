@@ -1,15 +1,15 @@
-name: Fresh main app file picker diagnostic
+name: File picker without touch logging diagnostic
 on:
   workflow_dispatch:
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: fresh-main-file-picker-${{ github.ref }}
+  group: file-picker-without-touch-logging-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   fresh-file-picker:
-    name: Main app first install (Node and WebKit)
+    name: Fresh app without file tracing (Node and WebKit)
     runs-on: macos-15
     timeout-minutes: 40
     env:
@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 3
       - uses: actions/setup-node@v4
         with:
           node-version: 24.14.0
@@ -39,14 +39,14 @@ jobs:
           mkdir -p ios-app/Resources
           tar -xzf ios-app/build/runtime.tar.gz -C ios-app/Resources
       - run: node ios-app/scripts/download-node.mjs
-      - name: Run one first-install file diagnostic
+      - name: Run one first-install diagnostic without file tracing
         run: python3 diagnostics/fresh-main-file-picker/run.py
         timeout-minutes: 34
       - name: Upload compact evidence
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: fresh-main-file-picker-summary
+          name: file-picker-without-touch-logging-summary
           path: |
             ios-app/build/fresh-picker/report/*.json
             ios-app/build/fresh-picker/report/*.log
@@ -62,6 +62,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: fresh-main-file-picker-full
+          name: file-picker-without-touch-logging-full
           path: ios-app/build/fresh-picker/report/
           retention-days: 7

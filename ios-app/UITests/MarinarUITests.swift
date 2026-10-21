@@ -12,6 +12,7 @@ final class MarinarUITests: XCTestCase {
         XCUIDevice.shared.orientation = .portrait
         app.launchArguments = ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchEnvironment["MARINARA_TEST_DIAGNOSTICS"] = "1"
+        app.launchEnvironment["MARINARA_TEST_NO_FILE_TRACING"] = "1"
     }
 
     override func tearDownWithError() throws {
@@ -352,6 +353,10 @@ final class MarinarUITests: XCTestCase {
         let fixtureFilename = String(fixtureDescription.label.dropFirst(fixturePrefix.count))
         XCTAssertNotNil(fixtureFilename.range(of: "^marinar-ios-import-[0-9a-f]{8}\\.json$", options: .regularExpression),
                         "The import fixture filename is invalid")
+        let filenameEvidence = XCTAttachment(string: fixtureFilename)
+        filenameEvidence.name = "html-picker-expected-fixture"
+        filenameEvidence.lifetime = .keepAlways
+        add(filenameEvidence)
         let fixtureStem = (fixtureFilename as NSString).deletingPathExtension
         let file = app.webViews.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'Choose File' OR label CONTAINS[c] 'Choose test file'")).firstMatch
         XCTAssertTrue(file.waitForExistence(timeout: 15), "HTML file input is missing")
@@ -420,9 +425,15 @@ final class MarinarUITests: XCTestCase {
         let picker = app.otherElements["Browse View (Picker)"].firstMatch
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: picker)
         waitForExpectations(timeout: 15)
-        let imported = app.webViews.staticTexts.matching(NSPredicate(format:
-            "label CONTAINS %@ AND label CONTAINS 'restored-file-fixture'", fixtureFilename)).firstMatch
+        let expectedJSON = #"{"fixture":"restored-file-fixture","text":"실제 파일 선택 확인"}"#
+        let expectedImport = "Imported: \(fixtureFilename) \(expectedJSON)"
+        let imported = app.webViews.staticTexts[expectedImport].firstMatch
         XCTAssertTrue(imported.waitForExistence(timeout: 15), "WKWebView did not receive the selected file bytes")
+        XCTAssertEqual(imported.label, expectedImport, "File.text() did not return the exact selected filename and JSON")
+        let importedEvidence = XCTAttachment(string: imported.label)
+        importedEvidence.name = "html-file-reader-verified-content"
+        importedEvidence.lifetime = .keepAlways
+        add(importedEvidence)
         attachScreen("system-file-imported")
     }
 
