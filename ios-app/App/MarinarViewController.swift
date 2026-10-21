@@ -304,6 +304,8 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        recordExportEventIfNeeded("navigation-action", fields: ["scheme": navigationAction.request.url?.scheme ?? "none",
+            "newWindow": navigationAction.targetFrame == nil, "shouldPerformDownload": navigationAction.shouldPerformDownload])
         guard let url = navigationAction.request.url else { decisionHandler(.cancel); return }
         if navigationAction.shouldPerformDownload || (isLocalBlob(url) && navigationAction.targetFrame == nil) {
             decisionHandler(isLocal(url) || isLocalBlob(url) ? .download : .cancel)
@@ -320,10 +322,14 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        recordExportEventIfNeeded("navigation-response", fields: ["scheme": navigationResponse.response.url?.scheme ?? "none",
+            "canShowMIMEType": navigationResponse.canShowMIMEType])
         decisionHandler(navigationResponse.canShowMIMEType ? .allow : .download)
     }
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        recordExportEventIfNeeded("new-window", fields: ["scheme": navigationAction.request.url?.scheme ?? "none",
+            "shouldPerformDownload": navigationAction.shouldPerformDownload])
         if let url = navigationAction.request.url, isLocal(url) { webView.load(navigationAction.request) }
         return nil
     }
@@ -358,9 +364,17 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         present(alert, animated: true)
     }
 
-    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) { download.delegate = self }
-    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) { download.delegate = self }
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        recordExportEventIfNeeded("action-became-download")
+        download.delegate = self
+    }
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        recordExportEventIfNeeded("response-became-download")
+        download.delegate = self
+    }
     func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+        recordExportEventIfNeeded("download-destination", fields: ["scheme": response.url?.scheme ?? "none",
+            "status": (response as? HTTPURLResponse)?.statusCode ?? 0])
         if let response = response as? HTTPURLResponse, !(200...299).contains(response.statusCode) {
             reportedDownloadFailures.insert(ObjectIdentifier(download))
             completionHandler(nil)
@@ -380,6 +394,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         } catch { completionHandler(nil) }
     }
     func downloadDidFinish(_ download: WKDownload) {
+        recordExportEventIfNeeded("download-finished")
         guard let url = downloadURLs.removeValue(forKey: ObjectIdentifier(download)) else { return }
         try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: url.path)
         recordTestDownloadIfNeeded(url)
@@ -402,6 +417,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
             return
         }
         sharing = true
+        recordExportEventIfNeeded("share-presenting")
         let url = pendingShares.removeFirst()
         let share = UIActivityViewController(activityItems: [url], applicationActivities: nil)
         share.view.accessibilityIdentifier = "marinar-export-share"
@@ -423,6 +439,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     }
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        recordExportEventIfNeeded("download-failed", fields: ["code": (error as NSError).code])
         if let url = downloadURLs.removeValue(forKey: ObjectIdentifier(download)) { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         if reportedDownloadFailures.remove(ObjectIdentifier(download)) != nil { return }
         showExportError(error.localizedDescription)
@@ -431,6 +448,27 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     private func showExportError(_ message: String) {
         pendingExportErrors.append(message)
         presentNextShare()
+    }
+
+    private func recordExportEventIfNeeded(_ name: String, fields: [String: Any] = [:]) {
+        #if DEBUG
+        guard ProcessInfo.processInfo.environment["MARINARA_TEST_FILE_PANEL"] == "1" else { return }
+        // Keep URLs, credentials, filenames and server response bodies out of
+        // this small diagnostic artifact. Only navigation/download stages are recorded.
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let file = documents.appendingPathComponent("ios-export-events.json")
+        var events = (try? Data(contentsOf: file)).flatMap {
+            (try? JSONSerialization.jsonObject(with: $0)) as? [[String: Any]]
+        } ?? []
+        var event = fields
+        event["event"] = name
+        event["time"] = Date().timeIntervalSince1970
+        event["pid"] = ProcessInfo.processInfo.processIdentifier
+        events.append(event)
+        if let data = try? JSONSerialization.data(withJSONObject: Array(events.suffix(200))) {
+            try? data.write(to: file, options: .atomic)
+        }
+        #endif
     }
 
     private func installRestoreResetIfNeeded(_ restoreID: String?) {
@@ -505,7 +543,20 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
           const panel = document.createElement('section');
           panel.id = 'ios-file-diagnostics';
           panel.style = 'position:fixed;inset:8px;z-index:2147483647;background:white;color:black;padding:16px;overflow:auto';
-          panel.innerHTML = '<h1>iOS file diagnostics</h1><button id="ios-test-export">Export test JSON</button><button id="ios-test-error">Test failed export</button><hr><label>Choose test file<input id="ios-test-file" type="file" accept="application/json,.json"></label><hr><button id="ios-test-confirm">Test confirmation</button><p id="ios-file-result"></p>';
+          panel.innerHTML = '<h1>iOS file diagnostics</h1><button id="ios-test-export">Export test JSON</button><button id="ios-test-error">Test failed export</button><hr><label>Choose test file<input id="ios-test-file" type="file" accept="application/json,.json"></label><hr><button id="ios-test-confirm">Test confirmation</button><p id="ios-file-result"></p><aside id="ios-event-result" style="position:fixed;bottom:16px;left:24px;right:24px;height:70px;font-size:12px;overflow:auto;pointer-events:none"></aside><p id="ios-export-result" style="position:fixed;bottom:90px;left:24px;right:24px;height:30px;font-size:14px;pointer-events:none">Export handler idle</p>';
+          const events = [];
+          let displayEvents;
+          for (const type of ['pointerdown', 'pointerup', 'touchstart', 'touchend', 'click']) {
+            panel.addEventListener(type, event => {
+              events.push(type + ':' + (event.target.id || event.target.tagName));
+              if (type === 'pointerup' || type === 'touchend' || type === 'click') {
+                clearTimeout(displayEvents);
+                displayEvents = setTimeout(() => {
+                  panel.querySelector('#ios-event-result').textContent = events.slice(-8).join(' > ');
+                }, 400);
+              }
+            }, {capture:true, passive:true});
+          }
           const directDownload = (url, name) => {
             const anchor = document.createElement('a'); anchor.href = url; anchor.download = name;
             document.body.append(anchor); anchor.click(); anchor.remove();
@@ -535,11 +586,15 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
           for (const button of panel.querySelectorAll('button,input')) button.style = 'font-size:18px;min-height:44px;margin:8px;display:block';
           document.body.append(panel);
           panel.querySelector('#ios-test-export').onclick = () => {
-            const url = URL.createObjectURL(new Blob(['{"fixture":"marinar-ios","text":"파일 내보내기"}'], {type:'application/json'}));
-            const anchor = document.createElement('a');
-            anchor.href = url; anchor.download = 'marinar-ios-export.json'; anchor.target = '_blank'; anchor.rel = 'noopener';
-            document.body.append(anchor); anchor.click(); anchor.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 60000);
+            const result = panel.querySelector('#ios-export-result');
+            result.textContent = 'Export handler started';
+            try {
+              const url = URL.createObjectURL(new Blob(['{"fixture":"marinar-ios","text":"파일 내보내기"}'], {type:'application/json'}));
+              const anchor = document.createElement('a');
+              anchor.href = url; anchor.download = 'marinar-ios-export.json'; anchor.target = '_blank'; anchor.rel = 'noopener';
+              document.body.append(anchor); anchor.click(); anchor.remove();
+              setTimeout(() => URL.revokeObjectURL(url), 60000);
+            } catch (error) { result.textContent = 'Export handler failed: ' + error.message; }
           };
           panel.querySelector('#ios-test-file').onchange = async (event) => {
             const file = event.target.files[0];
@@ -551,7 +606,9 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
           panel.querySelector('#ios-test-error').onclick = () => directDownload('/api/ios/missing-download-fixture', 'marinar-ios-error.json');
         })();
         """
-        webView.evaluateJavaScript(script, completionHandler: nil)
+        webView.evaluateJavaScript(script) { [weak self] _, error in
+            self?.recordExportEventIfNeeded("diagnostics-installed", fields: ["succeeded": error == nil])
+        }
         #endif
     }
 

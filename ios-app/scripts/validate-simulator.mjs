@@ -24,7 +24,7 @@ let mock;
 let container;
 let launchNumber = 0;
 const launchLogs = [];
-const report = { formatVersion: 1, status: 'running', checks: [], coverage: {
+const report = { formatVersion: 1, status: 'running', checks: [], errors: [], uiTests: [], coverage: {
   actualEmbeddedNode: false, actualWKWebView: false, nativeSendInteraction: false,
   nativeBlobDownload: false, nativeShareSheet: false, systemFilePicker: false, nativeDialogs: false,
   nativeBackgroundFlush: false,
@@ -58,6 +58,35 @@ async function run(command, commandArgs, { log, allowFailure = false, env } = {}
   }
   if (code !== 0 && !allowFailure) throw new Error(`${command} exited ${code}${log ? `; see ${log}` : `: ${text.slice(-2000)}`}`);
   return text;
+}
+
+function recordFailure(phase, error) {
+  const message = error instanceof Error ? error.message : String(error);
+  report.errors.push({ phase, message });
+  console.error(`${phase}: ${message}`);
+}
+
+async function collectCheck(phase, callback) {
+  try { await callback(); return true; }
+  catch (error) { recordFailure(phase, error); return false; }
+}
+
+async function runUITests(commandArgs, { phase, log, expectedTests }) {
+  let commandError;
+  try { await run('xcodebuild', commandArgs, { log }); }
+  catch (error) { commandError = error; }
+  const output = await readFile(path.join(reportDir, log), 'utf8').catch(() => '');
+  const endings = [...output.matchAll(/^Test Case '-\[MarinarUITests\.MarinarUITests (test\w+)\]' (passed|failed) \(/gm)];
+  const tests = Object.fromEntries(expectedTests.map((name) => {
+    const outcomes = endings.filter((match) => match[1] === name).map((match) => match[2]);
+    return [name, outcomes.includes('failed') ? 'failed' : outcomes.includes('passed') ? 'passed' : 'not-completed'];
+  }));
+  report.uiTests.push({ phase, log, tests, ...(commandError ? { commandError: commandError.message } : {}) });
+  if (commandError) recordFailure(phase, commandError);
+  for (const [name, status] of Object.entries(tests)) {
+    if (status !== 'passed') recordFailure(`${phase}/${name}`, new Error(`XCTest ${status}; see ${log}`));
+  }
+  return new Set(Object.keys(tests).filter((name) => tests[name] === 'passed'));
 }
 
 async function launch() {
@@ -105,6 +134,11 @@ async function preserveLaunchLogs() {
   // Copy before XCTest can migrate the data container, and again after the
   // final launch. A missing old path must not remove an already copied log.
   for (const file of launchLogs) await copyFile(file, path.join(reportDir, path.basename(file))).catch(() => {});
+  if (deviceId) {
+    const current = await run('xcrun', ['simctl', 'get_app_container', deviceId, bundleId, 'data']).catch(() => undefined);
+    if (current) await copyFile(path.join(current, 'Documents/ios-export-events.json'),
+      path.join(reportDir, `${deviceId}-ios-export-events.json`)).catch(() => {});
+  }
 }
 
 async function exportTestAttachments() {
@@ -351,43 +385,64 @@ try {
   await preserveLaunchLogs();
   const callsBeforeUI = mock.calls.length;
   console.log('Sending through the real WKWebView composer and checking restoration after app relaunch.');
-  await run('xcodebuild', ['test-without-building', ...buildArgs,
+  const primaryTests = await runUITests(['test-without-building', ...buildArgs,
     '-parallel-testing-enabled', 'NO', '-maximum-concurrent-test-simulator-destinations', '1',
     '-only-testing:MarinarUITests/MarinarUITests/testSendPersistsAfterProcessRelaunch',
     '-only-testing:MarinarUITests/MarinarUITests/testBlobDownloadShareAndFilePicker',
-    '-resultBundlePath', path.join(reportDir, 'MarinarUITests.xcresult')], { log: 'simulator-ui-tests.log' });
-  assert.ok(mock.calls.slice(callsBeforeUI).some((call) => call.kind === 'stream' && call.completed
-    && call.messages.some((message) => message.role === 'user' && JSON.stringify(message.content).includes(STREAM_PROMPT))),
-  'UI test did not send its typed prompt to the mock provider');
-  report.coverage.actualWKWebView = true;
-  report.coverage.nativeSendInteraction = true;
-  report.checks.push('actual-wkwebview-native-keyboard-and-send');
-  report.download = await verifyBlobDownload(true);
-  Object.assign(report.coverage, { nativeBlobDownload: true, nativeShareSheet: true, systemFilePicker: true, nativeDialogs: true });
-  report.checks.push('blob-download-byte-integrity', 'streamed-16mib-backup-disk-integrity', 'http-download-error-rejected', 'native-export-share-sheet', 'system-file-picker-cancel', 'system-file-picker-read-bytes', 'javascript-confirm-accept-and-cancel');
-  console.log('UI test passed. Verifying its saved messages through the embedded server after another process relaunch.');
-  await stop();
-  config = await launch();
-  const backgroundFlush = JSON.parse(await readFile(path.join(container, 'Documents/ios-background-flush-result.json'), 'utf8'));
-  assert.equal(backgroundFlush.succeeded, true, 'Native background flush did not complete');
-  assert.equal(backgroundFlush.status, 200);
-  report.coverage.nativeBackgroundFlush = true;
-  report.checks.push('native-background-flush-acknowledged');
-  const response = await fetch(`${baseUrl}/api/chats/${uiState.chatId}/messages`, {
-    headers: { 'x-marinara-ios-token': config.token }, signal: AbortSignal.timeout(30_000),
+    '-resultBundlePath', path.join(reportDir, 'MarinarUITests.xcresult')], {
+    phase: 'primary-ui', log: 'simulator-ui-tests.log',
+    expectedTests: ['testSendPersistsAfterProcessRelaunch', 'testBlobDownloadShareAndFilePicker'],
   });
-  assert.ok(response.ok, 'Cannot read the UI-created messages after relaunch');
-  const messagesBody = await response.json();
-  const messages = Array.isArray(messagesBody) ? messagesBody : messagesBody.messages;
-  assert.ok(messages.some((item) => item.role === 'user' && item.content === STREAM_PROMPT));
-  assert.ok(messages.some((item) => item.role === 'assistant' && item.content === STREAM_REPLY));
-  report.checks.push('ui-messages-survive-app-process-relaunch');
-  console.log('Restoring a real full backup through an app process restart and checking WebView cache hydration.');
-  config = await exerciseNativeFullRestore(config, uiState);
-  await run('xcrun', ['simctl', 'io', deviceId, 'screenshot', path.join(reportDir, 'primary-chat-restored.png')]);
-  await run('xcrun', ['simctl', 'spawn', deviceId, 'log', 'show', '--last', '15m', '--style', 'compact', '--predicate', 'process == "Marinar"'], { log: 'primary-app.log', allowFailure: true });
-  await stop();
   await preserveLaunchLogs();
+  // XCTest runs independent methods in one invocation. An export failure must
+  // remain a failure while allowing a completed chat test to prove restoration.
+  if (primaryTests.has('testBlobDownloadShareAndFilePicker')) await collectCheck('primary-file-integrity', async () => {
+    report.download = await verifyBlobDownload(true);
+    Object.assign(report.coverage, { nativeBlobDownload: true, nativeShareSheet: true, systemFilePicker: true, nativeDialogs: true });
+    report.checks.push('blob-download-byte-integrity', 'streamed-16mib-backup-disk-integrity', 'http-download-error-rejected',
+      'native-export-share-sheet', 'system-file-picker-cancel', 'system-file-picker-read-bytes', 'javascript-confirm-accept-and-cancel');
+  });
+  let chatVerified = false;
+  if (primaryTests.has('testSendPersistsAfterProcessRelaunch')) chatVerified = await collectCheck('primary-chat-send', async () => {
+    assert.ok(mock.calls.slice(callsBeforeUI).some((call) => call.kind === 'stream' && call.completed
+      && call.messages.some((message) => message.role === 'user' && JSON.stringify(message.content).includes(STREAM_PROMPT))),
+    'UI test did not send its typed prompt to the mock provider');
+    report.coverage.actualWKWebView = true;
+    report.coverage.nativeSendInteraction = true;
+    report.checks.push('actual-wkwebview-native-keyboard-and-send');
+  });
+  try {
+    const relaunched = await collectCheck('primary-process-relaunch', async () => { await stop(); config = await launch(); });
+    if (relaunched && chatVerified) {
+      await collectCheck('primary-background-flush', async () => {
+        const backgroundFlush = JSON.parse(await readFile(path.join(container, 'Documents/ios-background-flush-result.json'), 'utf8'));
+        assert.equal(backgroundFlush.succeeded, true, 'Native background flush did not complete');
+        assert.equal(backgroundFlush.status, 200);
+        report.coverage.nativeBackgroundFlush = true;
+        report.checks.push('native-background-flush-acknowledged');
+      });
+      const messagesRestored = await collectCheck('primary-chat-persistence', async () => {
+        const response = await fetch(`${baseUrl}/api/chats/${uiState.chatId}/messages`, {
+          headers: { 'x-marinara-ios-token': config.token }, signal: AbortSignal.timeout(30_000),
+        });
+        assert.ok(response.ok, 'Cannot read the UI-created messages after relaunch');
+        const messagesBody = await response.json();
+        const messages = Array.isArray(messagesBody) ? messagesBody : messagesBody.messages;
+        assert.ok(messages.some((item) => item.role === 'user' && item.content === STREAM_PROMPT));
+        assert.ok(messages.some((item) => item.role === 'assistant' && item.content === STREAM_REPLY));
+        report.checks.push('ui-messages-survive-app-process-relaunch');
+      });
+      if (messagesRestored) await collectCheck('primary-full-restore', async () => {
+        console.log('Restoring a real full backup through an app process restart and checking WebView cache hydration.');
+        config = await exerciseNativeFullRestore(config, uiState);
+      });
+    }
+  } finally {
+    await run('xcrun', ['simctl', 'io', deviceId, 'screenshot', path.join(reportDir, 'primary-followup-screen.png')], { allowFailure: true }).catch(() => {});
+    await run('xcrun', ['simctl', 'spawn', deviceId, 'log', 'show', '--last', '20m', '--style', 'compact', '--predicate', 'process == "Marinar"'], { log: 'primary-app.log', allowFailure: true }).catch(() => {});
+    await stop().catch(() => {});
+    await preserveLaunchLogs();
+  }
 
   // Reuse the already built app/test bundle. The extra devices only exercise
   // viewport/keyboard and iPad popover behavior, not the entire API suite.
@@ -399,41 +454,60 @@ try {
       ?? devicetypes.find((item) => item.name.startsWith('iPad')), files: true },
   ];
   for (const variant of variants) {
-    assert.ok(variant.type, `Required ${variant.key} simulator type is unavailable`);
-    console.log(`Checking ${variant.key} portrait/landscape keyboard${variant.files ? ', blob export and system picker' : ''} with the existing build.`);
-    deviceId = await run('xcrun', ['simctl', 'create', `Marinar-${variant.key}-${Date.now()}`, variant.type.identifier, selectedRuntime.identifier]);
-    ownedDevices.add(deviceId);
-    const result = { name: variant.type.name, deviceId, runtimeVersion: selectedRuntime.version, checks: [] };
+    const errorsBefore = report.errors.length;
+    const result = { key: variant.key, name: variant.type?.name, runtimeVersion: selectedRuntime.version, checks: [], status: 'running' };
     report.screenVariants.push(result);
-    await run('xcrun', ['simctl', 'boot', deviceId]);
-    await run('xcrun', ['simctl', 'bootstatus', deviceId, '-b'], { log: `${variant.key}-boot.log` });
-    await run('xcrun', ['simctl', 'install', deviceId, path.join(derived, 'Build/Products/Debug-iphonesimulator/Marinar.app')]);
-    config = await launch();
-    await prepareUI(config, path.join(reportDir, `${variant.key}-seed.json`));
-    await stop();
-    await preserveLaunchLogs();
-    const argsForDevice = [...buildArgs];
-    argsForDevice[argsForDevice.indexOf('-destination') + 1] = `platform=iOS Simulator,id=${deviceId}`;
-    await run('xcodebuild', ['test-without-building', ...argsForDevice,
-      '-parallel-testing-enabled', 'NO', '-maximum-concurrent-test-simulator-destinations', '1',
-      '-only-testing:MarinarUITests/MarinarUITests/testComposerAcrossOrientations',
-      ...(variant.files ? ['-only-testing:MarinarUITests/MarinarUITests/testBlobDownloadShareAndFilePicker'] : []),
-      '-resultBundlePath', path.join(reportDir, `${variant.key}.xcresult`)], { log: `${variant.key}-ui-tests.log` });
-    result.checks.push('portrait-and-landscape-composer-keyboard');
-    if (variant.files) { result.download = await verifyBlobDownload(); result.checks.push('blob-export-popover', 'system-file-picker-cancel', 'system-file-picker-read-bytes'); }
-    await run('xcrun', ['simctl', 'spawn', deviceId, 'log', 'show', '--last', '10m', '--style', 'compact', '--predicate', 'process == "Marinar"'], { log: `${variant.key}-app.log`, allowFailure: true });
-    await stop();
-    await preserveLaunchLogs();
-    await run('xcrun', ['simctl', 'shutdown', deviceId]);
+    let variantDevice;
+    try {
+      assert.ok(variant.type, `Required ${variant.key} simulator type is unavailable`);
+      console.log(`Checking ${variant.key} portrait/landscape keyboard${variant.files ? ', blob export and system picker' : ''} with the existing build.`);
+      variantDevice = await run('xcrun', ['simctl', 'create', `Marinar-${variant.key}-${Date.now()}`, variant.type.identifier, selectedRuntime.identifier]);
+      deviceId = variantDevice;
+      ownedDevices.add(deviceId);
+      result.deviceId = deviceId;
+      await run('xcrun', ['simctl', 'boot', deviceId]);
+      await run('xcrun', ['simctl', 'bootstatus', deviceId, '-b'], { log: `${variant.key}-boot.log` });
+      await run('xcrun', ['simctl', 'install', deviceId, path.join(derived, 'Build/Products/Debug-iphonesimulator/Marinar.app')]);
+      config = await launch();
+      await prepareUI(config, path.join(reportDir, `${variant.key}-seed.json`));
+      await stop();
+      await preserveLaunchLogs();
+      const argsForDevice = [...buildArgs];
+      argsForDevice[argsForDevice.indexOf('-destination') + 1] = `platform=iOS Simulator,id=${deviceId}`;
+      const tests = await runUITests(['test-without-building', ...argsForDevice,
+        '-parallel-testing-enabled', 'NO', '-maximum-concurrent-test-simulator-destinations', '1',
+        '-only-testing:MarinarUITests/MarinarUITests/testComposerAcrossOrientations',
+        ...(variant.files ? ['-only-testing:MarinarUITests/MarinarUITests/testBlobDownloadShareAndFilePicker'] : []),
+        '-resultBundlePath', path.join(reportDir, `${variant.key}.xcresult`)], {
+        phase: variant.key, log: `${variant.key}-ui-tests.log`,
+        expectedTests: ['testComposerAcrossOrientations', ...(variant.files ? ['testBlobDownloadShareAndFilePicker'] : [])],
+      });
+      if (tests.has('testComposerAcrossOrientations')) result.checks.push('portrait-and-landscape-composer-keyboard');
+      if (variant.files && tests.has('testBlobDownloadShareAndFilePicker')) await collectCheck(`${variant.key}-file-integrity`, async () => {
+        result.download = await verifyBlobDownload();
+        result.checks.push('blob-export-popover', 'system-file-picker-cancel', 'system-file-picker-read-bytes');
+      });
+    } catch (error) { recordFailure(variant.key, error); }
+    finally {
+      if (variantDevice) {
+        await run('xcrun', ['simctl', 'io', variantDevice, 'screenshot', path.join(reportDir, `${variant.key}-screen.png`)], { allowFailure: true }).catch(() => {});
+        await run('xcrun', ['simctl', 'spawn', variantDevice, 'log', 'show', '--last', '15m', '--style', 'compact', '--predicate', 'process == "Marinar"'], { log: `${variant.key}-app.log`, allowFailure: true }).catch(() => {});
+        await stop().catch(() => {});
+        await preserveLaunchLogs();
+        await run('xcrun', ['simctl', 'shutdown', variantDevice], { allowFailure: true }).catch(() => {});
+      }
+      result.status = report.errors.length === errorsBefore ? 'passed' : 'failed';
+    }
   }
   report.providerCalls = mock.calls.map(({ id, kind, streaming, completed, disconnected }) => ({ id, kind, streaming, completed, disconnected }));
-  report.status = 'passed';
-  console.log('Native simulator validation passed. No external AI service was used.');
+  report.status = report.errors.length ? 'failed' : 'passed';
+  if (report.errors.length) process.exitCode = 1;
+  console.log(`Native simulator validation ${report.status} with ${report.errors.length} recorded errors. No external AI service was used.`);
 } catch (error) {
   report.status = 'failed';
   report.error = error.message;
+  recordFailure('validation', error);
   process.exitCode = 1;
-  console.error(error.message);
 } finally {
   if (process.platform === 'darwin') await exportTestAttachments().catch((error) => {
     console.warn(`Could not export XCTest attachments: ${error.message}`);

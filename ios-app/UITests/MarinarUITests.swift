@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 
 final class MarinarUITests: XCTestCase {
     private let app = XCUIApplication()
@@ -100,6 +101,11 @@ final class MarinarUITests: XCTestCase {
         let export = app.webViews.buttons["Export test JSON"].firstMatch
         XCTAssertTrue(export.waitForExistence(timeout: 30))
         export.tap()
+        let handler = app.webViews.staticTexts["Export handler started"].firstMatch
+        let exportedFilename = app.descendants(matching: .any).matching(NSPredicate(format:
+            "label CONTAINS 'marinar-ios-export'")).firstMatch
+        expectation(for: NSPredicate { _, _ in handler.exists || exportedFilename.exists }, evaluatedWith: app)
+        waitForExpectations(timeout: 15)
         dismissExportShare("blob-export-share", expectedFilename: "marinar-ios-export")
         XCTAssertTrue(export.waitForExistence(timeout: 15))
         let streamed = app.webViews.buttons["Export streamed archive"].firstMatch
@@ -167,21 +173,23 @@ final class MarinarUITests: XCTestCase {
     }
 
     private func dismissExportShare(_ screenshotName: String, expectedFilename: String) {
-        // iOS can replace UIActivityViewController's original view with its
-        // remote share UI, which does not inherit our custom identifier.
-        // These system identifiers were observed in the exported hierarchy.
-        let share = app.otherElements.matching(NSPredicate(format:
-            "identifier IN %@", ["marinar-export-share", "ActivityListView", "ShareSheet.RemoteContainerView"])).firstMatch
-        XCTAssertTrue(share.waitForExistence(timeout: 60), "Download did not open the native share sheet")
+        // Assert visible user actions and the actual filename. Remote iOS
+        // share controllers do not reliably retain wrapper identifiers.
         let filename = app.descendants(matching: .any).matching(NSPredicate(format:
             "label CONTAINS %@", expectedFilename)).firstMatch
-        XCTAssertTrue(filename.waitForExistence(timeout: 30), "The share sheet does not contain the expected exported file")
+        XCTAssertTrue(filename.waitForExistence(timeout: 60), "The share sheet does not contain the expected exported file")
+        let save = app.descendants(matching: .any).matching(NSPredicate(format: "label == 'Save to Files'")).firstMatch
+        XCTAssertTrue(save.waitForExistence(timeout: 30), "The exported file cannot be saved through the native share sheet")
         attachScreen(screenshotName)
-        let close = app.buttons.matching(NSPredicate(format:
-            "identifier == 'header.closeButton' OR label == 'Close' OR label == 'Cancel'")).firstMatch
-        if close.waitForExistence(timeout: 5) { close.tap() }
-        else { app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.98)).tap() } // iPad popover
-        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: share)
+        let close = app.buttons["Close"].firstMatch
+        if close.waitForExistence(timeout: 15) { close.tap() }
+        else if UIDevice.current.userInterfaceIdiom == .pad {
+            // A popover may use outside-tap dismissal instead of a Close button.
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.98)).tap()
+        } else { XCTFail("The native share sheet has no Close action") }
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: filename)
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: save)
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: close)
         waitForExpectations(timeout: 15)
     }
 }
