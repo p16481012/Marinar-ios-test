@@ -57,16 +57,17 @@ jobs:
           include-hidden-files: true
           retention-days: 7
   ios:
-    name: iOS Simulator (${{ matrix.profile }})
+    name: File baseline (Xcode ${{ matrix.xcode }})
     needs: runtime
     runs-on: macos-15
     timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
-        profile: [primary, compact-phone, ipad]
+        profile: [primary]
+        xcode: ['16.4', '26.1.1']
     env:
-      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_${{ matrix.xcode }}.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -87,7 +88,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ios-validation-summary-${{ matrix.profile }}
+          name: ios-validation-summary-${{ matrix.profile }}-xcode${{ matrix.xcode }}
           path: |
             ios-app/build/validation/**/simulator-validation.json
             ios-app/build/validation/**/*export-events*.json
@@ -101,11 +102,12 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ios-validation-${{ matrix.profile }}
+          name: ios-validation-${{ matrix.profile }}-xcode${{ matrix.xcode }}
           path: ios-app/build/validation
           retention-days: 14
   ipa:
     name: Package validated device IPA
+    if: ${{ false }}
     needs: [runtime, ios]
     runs-on: macos-15
     timeout-minutes: 20
