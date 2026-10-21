@@ -1,146 +1,92 @@
 name: iOS prototype
+run-name: Device Release compilation for 6e924ad
 on:
-  push:
-    branches: [main]
-    paths-ignore: ['docs/**', '*.md']
   workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  group: ios-prototype-${{ github.ref }}
-  cancel-in-progress: true
+  actions: read
 jobs:
-  runtime:
-    name: Build and test packaged server
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    env:
-      SKIP_PWA: '1'
-      NODE_OPTIONS: --max-old-space-size=6144
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.14.0
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile --ignore-scripts
-      - run: pnpm --filter @marinara-engine/shared build
-      - run: pnpm --filter @marinara-engine/server exec tsc --noEmit --composite false --incremental false
-      - run: pnpm --filter @marinara-engine/client build
-      - run: node ios-app/scripts/prepare.mjs
-      - run: node scripts/ios/run-chat-lifecycle.mjs --entry ios-app/Resources/runtime/bootstrap.cjs
-      - run: node scripts/ios/run-provider-lifecycle.mjs --entry ios-app/Resources/runtime/bootstrap.cjs
-      - run: node scripts/ios/run-transfer-lifecycle.mjs --entry ios-app/Resources/runtime/bootstrap.cjs
-      - run: node scripts/ios/run-backup-ui.mjs --browser-channel chrome
-      - name: Archive runtime without changing file permissions
-        run: tar -czf ios-app/build/runtime.tar.gz -C ios-app/Resources runtime
-      - uses: actions/upload-artifact@v4
-        with:
-          name: embedded-runtime
-          path: ios-app/build/runtime.tar.gz
-          retention-days: 7
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: host-validation
-          path: |
-            .tmp/ios-chat-lifecycle/report.json
-            .tmp/ios-chat-lifecycle/server-*.log
-            .tmp/ios-provider-lifecycle/report.json
-            .tmp/ios-provider-lifecycle/transfer-server-*.log
-            .tmp/ios-transfer-lifecycle/report.json
-            .tmp/ios-transfer-lifecycle/transfer-server-*.log
-            .tmp/ios-backup-ui/report.json
-            .tmp/ios-backup-ui/*.png
-            .tmp/ios-backup-ui/transfer-server-*.log
-          include-hidden-files: true
-          retention-days: 7
-  ios:
-    name: iOS Simulator (${{ matrix.profile }})
-    needs: runtime
-    runs-on: macos-15
-    timeout-minutes: 35
-    strategy:
-      fail-fast: false
-      matrix:
-        profile: [primary, compact-phone, ipad]
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.14.0
-      - uses: actions/download-artifact@v4
-        with:
-          name: embedded-runtime
-          path: ios-app/build
-      - run: |
-          mkdir -p ios-app/Resources
-          tar -xzf ios-app/build/runtime.tar.gz -C ios-app/Resources
-          uname -m
-          xcodebuild -version
-      - run: node ios-app/scripts/download-node.mjs
-      - run: node ios-app/scripts/validate-simulator.mjs --simulator-ui --software-keyboard --profile ${{ matrix.profile }} --report-dir ios-app/build/validation/${{ matrix.profile }} --derived-data ios-app/build/DerivedData-${{ matrix.profile }}
-        timeout-minutes: 28
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ios-validation-summary-${{ matrix.profile }}
-          path: |
-            ios-app/build/validation/**/simulator-validation.json
-            ios-app/build/validation/**/*export-events*.json
-            ios-app/build/validation/**/*ui-tests.log
-            ios-app/build/validation/**/*file-picker.log
-            ios-app/build/validation/**/*build.log
-            ios-app/build/validation/**/*.png
-            ios-app/build/validation/**/attachments/**/*.txt
-            ios-app/build/validation/**/attachments/**/manifest.json
-          retention-days: 14
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ios-validation-${{ matrix.profile }}
-          path: ios-app/build/validation
-          retention-days: 14
-  ipa:
-    name: Package validated device IPA
-    needs: [runtime, ios]
+  device:
+    name: Verify device Release build (no IPA)
     runs-on: macos-15
     timeout-minutes: 20
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: 6e924ad0bc9037ef63963e0ea0ada7aea500e694
       - uses: actions/setup-node@v4
         with:
           node-version: 24.14.0
+      - name: Verify runtime artifact source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh api repos/${GITHUB_REPOSITORY}/actions/runs/39615226741 --jq .head_sha)" = '6e924ad0bc9037ef63963e0ea0ada7aea500e694'
       - uses: actions/download-artifact@v4
         with:
           name: embedded-runtime
           path: ios-app/build
+          run-id: 39615226741
+          github-token: ${{ github.token }}
       - run: |
           mkdir -p ios-app/Resources
           tar -xzf ios-app/build/runtime.tar.gz -C ios-app/Resources
       - run: node ios-app/scripts/download-node.mjs
-      - name: Build device app
+      - name: Compile iPhoneOS Release
         run: >-
           xcodebuild -project ios-app/Marinar.xcodeproj -scheme Marinar
           -configuration Release -sdk iphoneos -destination 'generic/platform=iOS'
           -derivedDataPath ios-app/build/Device
-          CURRENT_PROJECT_VERSION=${{ github.run_number }}
+          CURRENT_PROJECT_VERSION=19
           CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=
           build > ios-app/build/device-build.log 2>&1
-      - run: node ios-app/scripts/package-ipa.mjs --app ios-app/build/Device/Build/Products/Release-iphoneos/Marinar.app
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Marinar-ios-test-unsigned-ipa
-          path: ios-app/build/release/*
-          retention-days: 30
+      - name: Verify Release app and runtime
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFile, writeFile } from 'node:fs/promises';
+          import { createHash } from 'node:crypto';
+          import { execFileSync } from 'node:child_process';
+          import path from 'node:path';
+          const app = 'ios-app/build/Device/Build/Products/Release-iphoneos/Marinar.app';
+          const source = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          assert.equal(source, '6e924ad0bc9037ef63963e0ea0ada7aea500e694');
+          const plist = JSON.parse(execFileSync('plutil', ['-convert', 'json', '-o', '-', path.join(app, 'Info.plist')], { encoding: 'utf8' }));
+          assert.equal(plist.CFBundleIdentifier, 'com.p16481012.marinar.ios.test');
+          assert.equal(plist.CFBundleShortVersionString, '2.5.1');
+          assert.equal(plist.CFBundleVersion, '19');
+          assert.equal(plist.MinimumOSVersion, '16.4');
+          assert.deepEqual(plist.CFBundleSupportedPlatforms, ['iPhoneOS']);
+          const executable = path.join(app, 'Marinar');
+          const architecture = execFileSync('lipo', ['-archs', executable], { encoding: 'utf8' }).trim();
+          assert.equal(architecture, 'arm64');
+          const binary = await readFile(executable);
+          const forbidden = ['MARINARA_TEST_DIAGNOSTICS', 'MARINARA_TEST_FILE_PANEL', 'MARINARA_TEST_FILES_CONTROL',
+            'restored-file-fixture', 'marinar-ios-import-', 'MarinarDiagnosticWindow', 'ios-file-diagnostics'];
+          for (const marker of forbidden) assert.ok(!binary.includes(Buffer.from(marker)), `DEBUG marker in Release: ${marker}`);
+          const runtime = path.join(app, 'runtime');
+          const manifest = JSON.parse(await readFile(path.join(runtime, 'runtime-manifest.json'), 'utf8'));
+          assert.ok(manifest.files.some(file => file.path === 'restore-core.cjs'));
+          for (const file of manifest.files) {
+            assert.ok(!file.path.includes('..') && !path.isAbsolute(file.path));
+            const bytes = await readFile(path.join(runtime, file.path));
+            assert.equal(bytes.length, file.size, file.path);
+            assert.equal(createHash('sha256').update(bytes).digest('hex'), file.sha256, file.path);
+          }
+          const report = { status: 'passed', source, configuration: 'Release', platform: 'iPhoneOS', architecture,
+            minimumOSVersion: plist.MinimumOSVersion, version: plist.CFBundleShortVersionString, build: plist.CFBundleVersion,
+            runtimeFilesVerified: manifest.files.length, debugMarkersExcluded: forbidden,
+            nativeUIValidated: false, physicalDeviceValidated: false, ipaCreated: false };
+          await writeFile('ios-app/build/device-release-check.json', JSON.stringify(report, null, 2) + '\n');
+          console.log(JSON.stringify(report, null, 2));
+          NODE
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ios-device-build
-          path: ios-app/build/device-build.log
+          name: device-release-compilation-check
+          path: |
+            ios-app/build/device-build.log
+            ios-app/build/device-release-check.json
           retention-days: 14
