@@ -77,6 +77,7 @@ jobs:
           xcodebuild -version
       - run: node ios-app/scripts/download-node.mjs
       - run: node ios-app/scripts/validate-simulator.mjs
+        timeout-minutes: 40
       - name: Build device app
         run: >-
           xcodebuild -project ios-app/Marinar.xcodeproj -scheme Marinar

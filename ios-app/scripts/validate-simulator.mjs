@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { copyFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startMockProvider, STREAM_PROMPT, STREAM_REPLY, RESTORE_PROMPT, RESTORE_REPLY } from '../../scripts/ios/mock-openai-provider.mjs';
@@ -34,21 +34,82 @@ const report = { formatVersion: 1, status: 'running', checks: [], errors: [], ui
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 await mkdir(reportDir, { recursive: true });
 
-async function run(command, commandArgs, { log, allowFailure = false, env } = {}) {
+async function checkpoint(phase) {
+  if (phase) report.phase = phase;
+  report.updatedAt = new Date().toISOString();
+  const destination = path.join(reportDir, 'simulator-validation.json');
+  const temporary = `${destination}.tmp`;
+  await writeFile(temporary, JSON.stringify(report, null, 2) + '\n');
+  await rename(temporary, destination);
+}
+
+function commandTimeout(command, commandArgs) {
+  // Cold Xcode builds and fresh simulator services are slow on hosted runners.
+  // Keep separate generous limits rather than letting one stuck child exhaust
+  // the whole job and lose all completed independent checks.
+  if (command === 'xcodebuild') return 15 * 60_000;
+  if (commandArgs[0] === 'xcresulttool') return 5 * 60_000;
+  if (commandArgs[0] === 'simctl') {
+    if (commandArgs[1] === 'bootstatus') return 8 * 60_000;
+    if (['boot', 'launch', 'install'].includes(commandArgs[1])) return 3 * 60_000;
+  }
+  return 2 * 60_000;
+}
+
+async function run(command, commandArgs, { log, allowFailure = false, env, timeoutMs = commandTimeout(command, commandArgs) } = {}) {
+  assert.ok(Number.isFinite(timeoutMs) && timeoutMs > 0, 'Command timeout must be positive milliseconds');
+  report.command = { name: command, ...(log ? { log } : {}), startedAt: new Date().toISOString(), timeoutMs, status: 'running' };
+  await checkpoint();
   const output = [];
   const stream = log ? createWriteStream(path.join(reportDir, log)) : null;
-  const child = spawn(command, commandArgs, { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], ...(env ? { env: { ...process.env, ...env } } : {}) });
+  // A separate POSIX group lets a timeout stop xcodebuild and its descendants,
+  // without touching the validator, mock provider or another simulator task.
+  const processGroup = process.platform !== 'win32';
+  const child = spawn(command, commandArgs, { cwd: root, detached: processGroup,
+    stdio: ['ignore', 'pipe', 'pipe'], ...(env ? { env: { ...process.env, ...env } } : {}) });
   for (const pipe of [child.stdout, child.stderr]) pipe.on('data', (data) => {
     if (stream) stream.write(data);
     else output.push(data);
   });
-  const code = await new Promise((resolve, reject) => {
-    child.once('error', reject);
-    child.once('close', resolve);
+  let timedOut = false;
+  let spawnError;
+  const signalChild = (signal) => {
+    if (!child.pid) return;
+    try { if (processGroup) process.kill(-child.pid, signal); else child.kill(signal); }
+    catch (error) { if (error.code !== 'ESRCH') console.warn(`Could not send ${signal} to ${command}: ${error.code}`); }
+  };
+  const code = await new Promise((resolve) => {
+    let killTimer;
+    let drainTimer;
+    let settled = false;
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer); clearTimeout(killTimer); clearTimeout(drainTimer);
+      // Ensure descendants cannot retain pipes or run after a timed-out parent
+      // exits voluntarily in response to SIGTERM.
+      if (timedOut) signalChild('SIGKILL');
+      resolve(code);
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      signalChild('SIGTERM');
+      killTimer = setTimeout(() => signalChild('SIGKILL'), 10_000);
+      drainTimer = setTimeout(() => {
+        child.stdout.destroy(); child.stderr.destroy();
+        finish(null);
+      }, 20_000);
+    }, timeoutMs);
+    child.once('error', (error) => { spawnError = error; finish(null); });
+    child.once('close', finish);
   });
   if (stream) await new Promise((resolve) => stream.end(resolve));
+  const failed = timedOut || spawnError || code !== 0;
+  Object.assign(report.command, { status: timedOut ? 'timed-out' : failed ? 'failed' : 'passed', endedAt: new Date().toISOString(), exitCode: code });
+  if (timedOut) recordFailure('command-timeout', new Error(`${command} timed out after ${timeoutMs} ms${log ? `; see ${log}` : ''}`));
+  await checkpoint();
   const text = Buffer.concat(output).toString('utf8').trim();
-  if (code !== 0 && log && command === 'xcodebuild') {
+  if (failed && log && command === 'xcodebuild') {
     // Show only compiler/XCTest diagnostics here. Native runtime stdout and
     // launch configuration are deliberately excluded from console output.
     const lines = (await readFile(path.join(reportDir, log), 'utf8').catch(() => '')).trim().split('\n');
@@ -56,6 +117,10 @@ async function run(command, commandArgs, { log, allowFailure = false, env } = {}
     const summary = [...new Set([...failures, ...lines.slice(-60)])].slice(-80);
     console.error(`xcodebuild failure details (${log}):\n${summary.join('\n')}`);
   }
+  // A timeout is never an acceptable nonzero result (even in best-effort
+  // cleanup); its caller can catch it explicitly and retain the failure.
+  if (timedOut) throw new Error(`${command} timed out after ${timeoutMs} ms${log ? `; see ${log}` : ''}`);
+  if (spawnError) throw spawnError;
   if (code !== 0 && !allowFailure) throw new Error(`${command} exited ${code}${log ? `; see ${log}` : `: ${text.slice(-2000)}`}`);
   return text;
 }
@@ -67,11 +132,14 @@ function recordFailure(phase, error) {
 }
 
 async function collectCheck(phase, callback) {
+  await checkpoint(phase);
   try { await callback(); return true; }
   catch (error) { recordFailure(phase, error); return false; }
+  finally { await checkpoint(); }
 }
 
 async function runUITests(commandArgs, { phase, log, expectedTests }) {
+  await checkpoint(phase);
   let commandError;
   try { await run('xcodebuild', commandArgs, { log }); }
   catch (error) { commandError = error; }
@@ -86,6 +154,7 @@ async function runUITests(commandArgs, { phase, log, expectedTests }) {
   for (const [name, status] of Object.entries(tests)) {
     if (status !== 'passed') recordFailure(`${phase}/${name}`, new Error(`XCTest ${status}; see ${log}`));
   }
+  await checkpoint();
   return new Set(Object.keys(tests).filter((name) => tests[name] === 'passed'));
 }
 
@@ -159,16 +228,16 @@ async function prepareUI(config, stateFile) {
   const baseUrl = `http://127.0.0.1:${config.port}`;
   const uiState = await runChatPhase({ phase: 'seed', baseUrl, providerUrl: mock.baseUrl, stateFile, token: config.token });
   const headers = { 'x-marinara-ios-token': config.token, 'x-marinara-csrf': '1', origin: baseUrl, 'content-type': 'application/json' };
-  const response = await fetch(`${baseUrl}/api/app-settings/ui`, { headers });
+  const response = await fetch(`${baseUrl}/api/app-settings/ui`, { headers, signal: AbortSignal.timeout(60_000) });
   assert.ok(response.ok, 'Cannot read test UI preferences');
   const preference = await response.json();
   const quiet = { ...JSON.parse(preference.value || '{}'), hasCompletedOnboarding: true, language: 'en',
     sidebarOpen: false, rightPanelOpen: false, trackerPanelEnabled: false, chibiProfessorMariEnabled: false,
     chatHelpSeenModes: ['conversation', 'roleplay', 'game'], chatWindowIntroDismissed: true,
     seasonalThemesDisabled: true, __updatedAt: Date.now() };
-  const saved = await fetch(`${baseUrl}/api/app-settings/ui`, { method: 'PUT', headers, body: JSON.stringify({ value: JSON.stringify(quiet) }) });
+  const saved = await fetch(`${baseUrl}/api/app-settings/ui`, { method: 'PUT', headers, body: JSON.stringify({ value: JSON.stringify(quiet) }), signal: AbortSignal.timeout(60_000) });
   assert.ok(saved.ok, 'Cannot save test UI preferences');
-  const flushed = await fetch(`${baseUrl}/api/ios/flush`, { method: 'POST', headers, body: '{}' });
+  const flushed = await fetch(`${baseUrl}/api/ios/flush`, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(60_000) });
   assert.ok(flushed.ok, 'Cannot flush test UI preferences');
   const persistence = await readFile(path.join(root, 'packages/client/src/lib/ui-persistence.ts'), 'utf8');
   const uiStateVersion = Number(persistence.match(/version:\s*(\d+)/)?.[1]);
@@ -331,6 +400,7 @@ async function exerciseNativeFullRestore(config, uiState) {
 }
 
 try {
+  await checkpoint('environment');
   assert.equal(process.platform, 'darwin', 'This validation requires macOS and Xcode');
   assert.equal(process.arch, 'arm64', 'The pinned Node framework has an ARM64 simulator slice only');
   const launchHelp = await run('xcrun', ['simctl', 'help', 'launch']);
@@ -358,14 +428,17 @@ try {
   report.simulator = { name: selected.name, deviceTypeIdentifier: selected.deviceTypeIdentifier,
     runtimeIdentifier: selected.runtimeIdentifier, runtimeVersion: selectedRuntime.version,
     runtimeBuildVersion: selectedRuntime.buildversion };
+  await checkpoint('primary-simulator-boot');
   await run('xcrun', ['simctl', 'boot', deviceId], { allowFailure: true });
   await run('xcrun', ['simctl', 'bootstatus', deviceId, '-b'], { log: 'simulator-boot.log' });
   console.log('Building the native app and UI test bundle.');
+  await checkpoint('native-build');
   const buildArgs = ['-project', project, '-scheme', 'Marinar', '-configuration', 'Debug',
     '-destination', `platform=iOS Simulator,id=${deviceId}`, '-derivedDataPath', derived,
     'CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO', 'CODE_SIGN_IDENTITY='];
   await run('xcodebuild', ['build-for-testing', ...buildArgs], { log: 'simulator-build.log' });
   await run('xcrun', ['simctl', 'install', deviceId, path.join(derived, 'Build/Products/Debug-iphonesimulator/Marinar.app')]);
+  await checkpoint('primary-native-lifecycle');
   let config = await launch();
   report.coverage.actualEmbeddedNode = true;
   report.checks.push('native-node-startup-and-authenticated-health');
@@ -442,6 +515,9 @@ try {
     await run('xcrun', ['simctl', 'spawn', deviceId, 'log', 'show', '--last', '20m', '--style', 'compact', '--predicate', 'process == "Marinar"'], { log: 'primary-app.log', allowFailure: true }).catch(() => {});
     await stop().catch(() => {});
     await preserveLaunchLogs();
+    if (ownedDevices.has(deviceId)) await collectCheck('primary-simulator-shutdown', async () => {
+      await run('xcrun', ['simctl', 'shutdown', deviceId]);
+    });
   }
 
   // Reuse the already built app/test bundle. The extra devices only exercise
@@ -459,6 +535,7 @@ try {
     report.screenVariants.push(result);
     let variantDevice;
     try {
+      await checkpoint(`${variant.key}-setup`);
       assert.ok(variant.type, `Required ${variant.key} simulator type is unavailable`);
       console.log(`Checking ${variant.key} portrait/landscape keyboard${variant.files ? ', blob export and system picker' : ''} with the existing build.`);
       variantDevice = await run('xcrun', ['simctl', 'create', `Marinar-${variant.key}-${Date.now()}`, variant.type.identifier, selectedRuntime.identifier]);
@@ -497,6 +574,7 @@ try {
         await run('xcrun', ['simctl', 'shutdown', variantDevice], { allowFailure: true }).catch(() => {});
       }
       result.status = report.errors.length === errorsBefore ? 'passed' : 'failed';
+      await checkpoint(`${variant.key}-finished`);
     }
   }
   report.providerCalls = mock.calls.map(({ id, kind, streaming, completed, disconnected }) => ({ id, kind, streaming, completed, disconnected }));
@@ -509,6 +587,7 @@ try {
   recordFailure('validation', error);
   process.exitCode = 1;
 } finally {
+  await checkpoint('collecting-artifacts');
   if (process.platform === 'darwin') await exportTestAttachments().catch((error) => {
     console.warn(`Could not export XCTest attachments: ${error.message}`);
   });
@@ -523,8 +602,9 @@ try {
   }
   if (mock) await mock.close();
   for (const owned of ownedDevices) {
-    await run('xcrun', ['simctl', 'shutdown', owned], { allowFailure: true });
-    await run('xcrun', ['simctl', 'delete', owned], { allowFailure: true });
+    await run('xcrun', ['simctl', 'shutdown', owned], { allowFailure: true }).catch((error) => recordFailure('simulator-cleanup', error));
+    await run('xcrun', ['simctl', 'delete', owned], { allowFailure: true }).catch((error) => recordFailure('simulator-cleanup', error));
   }
-  await writeFile(path.join(reportDir, 'simulator-validation.json'), JSON.stringify(report, null, 2) + '\n');
+  if (report.errors.length) { report.status = 'failed'; process.exitCode = 1; }
+  await checkpoint('finished');
 }
