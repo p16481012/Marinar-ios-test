@@ -1,0 +1,2185 @@
+import { resolveDecisionConnection } from "../services/decision/decision-connection.js";
+import { isIosRuntime, isIosUnsupportedProvider } from "../config/ios-runtime.js";
+import { askNoulQuestions } from "../services/decision/system-one.client.js";
+import { connectionChatTarget, probeDecisionSlot } from "../services/decision/sidecar-decision.backend.js";
+import {
+  BUNDLED_CLAUDE_CODE_VERSION,
+  claudeCodeExecutableOption,
+  readClaudeCodeModelCatalog,
+  resolveClaudeCodeInstall,
+} from "../services/llm/providers/claude-subscription/installed-cli.js";
+// ──────────────────────────────────────────────
+// Routes: Connections
+// ──────────────────────────────────────────────
+import type { FastifyInstance, FastifyReply } from "fastify";
+import { existsSync } from "fs";
+import { mkdir, readFile, writeFile } from "fs/promises";
+import { extname, join } from "path";
+import {
+  ATLAS_CLOUD_IMAGE_MODELS,
+  ATLAS_CLOUD_VIDEO_MODELS,
+  CODEX_IMAGE_MODEL,
+  ZAI_IMAGE_MODELS,
+  FAL_IMAGE_MODELS,
+  IMAGE_DEFAULTS_STORAGE_KEY,
+  MODEL_LISTS,
+  VIDEO_DEFAULTS_STORAGE_KEY,
+  connectionImageCaptioningDefaultsSchema,
+  connectionModelPinSchema,
+  createConnectionSchema,
+  MAX_PINNED_MODELS,
+  createDefaultVideoGenerationProfile,
+  decisionTestTimeoutMs,
+  generationParametersSchema,
+  type GenerationParameterKey,
+  type ModelParameterCapabilities,
+  inferImageSource,
+  inferVideoSource,
+  hasPlanUsageWindows,
+  isLocalAuthProvider,
+  isMistralAdjustableReasoningModel,
+  isMistralGlm53Model,
+  isOpenAIGpt6Model,
+  localAuthProviderBaseUrl,
+  supportsSubscriptionUsageWidget,
+  normalizeVideoGenerationProfile,
+  type AtlasCloudVideoModelSchemaResponse,
+} from "@marinara-engine/shared";
+import {
+  connectionSavesModelList,
+  createConnectionsStorage,
+  readSavedModelList,
+  withoutSavedModels,
+} from "../services/storage/connections.storage.js";
+import {
+  allowsDefaultChatModel,
+  canRefreshLocalContext,
+  fetchLocalContextLimit,
+} from "../services/llm/local-context-limit.js";
+import { resetMemoryRecallVectorizerCache } from "../services/memory-recall-embedding.js";
+import { withLongTermMemoryEmbeddingChange } from "../services/generation/long-term-memory-runtime.js";
+import { createLLMProvider } from "../services/llm/provider-registry.js";
+import { resolveStoredChatOptions, resolveStoredMaxTokens } from "../services/generation/generation-parameters.js";
+import { describeEmptyModelResponse, sentOutputBudget } from "../services/generation/empty-response-reason.js";
+import { isGlm53MandatoryReasoningModel } from "../services/llm/providers/glm-request-compat.js";
+import { fetchOpenAIChatGPTModels, getOpenAIChatGPTAuth } from "../services/llm/openai-chatgpt-auth.js";
+import { fetchGrokCliModels } from "../services/llm/providers/grok-subscription.provider.js";
+import { stopIfClaudeCodeExposesMcp } from "../services/llm/providers/claude-subscription.provider.js";
+import {
+  buildGoogleVertexModelUrl,
+  googleAuthHeadersForVertex,
+  normalizeGoogleGenerativeLanguageBaseUrl,
+} from "../services/llm/providers/google.provider.js";
+import {
+  resolveConnectionImageDefaults,
+  resolveConnectionImageQuality,
+} from "../services/image/image-generation-defaults.js";
+import { buildVeniceApiUrl, normalizeVeniceImageModels } from "../services/image/venice-image.js";
+import { buildFalImageUrl } from "../services/image/fal-image.js";
+import { buildSpicyApiUrl, normalizeSpicyApiImageModels } from "../services/image/spicyapi-image.js";
+import { isImageLocalUrlsEnabled, isProviderLocalUrlsEnabled } from "../config/runtime-config.js";
+import { logger, logDebugOverride } from "../lib/logger.js";
+import {
+  assertInsideDir,
+  extensionFromImageMime,
+  isAllowedImageBuffer,
+  normalizeLoopbackUrl,
+  safeFetch,
+} from "../utils/security.js";
+import { DATA_DIR } from "../utils/data-dir.js";
+import { decryptApiKey } from "../utils/crypto.js";
+import {
+  fetchNanoGptSubscriptionUsage,
+  readNanoGptModelSubscriptionMetadata,
+} from "../services/nanogpt/subscription-usage.js";
+import { fetchClaudePlanUsage } from "../services/llm/providers/claude-subscription/plan-usage.js";
+import { fetchOpenAIChatGPTPlanUsage } from "../services/llm/openai-chatgpt-usage.js";
+import {
+  buildAtlasCloudModelSchemaUrl,
+  buildAtlasCloudTestReferenceImage,
+  describeAtlasCloudModelLimits,
+  fetchAtlasCloudModelSchema,
+  listAtlasCloudModelOptionFields,
+} from "../services/media/atlas-cloud-video-schema.js";
+import { fetchAtlasCloudModels } from "../services/media/atlas-cloud.js";
+import {
+  buildNanoGptVideoUrl,
+  fetchNanoGptVideoModels,
+  normalizeVideoService,
+} from "../services/video/video-generation.js";
+
+const CONNECTION_TEST_ERROR_PREVIEW_CHARS = 2000;
+const CONNECTION_IMAGES_DIR = join(DATA_DIR, "connections", "images");
+const SWARMUI_CONTROL_REQUEST_TIMEOUT_MS = 15_000;
+const DEFAULT_COMFYUI_VIDEO_BASE_URL = "http://127.0.0.1:8188";
+const DEFAULT_SWARMUI_VIDEO_BASE_URL = "http://127.0.0.1:7801";
+const DEFAULT_GEMINI_OMNI_VIDEO_MODEL = "gemini-omni-flash-preview";
+const DEFAULT_GEMINI_OMNI_VIDEO_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
+const DEFAULT_GOOGLE_VEO_VIDEO_MODEL = "veo-3.1-generate-preview";
+const DEFAULT_GOOGLE_VEO_VIDEO_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
+const DEFAULT_XAI_VIDEO_MODEL = "grok-imagine-video-1.5";
+const DEFAULT_XAI_VIDEO_BASE_URL = "https://api.x.ai/v1";
+const DEFAULT_OPENROUTER_VIDEO_MODEL = "google/veo-3.1";
+const DEFAULT_OPENROUTER_VIDEO_BASE_URL = "https://openrouter.ai/api/v1";
+const DEFAULT_NANOGPT_VIDEO_BASE_URL = "https://nano-gpt.com/api";
+const DEFAULT_ATLAS_CLOUD_VIDEO_MODEL = "google/veo3.1/text-to-video";
+const DEFAULT_ATLAS_CLOUD_VIDEO_BASE_URL = "https://api.atlascloud.ai/api/v1";
+const DEFAULT_SEEDANCE_VIDEO_MODEL = "seedance-2-0";
+const DEFAULT_SEEDANCE_VIDEO_BASE_URL = "https://api.seedance2.ai";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function readDebugMode(body: unknown): boolean {
+  return isRecord(body) && body.debugMode === true;
+}
+
+function trimProviderError(value: string, maxLen = CONNECTION_TEST_ERROR_PREVIEW_CHARS): string {
+  return value.trim().replace(/\s+/g, " ").slice(0, maxLen);
+}
+
+function providerJsonMessage(json: unknown): string | null {
+  if (!isRecord(json)) return null;
+
+  const nestedError = json.error;
+  const message =
+    (isRecord(nestedError) && typeof nestedError.message === "string" && nestedError.message) ||
+    (typeof nestedError === "string" && nestedError) ||
+    (typeof json.message === "string" && json.message) ||
+    (typeof json.detail === "string" && json.detail) ||
+    null;
+
+  if (!message) return null;
+
+  const markers = [
+    typeof json.type === "string" ? `type: ${json.type}` : null,
+    typeof json.code === "string" && json.code !== json.type ? `code: ${json.code}` : null,
+  ].filter(Boolean);
+
+  return markers.length > 0 ? `${message} (${markers.join(", ")})` : message;
+}
+
+function formatProviderErrorBody(body: string): string {
+  const trimmed = body.trim();
+  if (!trimmed) return "No response body";
+
+  if (/<(?:!doctype|html)\b/i.test(trimmed)) {
+    const titleMatch = trimmed.match(/<title[^>]*>(.*?)<\/title>/i);
+    if (titleMatch?.[1]) return trimProviderError(titleMatch[1]);
+    return trimProviderError(trimmed.replace(/<[^>]+>/g, " "));
+  }
+
+  try {
+    const json = JSON.parse(trimmed) as unknown;
+    const message = providerJsonMessage(json);
+    if (message) return trimProviderError(message);
+  } catch {
+    // Raw text response; fall through to preview.
+  }
+
+  return trimProviderError(trimmed);
+}
+
+function isOpenAICompatibleProvider(provider: string): boolean {
+  return ["openai", "openrouter", "nanogpt", "xai", "mistral", "custom", "cohere", "arli", "zai", "deepseek"].includes(
+    provider,
+  );
+}
+
+function usesResponsesEndpointForTestMessage(provider: string, model: string): boolean {
+  if (!isOpenAICompatibleProvider(provider) || provider === "custom") return false;
+  const normalized = model.toLowerCase();
+  return (
+    (isOpenAIGpt6Model(normalized) && provider !== "openrouter") ||
+    normalized.startsWith("gpt-5.6") ||
+    normalized.startsWith("gpt-5.5") ||
+    normalized.startsWith("gpt-5.4") ||
+    normalized.startsWith("codex-") ||
+    normalized.endsWith("-codex") ||
+    normalized.endsWith("-codex-max") ||
+    normalized.endsWith("-codex-mini")
+  );
+}
+
+function describeTestMessageTarget(provider: string, baseUrl: string, model: string): string {
+  if (provider === "claude_subscription") return "Claude Agent SDK";
+  if (provider === "openai_chatgpt") return "local ChatGPT session";
+  if (provider === "grok_subscription") return "local Grok CLI session";
+  if (!baseUrl) return "(no base URL)";
+  if (provider === "google_vertex") return buildGoogleVertexModelUrl(baseUrl, model, "generateContent");
+  if (isOpenAICompatibleProvider(provider)) {
+    return `${baseUrl}${usesResponsesEndpointForTestMessage(provider, model) ? "/responses" : "/chat/completions"}`;
+  }
+  if (provider === "anthropic") return `${baseUrl}/messages`;
+  return baseUrl;
+}
+
+function resolveImageGenerationSource(conn: Record<string, unknown>, baseUrl: string): string {
+  const explicitSource = typeof conn.imageGenerationSource === "string" ? conn.imageGenerationSource : "";
+  // Older connections identify their backend only through imageService.
+  const serviceHint = typeof conn.imageService === "string" ? conn.imageService : "";
+  const model = typeof conn.model === "string" ? conn.model : "";
+  return inferImageSource(explicitSource || serviceHint || model, baseUrl);
+}
+
+function resolveVideoGenerationSource(conn: Record<string, unknown>, baseUrl: string): string {
+  const explicitSource = typeof conn.videoGenerationSource === "string" ? conn.videoGenerationSource : "";
+  // Older connections identify their backend only through videoService.
+  const serviceHint = typeof conn.videoService === "string" ? conn.videoService : "";
+  const model = typeof conn.model === "string" ? conn.model : "";
+  return inferVideoSource(explicitSource || serviceHint || model, baseUrl);
+}
+
+function nanoGptVideoConnectionError(conn: Record<string, unknown>): string | null {
+  if (conn.provider !== "video_generation") return null;
+  const baseUrl =
+    typeof conn.baseUrl === "string" && conn.baseUrl.trim() ? conn.baseUrl : DEFAULT_NANOGPT_VIDEO_BASE_URL;
+  if (resolveVideoGenerationSource(conn, baseUrl) !== "nanogpt") return null;
+  try {
+    buildNanoGptVideoUrl(baseUrl, "generate-video");
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : "Invalid NanoGPT video endpoint";
+  }
+}
+
+// Returns the model-name options a ComfyUI loader node exposes through
+// object_info, or null when the response does not carry that node's schema —
+// a valid empty list and missing metadata must stay distinguishable so the
+// route can keep its 502 contract for malformed checkpoint responses.
+export function parseComfyLoaderModelNames(info: unknown, nodeName: string, inputName: string): string[] | null {
+  if (!isRecord(info)) return null;
+  const node = info[nodeName];
+  if (!isRecord(node) || !isRecord(node.input) || !isRecord(node.input.required)) return null;
+  const input = node.input.required[inputName];
+  if (!Array.isArray(input)) return null;
+  const options = input[0];
+  if (!Array.isArray(options)) return null;
+  return options.filter((option): option is string => typeof option === "string");
+}
+
+/** Atlas Cloud's live catalog, or the curated starter list when the catalog cannot be read. */
+async function listAtlasCloudModels(
+  baseUrl: string,
+  kind: "image" | "video",
+  starterModels: ReadonlyArray<{ id: string; name: string }>,
+): Promise<Array<{ id: string; name: string }>> {
+  try {
+    const models = await fetchAtlasCloudModels(baseUrl, kind);
+    if (models.length > 0) return models;
+  } catch (error) {
+    logger.warn(error, "[atlas-cloud] could not read the %s model catalog; using the starter list", kind);
+  }
+  return starterModels.map((model) => ({ id: model.id, name: model.name }));
+}
+
+function localUrlPolicyForProvider(provider: string, imageSource: string) {
+  const isLocalImageBackend =
+    provider === "image_generation" &&
+    (imageSource === "comfyui" || imageSource === "swarmui" || imageSource === "automatic1111");
+  const isImage = provider === "image_generation";
+  const isVideo = provider === "video_generation";
+  const isLocalVideoBackend = isVideo && (imageSource === "comfyui" || imageSource === "swarmui");
+  return {
+    allowLocal: isVideo
+      ? isLocalVideoBackend
+      : isLocalImageBackend || (isImage && isImageLocalUrlsEnabled())
+        ? true
+        : isProviderLocalUrlsEnabled(),
+    allowLoopback: true,
+    allowMdns:
+      isLocalVideoBackend ||
+      (!isVideo && (provider !== "image_generation" || isLocalImageBackend || isImageLocalUrlsEnabled())),
+    allowedProtocols: ["https:", "http:"],
+    flagName: isImage ? "IMAGE_LOCAL_URLS_ENABLED" : "PROVIDER_LOCAL_URLS_ENABLED",
+  };
+}
+
+function swarmUiHeaders(apiKey: string): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const token = apiKey.trim();
+  if (token) headers.Cookie = `swarm_token=${encodeURIComponent(token)}`;
+  return headers;
+}
+
+async function postSwarmUiJson(baseUrl: string, apiKey: string, route: string, body: Record<string, unknown>) {
+  const response = await safeFetch(`${baseUrl.replace(/\/+$/, "")}/API/${route}`, {
+    method: "POST",
+    headers: swarmUiHeaders(apiKey),
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(SWARMUI_CONTROL_REQUEST_TIMEOUT_MS),
+    policy: localUrlPolicyForProvider("image_generation", "swarmui"),
+    maxResponseBytes: 5 * 1024 * 1024,
+    decodeCompressedResponse: true,
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`SwarmUI returned ${response.status}: ${formatProviderErrorBody(text)}`);
+  }
+  let result: unknown;
+  try {
+    result = JSON.parse(text) as unknown;
+  } catch {
+    throw new Error("SwarmUI returned invalid JSON");
+  }
+  if (isRecord(result) && (typeof result.error === "string" || typeof result.error_id === "string")) {
+    const message =
+      typeof result.error === "string"
+        ? result.error
+        : typeof result.error_id === "string"
+          ? result.error_id
+          : "Unknown error";
+    throw new Error(`SwarmUI API error: ${trimProviderError(message)}`);
+  }
+  return result;
+}
+
+async function createSwarmUiSession(baseUrl: string, apiKey: string): Promise<string> {
+  const result = await postSwarmUiJson(baseUrl, apiKey, "GetNewSession", {});
+  const sessionId = isRecord(result) && typeof result.session_id === "string" ? result.session_id.trim() : "";
+  if (!sessionId) throw new Error("SwarmUI did not return a session_id");
+  return sessionId;
+}
+
+export function buildGoogleModelsPageUrl(baseUrl: string, modelsEndpoint: string, pageToken = ""): string {
+  return `${baseUrl}${modelsEndpoint}?pageSize=1000` + (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
+}
+
+export function buildConnectionTestCatalogUrl(
+  baseUrl: string,
+  provider: string,
+  modelsEndpoint = "/models",
+  audioSource?: string | null,
+): string {
+  const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
+  if (provider === "audio" && (audioSource || "elevenlabs") === "elevenlabs") {
+    return `${normalizedBaseUrl.replace(/\/v\d+$/, "")}/v1/models`;
+  }
+  return `${normalizedBaseUrl}${modelsEndpoint}`;
+}
+
+function normalizeConnectionTestBaseUrl(baseUrl: string, provider: string): string {
+  if (provider === "google") return normalizeGoogleGenerativeLanguageBaseUrl(baseUrl);
+  if (provider !== "image_generation") return baseUrl.replace(/\/+$/, "");
+  try {
+    return normalizeLoopbackUrl(baseUrl).replace(/\/+$/, "");
+  } catch {
+    return baseUrl;
+  }
+}
+
+function getStoredVideoDefaults(raw: unknown) {
+  const root = parseDefaultParametersRoot(raw);
+  return normalizeVideoGenerationProfile(root[VIDEO_DEFAULTS_STORAGE_KEY]).profile;
+}
+
+function parseDefaultParametersRoot(raw: unknown): Record<string, unknown> {
+  if (!raw) return {};
+  let parsed: unknown = raw;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed) as unknown;
+    } catch {
+      return {};
+    }
+  }
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? { ...(parsed as Record<string, unknown>) }
+    : {};
+}
+
+function parseImageUpload(image: string): { buffer: Buffer; hintedExt: string } {
+  let base64 = image;
+  let hintedExt = "png";
+  if (base64.startsWith("data:")) {
+    const match = base64.match(/^data:image\/([\w.+-]+);base64,/i);
+    if (match?.[1]) {
+      hintedExt = match[1].replace("+xml", "");
+      base64 = base64.slice(base64.indexOf(",") + 1);
+    }
+  }
+  return { buffer: Buffer.from(base64, "base64"), hintedExt };
+}
+
+function getSafeConnectionImagePath(filename: string): string | null {
+  if (!filename || filename.includes("..") || filename.includes("/") || filename.includes("\\")) return null;
+  try {
+    return assertInsideDir(CONNECTION_IMAGES_DIR, join(CONNECTION_IMAGES_DIR, filename));
+  } catch {
+    return null;
+  }
+}
+
+function buildStabilityUrl(baseUrl: string, targetPath: string): string {
+  try {
+    const url = new URL(baseUrl);
+    const parts = url.pathname.split("/").filter(Boolean);
+    const versionIndex = parts.findIndex((part) => part === "v1" || part === "v2beta");
+    const prefix = versionIndex >= 0 ? parts.slice(0, versionIndex) : parts;
+    url.pathname = `/${[...prefix, ...targetPath.split("/").filter(Boolean)].join("/")}`;
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return `${baseUrl.replace(/\/+$/, "")}/${targetPath.replace(/^\/+/, "")}`;
+  }
+}
+
+function buildHordeUrl(baseUrl: string, targetPath: string): string {
+  try {
+    const url = new URL(baseUrl);
+    const parts = url.pathname.split("/").filter(Boolean);
+    const versionIndex = parts.findIndex((part, index) => part === "api" && parts[index + 1] === "v2");
+    const prefix = versionIndex >= 0 ? parts.slice(0, versionIndex + 2) : [...parts, "api", "v2"];
+    url.pathname = `/${[...prefix, ...targetPath.split("/").filter(Boolean)].join("/")}`;
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return `${baseUrl.replace(/\/+$/, "")}/api/v2/${targetPath.replace(/^\/+/, "")}`;
+  }
+}
+
+function hordeHeaders(apiKey: string): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    apikey: apiKey.trim() || "0000000000",
+    "Client-Agent": "Marinara-Engine",
+  };
+}
+
+function isStabilityV1Base(baseUrl: string): boolean {
+  try {
+    const parts = new URL(baseUrl).pathname.split("/").filter(Boolean);
+    return parts.includes("v1") && !parts.includes("v2beta");
+  } catch {
+    return /\/v1(?:\/|$)/i.test(baseUrl) && !/\/v2beta(?:\/|$)/i.test(baseUrl);
+  }
+}
+
+function knownStabilityImageModels() {
+  return MODEL_LISTS.image_generation
+    .filter((model) => {
+      const id = model.id.toLowerCase();
+      return id.startsWith("sd3") || id.startsWith("stable-image");
+    })
+    .map((model) => ({ id: model.id, name: model.name }));
+}
+
+export async function connectionsRoutes(app: FastifyInstance) {
+  const storage = createConnectionsStorage(app.db);
+  if (isIosRuntime) {
+    app.addHook("preHandler", async (request, reply) => {
+      // Keep imported connection records editable while refusing desktop login,
+      // model discovery and test paths that bypass the chat provider factory.
+      const route = request.routeOptions.url ?? "";
+      if (!/\/(?:test|models|test-message|diagnose-claude-subscription|subscription-usage)$/u.test(route)) return;
+      const id = (request.params as { id?: string }).id;
+      const connection = id ? await storage.getById(id) : null;
+      if (connection && isIosUnsupportedProvider(connection.provider)) {
+        return reply.code(501).send({
+          code: "IOS_FEATURE_UNAVAILABLE",
+          error: "This connection requires a desktop CLI or login. Select a remote API provider in the iOS app.",
+        });
+      }
+    });
+  }
+  const maskConnection = <T extends { apiKeyEncrypted?: unknown; managementTokenEncrypted?: unknown } | null>(
+    conn: T,
+  ): T =>
+    conn
+      ? ({
+          ...withoutSavedModels(conn),
+          apiKeyEncrypted: conn.apiKeyEncrypted ? "••••••••" : "",
+          managementTokenEncrypted: conn.managementTokenEncrypted ? "••••••••" : "",
+        } as unknown as T)
+      : conn;
+
+  app.get("/", async () => {
+    return storage.list();
+  });
+
+  app.post("/refresh-local-context", async () => {
+    const candidates = (await storage.list()).filter(
+      (row) => row.provider !== "decision" && canRefreshLocalContext(row),
+    );
+    const updated: string[] = [];
+    // Each connection makes four bounded metadata probes; keep only three connections active at once.
+    for (let index = 0; index < candidates.length; index += 3) {
+      await Promise.all(
+        candidates.slice(index, index + 3).map(async (candidate) => {
+          const connection = await storage.getWithKey(candidate.id);
+          if (!connection) return;
+          const maxContext = await fetchLocalContextLimit(connection);
+          if (maxContext === null || maxContext === connection.maxContext) return;
+          if (await storage.updateContextIfUnchanged(connection, maxContext)) {
+            updated.push(connection.id);
+          }
+        }),
+      );
+    }
+    return { updated };
+  });
+
+  app.get<{ Params: { filename: string } }>("/images/file/:filename", async (req, reply) => {
+    const filepath = getSafeConnectionImagePath(req.params.filename);
+    if (!filepath || !existsSync(filepath)) return reply.status(404).send({ error: "Image not found" });
+
+    const buffer = await readFile(filepath);
+    const imageInfo = isAllowedImageBuffer(buffer, extname(filepath));
+    if (!imageInfo) return reply.status(404).send({ error: "Image not found" });
+
+    return reply
+      .header("Content-Type", imageInfo.mimeType)
+      .header("Cache-Control", "public, max-age=31536000, immutable")
+      .send(buffer);
+  });
+
+  app.get<{ Params: { id: string } }>("/:id", async (req, reply) => {
+    const conn = await storage.getById(req.params.id);
+    if (!conn) return reply.status(404).send({ error: "Connection not found" });
+    // Mask key in response
+    return maskConnection(conn);
+  });
+
+  app.post("/", async (req, reply) => {
+    const input = createConnectionSchema.parse(req.body);
+    const validationError = nanoGptVideoConnectionError(input);
+    if (validationError) return reply.status(400).send({ error: validationError });
+    return withLongTermMemoryEmbeddingChange(app.db, reply, async () => {
+      const created = await storage.create(input);
+      resetMemoryRecallVectorizerCache();
+      return maskConnection(created);
+    });
+  });
+
+  app.patch<{ Params: { id: string } }>("/:id", async (req, reply) => {
+    const data = createConnectionSchema.partial().parse(req.body);
+    const current = await storage.getById(req.params.id);
+    if (!current) return reply.status(404).send({ error: "Connection not found" });
+    const validationError = nanoGptVideoConnectionError({ ...current, ...data });
+    if (validationError) return reply.status(400).send({ error: validationError });
+    return withLongTermMemoryEmbeddingChange(app.db, reply, async () => {
+      const updated = await storage.update(req.params.id, data);
+      resetMemoryRecallVectorizerCache();
+      return maskConnection(updated);
+    });
+  });
+
+  app.post<{ Params: { id: string } }>("/:id/image", async (req, reply) => {
+    const connection = await storage.getById(req.params.id);
+    if (!connection) return reply.status(404).send({ error: "Connection not found" });
+
+    const body = req.body as { image?: string };
+    if (!body.image) return reply.status(400).send({ error: "No image data provided" });
+
+    const { buffer, hintedExt } = parseImageUpload(body.image);
+    const imageInfo = isAllowedImageBuffer(buffer, `.${hintedExt}`);
+    if (!imageInfo) return reply.status(400).send({ error: "Unsupported or invalid connection image" });
+
+    const ext = extensionFromImageMime(imageInfo.mimeType);
+    await mkdir(CONNECTION_IMAGES_DIR, { recursive: true });
+    const filename = `connection-${req.params.id.replace(/[^a-zA-Z0-9_-]/g, "-")}-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}.${ext}`;
+    const filepath = assertInsideDir(CONNECTION_IMAGES_DIR, join(CONNECTION_IMAGES_DIR, filename));
+    await writeFile(filepath, buffer);
+
+    const updated = await storage.update(req.params.id, { imagePath: `/api/connections/images/file/${filename}` });
+    if (!updated) return reply.status(404).send({ error: "Connection not found" });
+    return maskConnection(updated);
+  });
+
+  // Save default generation parameters for a connection
+  app.put<{ Params: { id: string } }>("/:id/default-parameters", async (req, reply) => {
+    const conn = await storage.getById(req.params.id);
+    if (!conn) return reply.status(404).send({ error: "Connection not found" });
+    const raw = req.body;
+    if (raw !== null && (typeof raw !== "object" || Array.isArray(raw))) {
+      return reply.status(400).send({ error: "Body must be a JSON object or null" });
+    }
+    let params: Record<string, unknown> | null = null;
+    if (raw !== null) {
+      const parsed = generationParametersSchema.partial().safeParse(raw);
+      if (!parsed.success) {
+        return reply.status(400).send({
+          error: "Invalid generation parameters",
+          issues: parsed.error.issues.map((issue) => ({
+            path: issue.path.join("."),
+            message: issue.message,
+          })),
+        });
+      }
+      params = { ...parsed.data };
+      const rawRecord = raw as Record<string, unknown>;
+      const imageCaptioningDefaults = connectionImageCaptioningDefaultsSchema.safeParse(rawRecord);
+      if (!imageCaptioningDefaults.success) {
+        return reply.status(400).send({
+          error: "Invalid image captioning defaults",
+          issues: imageCaptioningDefaults.error.issues.map((issue) => ({
+            path: issue.path.join("."),
+            message: issue.message,
+          })),
+        });
+      }
+      Object.assign(params, imageCaptioningDefaults.data);
+      if (Object.prototype.hasOwnProperty.call(rawRecord, IMAGE_DEFAULTS_STORAGE_KEY)) {
+        params[IMAGE_DEFAULTS_STORAGE_KEY] = rawRecord[IMAGE_DEFAULTS_STORAGE_KEY];
+      }
+      if (Object.prototype.hasOwnProperty.call(rawRecord, VIDEO_DEFAULTS_STORAGE_KEY)) {
+        params[VIDEO_DEFAULTS_STORAGE_KEY] = rawRecord[VIDEO_DEFAULTS_STORAGE_KEY];
+      }
+    }
+    return withLongTermMemoryEmbeddingChange(app.db, reply, async () => {
+      await storage.updateDefaultParameters(req.params.id, params);
+      resetMemoryRecallVectorizerCache();
+      return { success: true };
+    });
+  });
+
+  app.delete<{ Params: { id: string } }>("/:id", async (req, reply) => {
+    await withLongTermMemoryEmbeddingChange(app.db, reply, async () => {
+      await storage.remove(req.params.id);
+      resetMemoryRecallVectorizerCache();
+    });
+    return reply.status(204).send();
+  });
+
+  // Duplicate a connection (copies everything including the encrypted API key)
+  app.post<{ Params: { id: string } }>("/:id/duplicate", async (req, reply) => {
+    const result = await storage.duplicate(req.params.id);
+    if (!result) return reply.status(404).send({ error: "Connection not found" });
+    return maskConnection(result);
+  });
+
+  // Test connection (sends a tiny ping to the API)
+  app.post<{ Params: { id: string } }>("/:id/test", async (req, reply) => {
+    const conn = await storage.getWithKey(req.params.id);
+    if (!conn) return reply.status(404).send({ error: "Connection not found" });
+
+    const requestDebug = readDebugMode(req.body);
+    const debugLog = (message: string, ...args: any[]) => logDebugOverride(requestDebug, message, ...args);
+    const start = Date.now();
+    try {
+      if (conn.provider === "decision") {
+        const resolved = await resolveDecisionConnection(conn, (id) => storage.getWithKey(id));
+        if (!resolved.connection)
+          return {
+            success: false,
+            message: resolved.error,
+            errorCode: resolved.error,
+            latencyMs: Date.now() - start,
+            modelName: null,
+          };
+        // Waits past the connection's own limit so a slow answer comes back with its
+        // real time. The client compares that time with `timeLimitMs`, the limit chats use.
+        const timeLimitMs = resolved.connection.timeoutMs;
+        const testTimeoutMs = decisionTestTimeoutMs(timeLimitMs ?? 0);
+        if (resolved.connection.protocol === "chat_logprobs") {
+          // The same probe as a local model's Test, so it also reports whether the
+          // server returned log-probabilities and whether the model had to think.
+          const probe = await probeDecisionSlot(
+            connectionChatTarget(conn.id, conn.name, { ...resolved.connection, timeoutMs: testTimeoutMs }),
+          );
+          return {
+            success: probe.probability !== null,
+            message: probe.error ?? "Decision model answered.",
+            errorCode: probe.probability === null ? (probe.error ?? "no_answer") : undefined,
+            decisionProbability: probe.probability ?? undefined,
+            latencyMs: probe.latencyMs,
+            timeLimitMs,
+            testTimeoutMs,
+            logprobs: probe.logprobs,
+            answersDirectly: probe.answersDirectly,
+            modelName: resolved.connection.model,
+          };
+        }
+        const result = await askNoulQuestions({
+          connection: resolved.connection,
+          state: { recent_messages: [{ role: "user", name: "User", content: "The door is open." }] },
+          questions: [{ id: "test", instructions: "The door is open." }],
+          timeoutMs: testTimeoutMs,
+          debugMode: requestDebug,
+        });
+        const probability = result.answers.get("test");
+        return {
+          success: probability !== undefined,
+          message: result.error ?? "Decision model answered.",
+          errorCode: result.error,
+          decisionProbability: probability,
+          latencyMs: result.latencyMs,
+          timeLimitMs,
+          testTimeoutMs,
+          modelName: resolved.connection.model,
+        };
+      }
+      if (conn.provider === "claude_subscription") {
+        if (!conn.model) {
+          return {
+            success: false,
+            message: "No model configured. Set a Claude subscription model first.",
+            latencyMs: Date.now() - start,
+            modelName: null,
+          };
+        }
+        const provider = createLLMProvider(
+          conn.provider,
+          "",
+          conn.apiKey,
+          conn.maxContext,
+          conn.openrouterProvider,
+          conn.maxTokensOverride,
+          conn.claudeFastMode === "true",
+          conn.treatAsLocalEndpoint === "true",
+          conn.defaultParameters,
+          conn.id,
+        );
+        let responseText = "";
+        for await (const chunk of provider.chat([{ role: "user", content: "Reply with OK." }], {
+          model: conn.model,
+          maxTokens: 32,
+          stream: false,
+        })) {
+          responseText += chunk;
+        }
+        return {
+          success: true,
+          message: `Claude Agent SDK completed a real request: ${responseText.trim().slice(0, 120) || "OK"}`,
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
+      }
+
+      if (conn.provider === "openai_chatgpt") {
+        const auth = await getOpenAIChatGPTAuth();
+        const detail = auth.planType ? ` (${auth.planType})` : "";
+        return {
+          success: true,
+          message: `ChatGPT login found via Codex auth${detail}. Requests will use the local ChatGPT session.`,
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
+      }
+
+      if (conn.provider === "grok_subscription") {
+        const provider = createLLMProvider(
+          conn.provider,
+          // Grok CLI subscription auth is local-only: the CLI reads the
+          // cached `grok login` session, so API key/base URL are intentionally
+          // unused here and in normal generation.
+          "",
+          "",
+          conn.maxContext,
+          conn.openrouterProvider,
+          conn.maxTokensOverride,
+          conn.claudeFastMode === "true",
+          conn.treatAsLocalEndpoint === "true",
+          conn.defaultParameters,
+          conn.id,
+        );
+        let responseText = "";
+        for await (const chunk of provider.chat([{ role: "user", content: "Reply with OK." }], {
+          model: conn.model ?? "",
+          maxTokens: 32,
+          stream: false,
+        })) {
+          responseText += chunk;
+        }
+        return {
+          success: true,
+          message: `Grok CLI completed a real request: ${responseText.trim().slice(0, 120) || "OK"}`,
+          latencyMs: Date.now() - start,
+          modelName: conn.model || "Grok CLI default",
+        };
+      }
+
+      // Simple models list fetch to verify the key works
+      const { PROVIDERS } = await import("@marinara-engine/shared");
+      const provider = PROVIDERS[conn.provider as keyof typeof PROVIDERS];
+      let baseUrl = conn.baseUrl || provider?.defaultBaseUrl || "";
+
+      if (!baseUrl) {
+        return {
+          success: false,
+          message: "No base URL configured for this provider",
+          latencyMs: 0,
+          modelName: null,
+        };
+      }
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (provider?.usesAuthHeader) {
+        headers["Authorization"] = `Bearer ${conn.apiKey}`;
+      }
+      if (provider?.apiKeyHeader) {
+        headers[provider.apiKeyHeader] = conn.apiKey;
+      }
+      if (conn.provider === "google_vertex") {
+        Object.assign(headers, await googleAuthHeadersForVertex(conn.apiKey));
+      }
+      if (conn.provider === "anthropic") {
+        headers["anthropic-version"] = "2023-06-01";
+      }
+
+      const imageSource =
+        conn.provider === "image_generation" ? resolveImageGenerationSource(conn as any, baseUrl) : "";
+      if (conn.provider === "video_generation") {
+        return {
+          success: true,
+          message: "Video generation connection configured. Use Test Video to verify MP4 generation.",
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
+      }
+      baseUrl = normalizeConnectionTestBaseUrl(baseUrl, conn.provider);
+      // image_generation has no standard modelsEndpoint — use provider-specific checks
+      let testUrl: string;
+      if (conn.provider === "image_generation" && imageSource === "novelai") {
+        return {
+          success: true,
+          message: "NovelAI connection configured. Use 'Test Image' to verify generation works.",
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
+      } else if (conn.provider === "image_generation" && imageSource === "zai") {
+        return {
+          success: true,
+          message: "Z.AI connection configured. Use 'Test Image' to verify generation works.",
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
+      } else if (conn.provider === "image_generation" && imageSource === "fal") {
+        if (!conn.apiKey?.trim()) throw new Error("fal.ai requires an API key");
+        buildFalImageUrl(baseUrl, conn.model);
+        return {
+          success: true,
+          message:
+            "fal.ai connection configured. Use Test Image to verify your key and generate an image using credits.",
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
+      } else if (conn.provider === "image_generation" && imageSource === "codex_chatgpt") {
+        // Only reads the local login, so checking never uses the ChatGPT image allowance.
+        const auth = await getOpenAIChatGPTAuth();
+        const detail = auth.planType ? ` (${auth.planType})` : "";
+        return {
+          success: true,
+          message: `ChatGPT login found via Codex auth${detail}. Use Test Image to generate one image with your ChatGPT plan.`,
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
+      } else if (conn.provider === "image_generation" && imageSource === "horde") {
+        // Horde: heartbeat is the lightweight health endpoint for the public API.
+        testUrl = buildHordeUrl(baseUrl, "status/heartbeat");
+      } else if (conn.provider === "image_generation" && imageSource === "spicyapi") {
+        // Listing image models checks the key without starting a paid task.
+        testUrl = buildSpicyApiUrl(baseUrl, "models", { modality: "image" });
+      } else if (conn.provider === "image_generation" && imageSource === "stability") {
+        // Stability's generation endpoints live under v2beta, but account/key checks are v1.
+        testUrl = buildStabilityUrl(baseUrl, "v1/user/account");
+      } else if (conn.provider === "image_generation" && imageSource === "comfyui") {
+        // ComfyUI: ping the system stats endpoint
+        testUrl = `${baseUrl}/system_stats`;
+      } else if (conn.provider === "image_generation" && imageSource === "swarmui") {
+        await createSwarmUiSession(baseUrl, conn.apiKey || "");
+        return {
+          success: true,
+          message: "Connection successful",
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
+      } else if (conn.provider === "image_generation" && imageSource === "automatic1111") {
+        // AUTOMATIC1111 / SD Web UI: ping the internal ping endpoint
+        testUrl = `${baseUrl}/sdapi/v1/options`;
+      } else if (conn.provider === "image_generation" && imageSource === "runpod_comfyui") {
+        // RunPod: use Test Image to verify — no cheap endpoint test available
+        return {
+          success: true,
+          message: "RunPod endpoint configured. Use 'Test Image' to verify generation works.",
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
+      } else if (conn.provider === "google_vertex") {
+        testUrl = buildGoogleVertexModelUrl(baseUrl, conn.model, "models");
+      } else {
+        testUrl = buildConnectionTestCatalogUrl(
+          baseUrl,
+          conn.provider,
+          provider?.modelsEndpoint || "/models",
+          conn.audioSource,
+        );
+      }
+
+      const testHeaders =
+        conn.provider === "image_generation" && imageSource === "horde" ? hordeHeaders(conn.apiKey) : headers;
+      debugLog("[connections/test] provider=%s model=%s catalogUrl=%s", conn.provider, conn.model ?? "", testUrl);
+      const res = await safeFetch(testUrl, {
+        headers: testHeaders,
+        policy: localUrlPolicyForProvider(conn.provider, imageSource),
+        maxResponseBytes: 2 * 1024 * 1024,
+        decodeCompressedResponse: true,
+      });
+      const latencyMs = Date.now() - start;
+
+      if (res.ok) {
+        return { success: true, message: "Connection successful", latencyMs, modelName: conn.model };
+      } else {
+        const body = await res.text();
+        const detail = formatProviderErrorBody(body);
+        debugLog(
+          "[connections/test] provider=%s catalogUrl=%s returned %d: %s",
+          conn.provider,
+          testUrl,
+          res.status,
+          detail,
+        );
+        return {
+          success: false,
+          message: `API returned ${res.status}: ${detail}`,
+          latencyMs,
+          modelName: null,
+        };
+      }
+    } catch (err) {
+      debugLog(
+        "[connections/test] provider=%s failed: %s",
+        conn.provider,
+        err instanceof Error ? err.message : "Unknown error",
+      );
+      return {
+        success: false,
+        message: `Connection failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+        latencyMs: Date.now() - start,
+        modelName: null,
+      };
+    }
+  });
+
+  // ── Atlas Cloud: the selected video model's own inputs, for the connection editor ──
+  app.get<{ Querystring: { model?: string } }>("/atlas-cloud/video-model-schema", async (req, reply) => {
+    const model = String(req.query.model ?? "").trim();
+    if (!model || model.length > 200 || !buildAtlasCloudModelSchemaUrl(model)) {
+      return reply.status(400).send({ error: "Enter an Atlas Cloud model ID such as vendor/model/image-to-video" });
+    }
+    const schema = await fetchAtlasCloudModelSchema(model);
+    const response: AtlasCloudVideoModelSchemaResponse = schema
+      ? {
+          model,
+          available: true,
+          fields: listAtlasCloudModelOptionFields(schema),
+          limits: describeAtlasCloudModelLimits(schema),
+        }
+      : { model, available: false, fields: [], limits: null };
+    return response;
+  });
+
+  // ── Fetch available models from the provider API ──
+  /**
+   * Subscription usage for the usage widget.
+   *
+   * NanoGPT: prefers the connection's management token (`usage:read`, cannot
+   * spend balance) and falls back to the inference API key.
+   * Claude (Subscription) and OpenAI (ChatGPT): the plan's 5-hour and weekly
+   * windows, limited to the ones the connection has switched on.
+   */
+  app.get<{ Params: { id: string } }>("/:id/subscription-usage", async (req, reply) => {
+    const conn = await storage.getById(req.params.id);
+    if (!conn) return reply.status(404).send({ error: "Connection not found" });
+    if (!supportsSubscriptionUsageWidget(conn.provider)) {
+      return reply.status(400).send({
+        error:
+          "Subscription usage is only available for NanoGPT, Claude (Subscription) and OpenAI (ChatGPT) connections",
+      });
+    }
+    if (conn.profileImportReviewRequired === "true") {
+      return reply.status(409).send({ error: "Review and save this imported connection before reading its usage" });
+    }
+
+    if (hasPlanUsageWindows(conn.provider)) {
+      // An API key moves a Claude (Subscription) connection to API billing, which has no plan windows.
+      if (conn.provider === "claude_subscription" && decryptApiKey(conn.apiKeyEncrypted ?? "")) {
+        return reply
+          .status(400)
+          .send({ error: "This connection bills through its API key, so Claude plan limits do not apply to it" });
+      }
+      try {
+        const usage = await (conn.provider === "claude_subscription"
+          ? fetchClaudePlanUsage()
+          : fetchOpenAIChatGPTPlanUsage());
+        const hidden = new Set([
+          ...(conn.showUsageFiveHour === "false" ? ["five_hour"] : []),
+          ...(conn.showUsageWeekly === "false" ? ["seven_day"] : []),
+        ]);
+        return { ...usage, windows: usage.windows.filter((window) => !hidden.has(window.id)) };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to read plan usage";
+        return reply.status(502).send({ error: message });
+      }
+    }
+
+    try {
+      const managementToken = await storage.getManagementToken(req.params.id);
+      const apiKey = managementToken ? "" : decryptApiKey(conn.apiKeyEncrypted ?? "");
+      if (!managementToken && !apiKey) {
+        return reply.status(400).send({ error: "Add an API key or management token to read NanoGPT usage" });
+      }
+      const usage = await fetchNanoGptSubscriptionUsage({ managementToken, apiKey });
+      if (!usage) return reply.status(400).send({ error: "No NanoGPT credential available for usage lookup" });
+      return usage;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to read NanoGPT usage";
+      return reply.status(502).send({ error: message });
+    }
+  });
+
+  /**
+   * Ask the provider for its model list. Returns the list, or the reply once an error has been sent.
+   * `builtIn` marks a list answered without asking the provider, which is never saved.
+   */
+  const discoverConnectionModels = async (
+    conn: NonNullable<Awaited<ReturnType<typeof storage.getWithKey>>>,
+    reply: FastifyReply,
+  ): Promise<{ models: Array<{ id: string; name: string }>; loras?: unknown[]; builtIn?: true } | FastifyReply> => {
+    if (conn.provider === "decision") {
+      // Jev is only the default of the System One sources; a chat server needs the
+      // model name the user entered.
+      const model = conn.model || (conn.decisionSource === "openai_compatible" ? "" : "jev-latest");
+      return { models: model ? [{ id: model, name: model }] : [], builtIn: true };
+    }
+    try {
+      // Claude (Subscription) has no remote /models endpoint. Use the catalog
+      // Claude Code caches for the signed-in account; it already leaves out
+      // models the account or the Claude Code in use can't run, so the curated
+      // list is only the fallback before a catalog exists. A connection with an
+      // API key bills that key, so the subscription catalog does not apply.
+      if (conn.provider === "claude_subscription") {
+        const { MODEL_LISTS } = await import("@marinara-engine/shared");
+        // Without a known Claude Code version, models can't be checked against it.
+        const cliVersion = conn.apiKey
+          ? null
+          : ((await resolveClaudeCodeInstall())?.version ?? BUNDLED_CLAUDE_CODE_VERSION);
+        const catalog = cliVersion ? await readClaudeCodeModelCatalog(cliVersion) : [];
+        const models = catalog.length
+          ? catalog
+          : MODEL_LISTS.claude_subscription.map((m) => ({ id: m.id, name: m.name }));
+        return { models, builtIn: true };
+      }
+
+      if (conn.provider === "openai_chatgpt") {
+        try {
+          const models = await fetchOpenAIChatGPTModels();
+          if (models.length > 0) return { models };
+        } catch {
+          // Fall through to the curated list so the selector remains usable
+          // before the host has run `codex login`. It is not saved, so a later
+          // look at the list asks Codex again.
+        }
+        return { models: MODEL_LISTS.openai_chatgpt.map((m) => ({ id: m.id, name: m.name })), builtIn: true };
+      }
+
+      if (conn.provider === "grok_subscription") {
+        const models = await fetchGrokCliModels();
+        return { models };
+      }
+
+      const videoSource =
+        conn.provider === "video_generation" ? resolveVideoGenerationSource(conn as any, conn.baseUrl || "") : "";
+      if (conn.provider === "video_generation") {
+        if (videoSource === "atlas") {
+          return {
+            models: await listAtlasCloudModels(
+              conn.baseUrl || DEFAULT_ATLAS_CLOUD_VIDEO_BASE_URL,
+              "video",
+              ATLAS_CLOUD_VIDEO_MODELS,
+            ),
+          };
+        }
+        if (videoSource === "nanogpt") {
+          const models = await fetchNanoGptVideoModels(
+            conn.baseUrl || DEFAULT_NANOGPT_VIDEO_BASE_URL,
+            conn.apiKey || "",
+          );
+          return { models };
+        }
+        if (videoSource !== "comfyui" && videoSource !== "swarmui") {
+          const models = MODEL_LISTS.video_generation.map((m) => ({ id: m.id, name: m.name }));
+          return { models };
+        }
+      }
+
+      const { PROVIDERS } = await import("@marinara-engine/shared");
+      const provider = PROVIDERS[conn.provider as keyof typeof PROVIDERS];
+      let baseUrl = conn.baseUrl || provider?.defaultBaseUrl || "";
+
+      if (!baseUrl) {
+        return reply.status(400).send({ error: "No base URL configured" });
+      }
+
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (provider?.usesAuthHeader) {
+        headers["Authorization"] = `Bearer ${conn.apiKey}`;
+      }
+      if (provider?.apiKeyHeader) {
+        headers[provider.apiKeyHeader] = conn.apiKey;
+      }
+      if (conn.provider === "google_vertex") {
+        Object.assign(headers, await googleAuthHeadersForVertex(conn.apiKey));
+      }
+
+      // Anthropic requires version header for models endpoint
+      if (conn.provider === "anthropic") {
+        headers["anthropic-version"] = "2023-06-01";
+      }
+
+      // ── Special handling for local image gen services ──
+      const imageSource =
+        conn.provider === "image_generation" ? resolveImageGenerationSource(conn as any, baseUrl) : "";
+      const mediaSource = imageSource || videoSource;
+      if (conn.provider === "image_generation" && imageSource === "atlas") {
+        // `baseUrl` may have fallen back to the generic image provider default; the catalog lives on Atlas Cloud.
+        return {
+          models: await listAtlasCloudModels(
+            conn.baseUrl || DEFAULT_ATLAS_CLOUD_VIDEO_BASE_URL,
+            "image",
+            ATLAS_CLOUD_IMAGE_MODELS,
+          ),
+        };
+      }
+      if (conn.provider === "image_generation" && imageSource === "zai") {
+        return { models: ZAI_IMAGE_MODELS.map((model) => ({ id: model.id, name: model.name })) };
+      }
+      if (conn.provider === "image_generation" && imageSource === "fal") {
+        return { models: FAL_IMAGE_MODELS.map((model) => ({ id: model.id, name: model.name })) };
+      }
+      if (conn.provider === "image_generation" && imageSource === "codex_chatgpt") {
+        return { models: [{ id: CODEX_IMAGE_MODEL, name: "GPT Image 2" }] };
+      }
+      baseUrl = normalizeConnectionTestBaseUrl(baseUrl, conn.provider);
+      const lowerBase = baseUrl.toLowerCase();
+      const sanitizeProviderBody = (body: string): string => {
+        if (body.includes("<html") || body.includes("<!DOCTYPE")) {
+          const hint =
+            conn.provider === "image_generation"
+              ? "Check the Base URL for this image service."
+              : "Check the Base URL for this connection.";
+          return `Provider returned an HTML page instead of JSON. ${hint}`;
+        }
+        return body.slice(0, 300);
+      };
+
+      // Stability AI: v2beta has task-specific generation endpoints, not /models.
+      // Validate the key via v1 account, then either fetch legacy v1 engines or return the curated v2beta list.
+      if (conn.provider === "image_generation" && imageSource === "stability") {
+        const accountRes = await safeFetch(buildStabilityUrl(baseUrl, "v1/user/account"), {
+          headers,
+          policy: localUrlPolicyForProvider(conn.provider, imageSource),
+          maxResponseBytes: 2 * 1024 * 1024,
+          decodeCompressedResponse: true,
+        });
+        if (!accountRes.ok) {
+          const body = await accountRes.text();
+          return reply.status(502).send({
+            error: `Stability AI returned ${accountRes.status}: ${sanitizeProviderBody(body)}`,
+          });
+        }
+
+        if (isStabilityV1Base(baseUrl)) {
+          const res = await safeFetch(buildStabilityUrl(baseUrl, "v1/engines/list"), {
+            headers,
+            policy: localUrlPolicyForProvider(conn.provider, imageSource),
+            maxResponseBytes: 5 * 1024 * 1024,
+            decodeCompressedResponse: true,
+          });
+          if (!res.ok) {
+            const body = await res.text();
+            return reply.status(502).send({
+              error: `Stability AI returned ${res.status}: ${sanitizeProviderBody(body)}`,
+            });
+          }
+
+          const text = await res.text();
+          let json: unknown;
+          try {
+            json = JSON.parse(text);
+          } catch {
+            return reply.status(502).send({
+              error: `Failed to fetch models: ${sanitizeProviderBody(text)}`,
+            });
+          }
+
+          const engines = Array.isArray(json)
+            ? json
+            : Array.isArray((json as { engines?: unknown }).engines)
+              ? (json as { engines: unknown[] }).engines
+              : [];
+          const models = engines
+            .map((engine) => {
+              if (!engine || typeof engine !== "object") return null;
+              const record = engine as { id?: string; name?: string; description?: string };
+              const id = record.id ?? "";
+              return id ? { id, name: record.name ?? record.description ?? id } : null;
+            })
+            .filter((model): model is { id: string; name: string } => Boolean(model));
+          return { models: models.length ? models : knownStabilityImageModels() };
+        }
+
+        return { models: knownStabilityImageModels() };
+      }
+
+      if ((conn.provider === "image_generation" || conn.provider === "video_generation") && mediaSource === "swarmui") {
+        const sessionId = await createSwarmUiSession(baseUrl, conn.apiKey || "");
+        const result = await postSwarmUiJson(baseUrl, conn.apiKey || "", "ListT2IParams", { session_id: sessionId });
+        const modelGroups = isRecord(result) && isRecord(result.models) ? result.models : {};
+        const modelNames = Array.isArray(modelGroups["Stable-Diffusion"])
+          ? modelGroups["Stable-Diffusion"].filter((model): model is string => typeof model === "string")
+          : [];
+        const loraNames = Array.isArray(modelGroups.LoRA)
+          ? modelGroups.LoRA.filter((model): model is string => typeof model === "string")
+          : [];
+        return {
+          models: modelNames.map((name) => ({ id: name, name })),
+          loras: loraNames.map((name) => ({ id: name, name })),
+        };
+      }
+
+      // ComfyUI: fetch checkpoints and diffusion models from object_info
+      if ((conn.provider === "image_generation" || conn.provider === "video_generation") && mediaSource === "comfyui") {
+        const fetchComfyLoaderModelNames = async (nodeName: string, inputName: string) => {
+          const res = await safeFetch(`${baseUrl}/object_info/${nodeName}`, {
+            policy: localUrlPolicyForProvider(conn.provider, mediaSource),
+            maxResponseBytes: 5 * 1024 * 1024,
+            decodeCompressedResponse: true,
+          });
+          if (!res.ok) return { ok: false, status: res.status, names: null };
+          return {
+            ok: true,
+            status: res.status,
+            names: parseComfyLoaderModelNames(await res.json(), nodeName, inputName),
+          };
+        };
+
+        const checkpoints = await fetchComfyLoaderModelNames("CheckpointLoaderSimple", "ckpt_name");
+        if (!checkpoints.names) {
+          return reply.status(502).send({
+            error: checkpoints.ok
+              ? "ComfyUI did not return checkpoint model metadata"
+              : `ComfyUI returned ${checkpoints.status}`,
+          });
+        }
+        // Models in ComfyUI's diffusion_models folder (e.g. Anima, zImage) load
+        // through UNETLoader, not CheckpointLoaderSimple. Listing failures here
+        // must not hide the checkpoints on ComfyUI builds without that node.
+        const diffusionModels = await fetchComfyLoaderModelNames("UNETLoader", "unet_name").catch(() => ({
+          status: 0,
+          names: null,
+        }));
+        const loraModels = await fetchComfyLoaderModelNames("LoraLoader", "lora_name").catch(() => ({
+          status: 0,
+          names: null,
+        }));
+        const names = [...new Set([...checkpoints.names, ...(diffusionModels.names ?? [])])];
+        const loras = [...new Set(loraModels.names ?? [])];
+        return {
+          models: names.map((name: string) => ({ id: name, name })),
+          loras: loras.map((name: string) => ({ id: name, name })),
+        };
+      }
+
+      // AUTOMATIC1111 / SD Web UI: fetch models from /sdapi/v1/sd-models
+      if (conn.provider === "image_generation" && imageSource === "automatic1111") {
+        const res = await safeFetch(`${baseUrl}/sdapi/v1/sd-models`, {
+          policy: localUrlPolicyForProvider(conn.provider, imageSource),
+          maxResponseBytes: 5 * 1024 * 1024,
+          decodeCompressedResponse: true,
+        });
+        if (!res.ok) {
+          return reply.status(502).send({ error: `SD Web UI returned ${res.status}` });
+        }
+        const sdModels = (await res.json()) as Array<{ title?: string; model_name?: string }>;
+        return {
+          models: sdModels
+            .map((m) => ({ id: m.title ?? m.model_name ?? "", name: m.title ?? m.model_name ?? "" }))
+            .filter((m) => m.id),
+        };
+      }
+
+      if (conn.provider === "image_generation" && lowerBase.includes("nano-gpt.com")) {
+        const res = await safeFetch(`${baseUrl}/image-models`, {
+          headers,
+          policy: {
+            allowLocal: isProviderLocalUrlsEnabled(),
+            allowLoopback: true,
+            allowMdns: true,
+            allowedProtocols: ["https:", "http:"],
+            flagName: "PROVIDER_LOCAL_URLS_ENABLED",
+          },
+          maxResponseBytes: 5 * 1024 * 1024,
+          decodeCompressedResponse: true,
+        });
+        if (!res.ok) {
+          const body = await res.text();
+          return reply.status(502).send({ error: `Provider returned ${res.status}: ${sanitizeProviderBody(body)}` });
+        }
+        const text = await res.text();
+        let json: Record<string, unknown>;
+        try {
+          json = JSON.parse(text) as Record<string, unknown>;
+        } catch {
+          return reply.status(502).send({
+            error: `Failed to fetch models: ${sanitizeProviderBody(text)}`,
+          });
+        }
+        const data = (json.data ?? []) as Array<{ id?: string; name?: string }>;
+        return {
+          models: data.map((m) => ({ id: m.id ?? "", name: m.name ?? m.id ?? "" })).filter((m) => m.id),
+        };
+      }
+
+      if (conn.provider === "image_generation" && imageSource === "openrouter") {
+        const modelsUrl = `${baseUrl}/models?output_modalities=image`;
+        const res = await safeFetch(modelsUrl, {
+          headers,
+          policy: localUrlPolicyForProvider(conn.provider, imageSource),
+          maxResponseBytes: 5 * 1024 * 1024,
+          decodeCompressedResponse: true,
+        });
+        if (!res.ok) {
+          const body = await res.text();
+          return reply.status(502).send({
+            error: `OpenRouter returned ${res.status}: ${sanitizeProviderBody(body)}`,
+          });
+        }
+        const text = await res.text();
+        let json: Record<string, unknown>;
+        try {
+          json = JSON.parse(text) as Record<string, unknown>;
+        } catch {
+          return reply.status(502).send({
+            error: `Failed to fetch models: ${sanitizeProviderBody(text)}`,
+          });
+        }
+        return { models: normalizeModelsResponse("openrouter", json) };
+      }
+
+      if (conn.provider === "image_generation" && imageSource === "spicyapi") {
+        const res = await safeFetch(buildSpicyApiUrl(baseUrl, "models", { modality: "image" }), {
+          headers,
+          policy: localUrlPolicyForProvider(conn.provider, imageSource),
+          maxResponseBytes: 5 * 1024 * 1024,
+          decodeCompressedResponse: true,
+        });
+        const text = await res.text();
+        if (!res.ok) {
+          return reply.status(502).send({ error: `SpicyAPI returned ${res.status}: ${sanitizeProviderBody(text)}` });
+        }
+        try {
+          return { models: normalizeSpicyApiImageModels(JSON.parse(text)) };
+        } catch {
+          return reply.status(502).send({ error: `Failed to fetch models: ${sanitizeProviderBody(text)}` });
+        }
+      }
+
+      if (conn.provider === "image_generation" && imageSource === "venice") {
+        const res = await safeFetch(buildVeniceApiUrl(baseUrl, "models"), {
+          headers,
+          policy: localUrlPolicyForProvider(conn.provider, imageSource),
+          maxResponseBytes: 5 * 1024 * 1024,
+          decodeCompressedResponse: true,
+        });
+        if (!res.ok) {
+          const body = await res.text();
+          return reply.status(502).send({
+            error: `Venice returned ${res.status}: ${sanitizeProviderBody(body)}`,
+          });
+        }
+        const text = await res.text();
+        let json: unknown;
+        try {
+          json = JSON.parse(text);
+        } catch {
+          return reply.status(502).send({
+            error: `Failed to fetch models: ${sanitizeProviderBody(text)}`,
+          });
+        }
+        return { models: normalizeVeniceImageModels(json) };
+      }
+
+      if (conn.provider === "image_generation" && imageSource === "horde") {
+        const res = await safeFetch(`${buildHordeUrl(baseUrl, "status/models")}?type=image`, {
+          headers: hordeHeaders(conn.apiKey),
+          policy: localUrlPolicyForProvider(conn.provider, imageSource),
+          maxResponseBytes: 5 * 1024 * 1024,
+          decodeCompressedResponse: true,
+        });
+        if (!res.ok) {
+          const body = await res.text();
+          return reply.status(502).send({
+            error: `Horde returned ${res.status}: ${sanitizeProviderBody(body)}`,
+          });
+        }
+        const text = await res.text();
+        let json: unknown;
+        try {
+          json = JSON.parse(text);
+        } catch {
+          return reply.status(502).send({
+            error: `Failed to fetch models: ${sanitizeProviderBody(text)}`,
+          });
+        }
+        const models = (Array.isArray(json) ? json : [])
+          .map((model) => {
+            if (!model || typeof model !== "object") return null;
+            const record = model as { name?: string; id?: string };
+            const id = record.name ?? record.id ?? "";
+            return id ? { id, name: id } : null;
+          })
+          .filter((model): model is { id: string; name: string } => Boolean(model));
+        return { models };
+      }
+
+      // Google's ListModels endpoint is paginated (small default page size),
+      // so a single request silently drops most of the catalog. Follow
+      // nextPageToken until the list is complete.
+      if (conn.provider === "google") {
+        const collected: unknown[] = [];
+        let pageToken = "";
+        for (let page = 0; page < 20; page++) {
+          const pageUrl = buildGoogleModelsPageUrl(baseUrl, provider?.modelsEndpoint ?? "/models", pageToken);
+          const pageRes = await safeFetch(pageUrl, {
+            headers,
+            policy: {
+              allowLocal: isProviderLocalUrlsEnabled(),
+              allowLoopback: true,
+              allowMdns: true,
+              allowedProtocols: ["https:", "http:"],
+              flagName: "PROVIDER_LOCAL_URLS_ENABLED",
+            },
+            maxResponseBytes: 5 * 1024 * 1024,
+            decodeCompressedResponse: true,
+          });
+          if (!pageRes.ok) {
+            const body = await pageRes.text();
+            return reply.status(502).send({
+              error: `Provider returned ${pageRes.status}: ${sanitizeProviderBody(body)}`,
+            });
+          }
+          const pageText = await pageRes.text();
+          let pageJson: { models?: unknown[]; nextPageToken?: string };
+          try {
+            pageJson = JSON.parse(pageText) as { models?: unknown[]; nextPageToken?: string };
+          } catch {
+            return reply.status(502).send({
+              error: `Failed to fetch models: ${sanitizeProviderBody(pageText)}`,
+            });
+          }
+          if (Array.isArray(pageJson.models)) collected.push(...pageJson.models);
+          pageToken = typeof pageJson.nextPageToken === "string" ? pageJson.nextPageToken : "";
+          if (!pageToken) break;
+        }
+        if (pageToken) {
+          // Never report a silently truncated catalog as success.
+          return reply.status(502).send({
+            error: "Google returned more model pages than expected; refusing to show a truncated list.",
+          });
+        }
+        return { models: normalizeModelsResponse("google", { models: collected }) };
+      }
+
+      const modelsUrl =
+        conn.provider === "google_vertex"
+          ? buildGoogleVertexModelUrl(baseUrl, conn.model, "models")
+          : `${baseUrl}${provider?.modelsEndpoint || "/models"}`;
+
+      const res = await safeFetch(modelsUrl, {
+        headers,
+        policy: {
+          allowLocal: isProviderLocalUrlsEnabled(),
+          allowLoopback: true,
+          allowMdns: true,
+          allowedProtocols: ["https:", "http:"],
+          flagName: "PROVIDER_LOCAL_URLS_ENABLED",
+        },
+        maxResponseBytes: 5 * 1024 * 1024,
+        decodeCompressedResponse: true,
+      });
+      if (!res.ok) {
+        const body = await res.text();
+        return reply.status(502).send({
+          error: `Provider returned ${res.status}: ${sanitizeProviderBody(body)}`,
+        });
+      }
+
+      const text = await res.text();
+      let json: Record<string, unknown>;
+      try {
+        json = JSON.parse(text) as Record<string, unknown>;
+      } catch {
+        return reply.status(502).send({
+          error: `Failed to fetch models: ${sanitizeProviderBody(text)}`,
+        });
+      }
+
+      // Normalize across providers
+      const models = normalizeModelsResponse(conn.provider, json);
+      return { models };
+    } catch (err) {
+      logger.warn(err, "Model discovery failed for connection %s", conn.id);
+      // Node's fetch hides socket/DNS failures in Error.cause. Keep the code
+      // visible without exposing provider headers, credentials or response bodies.
+      const cause = err instanceof Error ? err.cause : undefined;
+      const code = isRecord(cause) && typeof cause.code === "string" ? cause.code : undefined;
+      const detail = err instanceof Error ? err.message : "Unknown error";
+      return reply.status(502).send({
+        error: `Failed to fetch models: ${detail}${code && /^[A-Z0-9_]+$/.test(code) ? ` (${code})` : ""}. The connection is made from the Marinara server; check that the provider is reachable there.`,
+      });
+    }
+  };
+
+  // A chat connection keeps the list it fetched, so later looks answer from it without asking the
+  // provider again. `refresh=true` (the Refresh and Fetch Models buttons) fetches and replaces it.
+  app.get<{ Params: { id: string }; Querystring: { refresh?: string } }>("/:id/models", async (req, reply) => {
+    const conn = await storage.getWithKey(req.params.id);
+    if (!conn) return reply.status(404).send({ error: "Connection not found" });
+    const savesList = connectionSavesModelList(conn.provider);
+    if (savesList && req.query.refresh !== "true") {
+      const saved = readSavedModelList(conn);
+      if (saved) return saved;
+    }
+    const discovered = await discoverConnectionModels(conn, reply);
+    if ((discovered as unknown) === reply) return reply;
+    const { builtIn, ...result } = discovered as Exclude<typeof discovered, FastifyReply>;
+    if (!savesList || builtIn) return result;
+    const saved = await storage.saveModelListIfUnchanged(conn, result.models);
+    // The provider, address or key changed while the list loaded, so it may belong to the old settings.
+    // Don't hand it out as current; the client asks again.
+    if (!saved) {
+      return reply.status(409).send({ error: "The connection changed while its models were loading." });
+    }
+    return saved;
+  });
+
+  app.post<{ Params: { id: string } }>("/:id/pinned-models", async (req, reply) => {
+    const parsed = connectionModelPinSchema.safeParse(req.body);
+    if (!parsed.success) return reply.status(400).send({ error: "Send a model ID and whether it is pinned." });
+    const result = await storage.setModelPinned(req.params.id, parsed.data.model, parsed.data.pinned);
+    if (result === "not_found") return reply.status(404).send({ error: "Connection not found" });
+    if (result === "limit") {
+      return reply.status(400).send({ error: `You can pin up to ${MAX_PINNED_MODELS} models per connection.` });
+    }
+    return result;
+  });
+
+  // ── Test image generation — uses a broadly supported 1K square canvas ──
+  app.post<{ Params: { id: string } }>("/:id/test-image", async (req, reply) => {
+    const conn = await storage.getWithKey(req.params.id);
+    if (!conn) return reply.status(404).send({ error: "Connection not found" });
+    if (conn.provider !== "image_generation") {
+      return reply.status(400).send({ error: "Not an image generation connection" });
+    }
+
+    const { PROVIDERS } = await import("@marinara-engine/shared");
+    const providerDef = PROVIDERS[conn.provider as keyof typeof PROVIDERS];
+    const baseUrl = (conn.baseUrl || providerDef?.defaultBaseUrl || "").replace(/\/+$/, "");
+
+    const { generateImage } = await import("../services/image/image-generation.js");
+    const imgModel = conn.model || "";
+    const imgApiKey = conn.apiKey || "";
+    const imgSource = conn.imageGenerationSource || imgModel;
+    const imgServiceHint = conn.imageService || imgSource;
+    const imageDefaults = resolveConnectionImageDefaults(conn);
+
+    const BASE_PROMPT = "plate of spaghetti with marinara sauce";
+
+    const start = Date.now();
+    try {
+      const result = await generateImage(imgSource, baseUrl, imgApiKey, imgServiceHint, {
+        prompt: BASE_PROMPT,
+        model: imgModel || undefined,
+        imageEndpointId: (conn.imageEndpointId as string | undefined) ?? undefined,
+        width: 1024,
+        height: 1024,
+        comfyWorkflow: conn.comfyuiWorkflow || undefined,
+        imageDefaults,
+        quality: resolveConnectionImageQuality(conn),
+        debugMode: readDebugMode(req.body),
+      });
+      return {
+        success: true,
+        base64: result.base64,
+        mimeType: result.mimeType,
+        latencyMs: Date.now() - start,
+        prompt: BASE_PROMPT,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        base64: null,
+        mimeType: null,
+        latencyMs: Date.now() - start,
+        prompt: BASE_PROMPT,
+        error: err instanceof Error ? err.message : "Unknown error",
+      };
+    }
+  });
+
+  // ── Test video generation — generates a short fixed MP4 ──
+  app.post<{ Params: { id: string } }>("/:id/test-video", async (req, reply) => {
+    const conn = await storage.getWithKey(req.params.id);
+    if (!conn) return reply.status(404).send({ error: "Connection not found" });
+    if (conn.provider !== "video_generation") {
+      return reply.status(400).send({ error: "Not a video generation connection" });
+    }
+
+    const { PROVIDERS } = await import("@marinara-engine/shared");
+    const providerDef = PROVIDERS[conn.provider as keyof typeof PROVIDERS];
+    const videoApiKey = conn.apiKey || "";
+    const defaults = conn.defaultParameters
+      ? getStoredVideoDefaults(conn.defaultParameters)
+      : createDefaultVideoGenerationProfile();
+    const inferredVideoSource = resolveVideoGenerationSource(conn as any, conn.baseUrl || "");
+    const explicitVideoSource = conn.videoGenerationSource || conn.videoService || "";
+    const videoSource = normalizeVideoService(
+      explicitVideoSource || (inferredVideoSource !== "gemini_omni" ? inferredVideoSource : defaults.service),
+    );
+    const rawVideoServiceHint = normalizeVideoService(conn.videoService || videoSource);
+    const videoServiceHint =
+      videoSource === "swarmui"
+        ? "swarmui"
+        : rawVideoServiceHint === "google_ai_studio"
+          ? inferVideoSource(conn.model || "", conn.baseUrl || "")
+          : rawVideoServiceHint;
+    const isXaiVideo = videoSource === "xai" || videoServiceHint === "xai";
+    const isGoogleVeoVideo = videoSource === "google_veo" || videoServiceHint === "google_veo";
+    const isNanoGptVideo = videoSource === "nanogpt";
+    const isOpenRouterVideo = !isNanoGptVideo && (videoSource === "openrouter" || videoServiceHint === "openrouter");
+    const isAtlasVideo = videoSource === "atlas" || videoServiceHint === "atlas";
+    const isSeedanceVideo = videoSource === "seedance" || videoServiceHint === "seedance";
+    const isSwarmUiVideo = videoSource === "swarmui" || videoServiceHint === "swarmui";
+    const isComfyUiVideo = videoSource === "comfyui" || videoServiceHint === "comfyui" || isSwarmUiVideo;
+    const baseUrl = (
+      conn.baseUrl ||
+      (isXaiVideo
+        ? DEFAULT_XAI_VIDEO_BASE_URL
+        : isGoogleVeoVideo
+          ? DEFAULT_GOOGLE_VEO_VIDEO_BASE_URL
+          : isOpenRouterVideo
+            ? DEFAULT_OPENROUTER_VIDEO_BASE_URL
+            : isNanoGptVideo
+              ? DEFAULT_NANOGPT_VIDEO_BASE_URL
+              : isAtlasVideo
+                ? DEFAULT_ATLAS_CLOUD_VIDEO_BASE_URL
+                : isSeedanceVideo
+                  ? DEFAULT_SEEDANCE_VIDEO_BASE_URL
+                  : isSwarmUiVideo
+                    ? DEFAULT_SWARMUI_VIDEO_BASE_URL
+                    : isComfyUiVideo
+                      ? DEFAULT_COMFYUI_VIDEO_BASE_URL
+                      : providerDef?.defaultBaseUrl || DEFAULT_GEMINI_OMNI_VIDEO_BASE_URL)
+    ).replace(/\/+$/, "");
+    const videoModel =
+      conn.model ||
+      (isXaiVideo
+        ? DEFAULT_XAI_VIDEO_MODEL
+        : isGoogleVeoVideo
+          ? DEFAULT_GOOGLE_VEO_VIDEO_MODEL
+          : isOpenRouterVideo
+            ? DEFAULT_OPENROUTER_VIDEO_MODEL
+            : isNanoGptVideo
+              ? ""
+              : isAtlasVideo
+                ? DEFAULT_ATLAS_CLOUD_VIDEO_MODEL
+                : isSeedanceVideo
+                  ? DEFAULT_SEEDANCE_VIDEO_MODEL
+                  : isComfyUiVideo
+                    ? ""
+                    : DEFAULT_GEMINI_OMNI_VIDEO_MODEL);
+    const activeDefaults = isXaiVideo
+      ? defaults.xai
+      : isGoogleVeoVideo
+        ? defaults.googleVeo
+        : isOpenRouterVideo
+          ? defaults.openrouter
+          : isNanoGptVideo
+            ? defaults.openrouter
+            : isAtlasVideo
+              ? defaults.atlas
+              : isSeedanceVideo
+                ? defaults.seedance
+                : isComfyUiVideo
+                  ? defaults.comfyui
+                  : defaults.geminiOmni;
+
+    const prompt =
+      "Create a concise cinematic 16:9 game scene video: a plate of spaghetti with marinara sauce on a table, gentle steam rising, warm kitchen light, slow push-in camera, no text or logos.";
+
+    const start = Date.now();
+    try {
+      const { generateVideo } = await import("../services/video/video-generation.js");
+      // Image-to-video Atlas Cloud models reject a text-only request, so the test supplies a neutral first frame.
+      const referenceImage = isAtlasVideo
+        ? await buildAtlasCloudTestReferenceImage(videoModel, activeDefaults.aspectRatio)
+        : null;
+      const result = await generateVideo(videoSource, baseUrl, videoApiKey, videoServiceHint, {
+        prompt,
+        model: videoModel,
+        referenceImage,
+        debugMode: readDebugMode(req.body),
+        durationSeconds: activeDefaults.durationSeconds,
+        aspectRatio: activeDefaults.aspectRatio,
+        resolution: isXaiVideo
+          ? defaults.xai.resolution
+          : isGoogleVeoVideo
+            ? defaults.googleVeo.resolution
+            : isOpenRouterVideo
+              ? defaults.openrouter.resolution
+              : isNanoGptVideo
+                ? defaults.openrouter.resolution
+                : isAtlasVideo
+                  ? defaults.atlas.resolution
+                  : isSeedanceVideo
+                    ? defaults.seedance.resolution
+                    : isComfyUiVideo
+                      ? defaults.comfyui.resolution
+                      : undefined,
+        comfyWorkflow: conn.comfyuiWorkflow || undefined,
+        comfyLoras: isComfyUiVideo ? defaults.comfyui.loras : [],
+        atlasModelOptions: isAtlasVideo ? defaults.atlas.modelOptions[videoModel.trim()] : undefined,
+        fps: isComfyUiVideo ? defaults.comfyui.fps : undefined,
+      });
+      return {
+        success: true,
+        base64: result.base64,
+        mimeType: result.mimeType,
+        latencyMs: Date.now() - start,
+        prompt,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        base64: null,
+        mimeType: null,
+        latencyMs: Date.now() - start,
+        prompt,
+        error: err instanceof Error ? err.message : "Unknown error",
+      };
+    }
+  });
+
+  // ── Diagnose Claude (Subscription) — verifies which model the SDK actually
+  //    billed against. The Claude Agent SDK can silently route a request to a
+  //    smaller model (fast mode, post-rate-limit `cooldown` state, account-tier
+  //    gating) without surfacing the swap to the caller. We send a tiny prompt
+  //    through the SDK with the connection's own fast-mode setting (not
+  //    forced off), then return the model(s) the SDK reports in `modelUsage`
+  //    plus its `fast_mode_state` so the UI can show "you asked for X, the
+  //    SDK billed Y." ──
+  app.post<{ Params: { id: string } }>("/:id/diagnose-claude-subscription", async (req, reply) => {
+    const conn = await storage.getWithKey(req.params.id);
+    if (!conn) return reply.status(404).send({ error: "Connection not found" });
+    if (conn.provider !== "claude_subscription") {
+      return reply.status(400).send({ error: "Not a Claude (Subscription) connection" });
+    }
+    if (!conn.model) {
+      return reply.status(400).send({ error: "No model configured. Pick a model first." });
+    }
+
+    const start = Date.now();
+    const requestedModel = conn.model;
+    let responseText = "";
+    let modelsBilled: string[] = [];
+    let modelUsageDetail: Array<{ model: string; inputTokens: number; outputTokens: number }> = [];
+    let fastModeState: string | null = null;
+    const errors: string[] = [];
+
+    try {
+      const sdk = await import("@anthropic-ai/claude-agent-sdk");
+      // The user's empirically reliable self-ID prompt. Asking the model "which
+      // Claude family are you (Opus/Sonnet/Haiku)" with a one-word constraint
+      // produces consistent, non-hallucinated answers — versions are unreliable
+      // but the family tier is not. Combined with the SDK-side `modelUsage`
+      // readout below, this gives two independent signals on the same call.
+      const fastMode = conn.claudeFastMode === "true";
+      // Use the Claude Code preset for `systemPrompt`. Without it the SDK
+      // strips the model's version awareness and every model falsely answers
+      // "Sonnet" — see the chat provider for the full explanation. Passing the
+      // preset gives a clean signal on the model's true identity.
+      // Same connector isolation as chat: no settings files or claude.ai connectors, and a hard stop
+      // if Claude Code loads MCP servers or tools anyway, since permission checks are off.
+      const abortController = new AbortController();
+      const queryHandle = sdk.query({
+        prompt:
+          "[OOC, hold on for one second, and tell me which claude model you are, you don't need to give me the version, are you Opus, Sonnet, Or Haiku? Answer with only the 1 word model name.]",
+        options: {
+          abortController,
+          model: requestedModel,
+          systemPrompt: { type: "preset", preset: "claude_code" },
+          tools: [],
+          settingSources: [],
+          permissionMode: "bypassPermissions",
+          includePartialMessages: false,
+          // A preset title skips the CLI's hidden session-naming request.
+          title: "Title",
+          settings: { fastMode },
+          ...(await claudeCodeExecutableOption()),
+          env: {
+            ...process.env,
+            ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+            ...(conn.apiKey ? { ANTHROPIC_API_KEY: conn.apiKey } : {}),
+          },
+        },
+      });
+
+      for await (const message of queryHandle) {
+        if (message.type === "system" && message.subtype === "init") {
+          stopIfClaudeCodeExposesMcp(message, abortController);
+        } else if (message.type === "assistant") {
+          const blocks = (message.message?.content ?? []) as Array<{ type: string; text?: string }>;
+          for (const block of blocks) {
+            if (block.type === "text" && block.text) responseText += block.text;
+          }
+        } else if (message.type === "result") {
+          const usage = message.modelUsage ?? {};
+          modelsBilled = Object.keys(usage);
+          modelUsageDetail = Object.entries(usage).map(([model, u]) => ({
+            model,
+            inputTokens: (u as { inputTokens?: number }).inputTokens ?? 0,
+            outputTokens: (u as { outputTokens?: number }).outputTokens ?? 0,
+          }));
+          fastModeState = message.fast_mode_state ?? null;
+          if (message.subtype !== "success") {
+            const detail = message.errors?.length ? message.errors.join("; ") : message.subtype;
+            errors.push(detail);
+          }
+        }
+      }
+    } catch (err) {
+      errors.push(err instanceof Error ? err.message : "Unknown error");
+    }
+
+    const latencyMs = Date.now() - start;
+    const billedDifferent = modelsBilled.length > 0 && !modelsBilled.includes(requestedModel);
+    return {
+      success: errors.length === 0,
+      requestedModel,
+      modelsBilled,
+      modelUsageDetail,
+      billedDifferent,
+      fastModeState,
+      response: responseText.slice(0, 500),
+      errors,
+      latencyMs,
+    };
+  });
+
+  // ── Test message — sends "hi" to the model and returns the response ──
+  app.post<{ Params: { id: string } }>("/:id/test-message", async (req, reply) => {
+    const conn = await storage.getWithKey(req.params.id);
+    if (!conn) return reply.status(404).send({ error: "Connection not found" });
+
+    if (conn.provider === "image_generation" || conn.provider === "video_generation") {
+      return reply.status(400).send({ error: "This provider does not support chat test messages." });
+    }
+
+    if (!conn.model && !allowsDefaultChatModel(conn)) {
+      return reply.status(400).send({ error: "No model configured. Set a model first." });
+    }
+
+    const { PROVIDERS } = await import("@marinara-engine/shared");
+    const providerDef = PROVIDERS[conn.provider as keyof typeof PROVIDERS];
+    const baseUrl = (conn.baseUrl || providerDef?.defaultBaseUrl || "").replace(/\/+$/, "");
+
+    // Local subscription/session providers manage their own endpoint, so skip
+    // the baseUrl precondition. Every HTTP provider still requires one.
+    if (!baseUrl && !isLocalAuthProvider(conn.provider)) {
+      return reply.status(400).send({ error: "No base URL configured" });
+    }
+
+    const start = Date.now();
+    const requestDebug = readDebugMode(req.body);
+    const debugLog = (message: string, ...args: any[]) => logDebugOverride(requestDebug, message, ...args);
+    const model = conn.model ?? "";
+    const targetUrl = describeTestMessageTarget(conn.provider, baseUrl, model);
+    try {
+      debugLog("[connections/test-message] provider=%s model=%s url=%s", conn.provider, model, targetUrl);
+      const provider = createLLMProvider(
+        conn.provider,
+        localAuthProviderBaseUrl(conn.provider) ?? baseUrl,
+        conn.apiKey,
+        conn.maxContext,
+        conn.openrouterProvider,
+        conn.maxTokensOverride,
+        conn.claudeFastMode === "true",
+        conn.treatAsLocalEndpoint === "true",
+        conn.defaultParameters,
+        conn.id,
+      );
+
+      const storedOptions = resolveStoredChatOptions(conn.defaultParameters, conn.provider, model);
+      // Reasoning models (GLM 5.3, Mistral reasoning models) spend one output budget on
+      // thinking and on text. At 200 tokens the whole budget is thinking and the test reports
+      // success with nothing to show, so give them room for a one-line answer.
+      const reasoningTest =
+        isGlm53MandatoryReasoningModel(model) ||
+        (conn.provider === "mistral" && (isMistralAdjustableReasoningModel(model) || isMistralGlm53Model(model)));
+      const maxTokens = resolveStoredMaxTokens(conn.defaultParameters, reasoningTest ? 1024 : 200);
+      let fullResponse = "";
+      const generation = provider.chat([{ role: "user", content: "hi" }], {
+        model,
+        ...storedOptions,
+        temperature: storedOptions.temperature ?? 0.7,
+        maxTokens,
+        stream: false,
+      });
+      let step = await generation.next();
+      while (!step.done) {
+        fullResponse += step.value;
+        step = await generation.next();
+      }
+      const usage = step.value || undefined;
+      const response = fullResponse.trim()
+        ? fullResponse.slice(0, 500)
+        : describeEmptyModelResponse({
+            finishReason: usage?.finishReason,
+            usage,
+            maxTokens: sentOutputBudget(maxTokens, conn.maxTokensOverride),
+            hadThinking: (usage?.completionReasoningTokens ?? 0) > 0,
+          });
+
+      const latencyMs = Date.now() - start;
+      debugLog("[connections/test-message] url=%s success in %dms: %s", targetUrl, latencyMs, response);
+      return {
+        success: true,
+        response,
+        latencyMs,
+        model: model || "Grok CLI default",
+      };
+    } catch (err) {
+      debugLog(
+        "[connections/test-message] provider=%s model=%s url=%s failed: %s",
+        conn.provider,
+        model,
+        targetUrl,
+        err instanceof Error ? err.message : "Unknown error",
+      );
+      return {
+        success: false,
+        response: "",
+        latencyMs: Date.now() - start,
+        error: err instanceof Error ? err.message : "Unknown error",
+        model: model || "Grok CLI default",
+      };
+    }
+  });
+}
+
+// ──────────────────────────────────────────────
+// Normalize models response from different providers
+// ──────────────────────────────────────────────
+interface RemoteModel {
+  id: string;
+  name: string;
+  context?: number;
+  maxOutput?: number;
+  capabilities?: ModelParameterCapabilities;
+  /** Aggregator subscription metadata (NanoGPT `detailed=true`). */
+  subscriptionIncluded?: boolean;
+  /** How many input tokens this model consumes per token of quota. */
+  inputTokenMultiplier?: number;
+}
+
+/** OpenRouter names each model's accepted request fields; map the ones the parameter panel controls. */
+const OPENROUTER_PARAMETER_FIELDS: Record<string, GenerationParameterKey> = {
+  temperature: "temperature",
+  top_p: "topP",
+  top_k: "topK",
+  frequency_penalty: "frequencyPenalty",
+  presence_penalty: "presencePenalty",
+  max_tokens: "maxTokens",
+  max_completion_tokens: "maxTokens",
+  reasoning: "reasoningEffort",
+  reasoning_effort: "reasoningEffort",
+  verbosity: "verbosity",
+};
+
+export function readOpenRouterModelCapabilities(
+  model: Record<string, unknown>,
+): ModelParameterCapabilities | undefined {
+  const fields = Array.isArray(model.supported_parameters) ? model.supported_parameters : [];
+  const keys = new Set<GenerationParameterKey>();
+  for (const field of fields) {
+    const key = typeof field === "string" ? OPENROUTER_PARAMETER_FIELDS[field] : undefined;
+    if (key) keys.add(key);
+  }
+  // An empty or missing list says nothing; it must not hide every control.
+  return keys.size > 0 ? { supportedParameters: [...keys] } : undefined;
+}
+
+/**
+ * Read NanoGPT's `subscription` block from a detailed model record.
+ * See `readNanoGptModelSubscriptionMetadata` for the parsing rules.
+ */
+function readSubscriptionMetadata(
+  model: Record<string, unknown>,
+): Pick<RemoteModel, "subscriptionIncluded" | "inputTokenMultiplier"> {
+  return readNanoGptModelSubscriptionMetadata(model);
+}
+
+function readProviderMetadataRecord(value: unknown): Record<string, unknown> | null {
+  return !!value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function readPositiveInteger(value: unknown): number | undefined {
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined;
+}
+
+function readOpenAICompatibleModelLimits(model: Record<string, unknown>): Pick<RemoteModel, "context" | "maxOutput"> {
+  const topProvider = readProviderMetadataRecord(model.top_provider);
+  const context =
+    readPositiveInteger(model.context_length) ??
+    readPositiveInteger(model.context_window) ??
+    readPositiveInteger(model.contextWindow) ??
+    readPositiveInteger(model.max_input_tokens) ??
+    readPositiveInteger(model.input_token_limit) ??
+    readPositiveInteger(model.inputTokenLimit) ??
+    readPositiveInteger(topProvider?.context_length) ??
+    // Mistral's /models
+    readPositiveInteger(model.max_context_length);
+  const maxOutput =
+    readPositiveInteger(topProvider?.max_completion_tokens) ??
+    readPositiveInteger(model.max_completion_tokens) ??
+    readPositiveInteger(model.max_output_tokens) ??
+    readPositiveInteger(model.max_tokens) ??
+    readPositiveInteger(model.maxOutputTokens) ??
+    readPositiveInteger(model.output_token_limit) ??
+    readPositiveInteger(model.outputTokenLimit);
+
+  return {
+    ...(context ? { context } : {}),
+    ...(maxOutput ? { maxOutput } : {}),
+  };
+}
+
+function normalizeModelsResponse(provider: string, json: Record<string, unknown>): RemoteModel[] {
+  switch (provider) {
+    case "google": {
+      // Google returns { models: [{ name: "models/gemini-...", displayName: "..." }] }
+      const models = (json.models ?? []) as Array<{
+        name?: string;
+        displayName?: string;
+        supportedGenerationMethods?: string[];
+        inputTokenLimit?: number;
+        outputTokenLimit?: number;
+      }>;
+      return models
+        .filter(
+          // Keep chat-capable models. Some catalog entries only advertise the
+          // streaming method, and a missing field should not hide a model.
+          (m) =>
+            !m.supportedGenerationMethods ||
+            m.supportedGenerationMethods.includes("generateContent") ||
+            m.supportedGenerationMethods.includes("streamGenerateContent"),
+        )
+        .map((m) => ({
+          id: (m.name ?? "").replace(/^models\//, ""),
+          name: m.displayName ?? (m.name ?? "").replace(/^models\//, ""),
+          ...readOpenAICompatibleModelLimits(m as Record<string, unknown>),
+        }))
+        .filter((m) => m.id);
+    }
+
+    case "google_vertex": {
+      // Vertex AI returns { publisherModels: [{ name: "publishers/google/models/gemini-...", ... }] }
+      const models = (json.publisherModels ?? []) as Array<{
+        name?: string;
+        displayName?: string;
+        supportedActions?: { viewRestApi?: unknown };
+        inputTokenLimit?: number;
+        outputTokenLimit?: number;
+      }>;
+      return models
+        .filter((m) => m.name?.includes("/models/"))
+        .map((m) => ({
+          id: (m.name ?? "").replace(/^.*\/models\//, ""),
+          name: m.displayName ?? (m.name ?? "").replace(/^.*\/models\//, ""),
+          ...readOpenAICompatibleModelLimits(m as Record<string, unknown>),
+        }))
+        .filter((m) => m.id);
+    }
+
+    case "anthropic": {
+      // Anthropic returns { data: [{ id: "claude-...", display_name: "..." }] }
+      const data = (json.data ?? []) as Array<{
+        id?: string;
+        display_name?: string;
+        type?: string;
+        context_window?: number;
+        max_output_tokens?: number;
+      }>;
+      return data
+        .filter((m) => m.type === "model" || m.id)
+        .map((m) => ({
+          id: m.id ?? "",
+          name: m.display_name ?? m.id ?? "",
+          ...readOpenAICompatibleModelLimits(m as Record<string, unknown>),
+        }))
+        .filter((m) => m.id);
+    }
+
+    case "cohere": {
+      // Cohere native v2 returns { models: [{ name: "command-r-plus", ... }] }.
+      // The OpenAI compatibility endpoint returns { data: [{ id: "command-r-plus", ... }] }.
+      const data = (json.data ?? []) as Array<{
+        id?: string;
+        name?: string;
+        context_length?: number;
+        max_output_tokens?: number;
+        max_completion_tokens?: number;
+      }>;
+      if (data.length > 0) {
+        return data
+          .map((m) => ({
+            id: m.id ?? "",
+            name: m.name ?? m.id ?? "",
+            ...readOpenAICompatibleModelLimits(m as Record<string, unknown>),
+          }))
+          .filter((m) => m.id);
+      }
+
+      const models = (json.models ?? []) as Array<{
+        name?: string;
+        endpoints?: string[];
+        context_length?: number;
+        max_output_tokens?: number;
+        max_completion_tokens?: number;
+      }>;
+      return models
+        .filter((m) => m.endpoints?.includes("chat"))
+        .map((m) => ({
+          id: m.name ?? "",
+          name: m.name ?? "",
+          ...readOpenAICompatibleModelLimits(m as Record<string, unknown>),
+        }))
+        .filter((m) => m.id);
+    }
+
+    default: {
+      // OpenAI-compatible: { data: [{ id: "gpt-4o", ... }] }
+      // This covers openai, mistral, openrouter, custom, nanogpt
+      const data = (json.data ?? []) as Array<Record<string, unknown> & { id?: string; name?: string }>;
+      return data
+        .map((m) => {
+          const capabilities = provider === "openrouter" ? readOpenRouterModelCapabilities(m) : undefined;
+          return {
+            id: m.id ?? "",
+            name: m.name ?? m.id ?? "",
+            ...readOpenAICompatibleModelLimits(m),
+            ...readSubscriptionMetadata(m),
+            ...(capabilities ? { capabilities } : {}),
+          };
+        })
+        .filter((m) => m.id);
+    }
+  }
+}

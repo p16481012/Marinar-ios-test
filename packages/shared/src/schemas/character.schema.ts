@@ -1,0 +1,219 @@
+// ──────────────────────────────────────────────
+// Character Zod Schemas
+// ──────────────────────────────────────────────
+import { z } from "zod";
+import { choiceDisplayModeSchema, choiceOptionSchema, choiceOptionSortSchema } from "./prompt.schema.js";
+import { storedRulesetSheetsSchema } from "./ruleset.schema.js";
+
+export const depthPromptSchema = z.object({
+  prompt: z.string().default(""),
+  depth: z.number().int().min(0).default(4),
+  role: z.enum(["system", "user", "assistant"]).default("system"),
+});
+
+const characterBookPositionSchema = z.union([
+  z.enum(["before_char", "after_char", "at_depth", "depth"]),
+  z.literal(0),
+  z.literal(1),
+  z.literal(2),
+  z.literal(3),
+  z.literal(4),
+  z.literal(5),
+  z.literal(6),
+]);
+
+const characterBookRoleSchema = z.union([
+  z.enum(["system", "user", "assistant"]),
+  z.literal(0),
+  z.literal(1),
+  z.literal(2),
+]);
+
+/** Conversation-mode behavior directive insertion strategy. */
+export const convoBehaviorInsertionStrategySchema = z.enum([
+  "constant_before",
+  "constant_after",
+  "post_history_replace",
+  "post_history_before",
+  "post_history_after",
+  "macro",
+]);
+
+/** Conversation-mode-only behavior directive. */
+export const convoBehaviorConfigSchema = z.object({
+  instruction: z.string().default(""),
+  insertionStrategy: convoBehaviorInsertionStrategySchema.catch("constant_after").default("constant_after"),
+});
+
+/**
+ * One onboarding question, shaped like a preset variable. No options = a free
+ * text answer; options = a choice (the first is the default); options plus
+ * `allowCustom` = a choice with a "write your own" answer. Content is not
+ * checked here so an unfinished variable never blocks importing the card —
+ * naming rules belong to the onboarding validator. No length limits either:
+ * onboarding is saved with the whole card, so one over-long question would
+ * make the card unsavable (the five persona fields have no limit).
+ */
+export const characterOnboardingVariableSchema = z.object({
+  id: z.string(),
+  variableName: z.string().default(""),
+  question: z.string().default(""),
+  // `description` is optional help text shown to the player under the option label.
+  options: z.array(choiceOptionSchema.extend({ description: z.string().optional() })).default([]),
+  allowCustom: z.boolean().default(false),
+  multiSelect: z.boolean().default(false),
+  separator: z.string().default(", "),
+  displayMode: choiceDisplayModeSchema.default("auto"),
+  optionSort: choiceOptionSortSchema.default("manual"),
+});
+
+/**
+ * Interactive onboarding ("skeleton persona"): the five persona Card fields as
+ * prose that may use `{{variable}}` and `{{#if}}`, plus the variables the player
+ * answers. Resolved once into a real persona when a chat starts; the card itself
+ * is never modified. An absent or `enabled: false` block means nothing is parsed.
+ * `cardVariables` is a second list of questions for the card's own fields: their
+ * answers are saved as chat variables instead of being written into a persona.
+ */
+export const characterOnboardingSchema = z.object({
+  enabled: z.boolean().default(false),
+  description: z.string().default(""),
+  personality: z.string().default(""),
+  backstory: z.string().default(""),
+  appearance: z.string().default(""),
+  scenario: z.string().default(""),
+  variables: z.array(characterOnboardingVariableSchema).default([]),
+  cardVariables: z.array(characterOnboardingVariableSchema).default([]),
+});
+
+export const characterExtensionsSchema = z
+  .object({
+    talkativeness: z.number().min(0).max(1).default(0.5),
+    fav: z.boolean().default(false),
+    world: z.string().default(""),
+    depth_prompt: depthPromptSchema.default({}),
+    backstory: z.string().default(""),
+    appearance: z.string().default(""),
+    /** Marinara Engine: use `imageAppearance` instead of `appearance` in image prompts. */
+    imageAppearanceEnabled: z.boolean().optional(),
+    /** Marinara Engine: appearance text used for image prompts when the override is enabled. */
+    imageAppearance: z.string().optional(),
+    /** Marinara Engine: retain card revisions and advance the visible version on edits. */
+    versioningEnabled: z.boolean().default(true),
+    // Conversation-mode-only fields (optional — absent on non-convo cards).
+    convoDisplayName: z.string().optional(),
+    convoDisplayNameInCard: z.boolean().optional(),
+    aboutMe: z.string().optional(),
+    convoBehavior: convoBehaviorConfigSchema.optional(),
+    /** Starting builds for Game Mode rulesets, keyed by ruleset id. Bounded, never shape-checked. */
+    rulesetSheets: storedRulesetSheetsSchema.optional(),
+    /**
+     * Marinara Engine: interactive onboarding carried by the card. Absent or
+     * disabled means no onboarding is offered and nothing is parsed.
+     */
+    onboarding: characterOnboardingSchema.optional(),
+  })
+  .passthrough();
+
+export const characterBookEntrySchema = z
+  .object({
+    keys: z.array(z.string()).default([]),
+    content: z.string().default(""),
+    extensions: z.record(z.unknown()).default({}),
+    enabled: z.boolean().default(true),
+    insertion_order: z.number().default(100),
+    case_sensitive: z.boolean().default(false),
+    name: z.string().default(""),
+    priority: z.number().default(100),
+    id: z.number().default(0),
+    comment: z.string().default(""),
+    selective: z.boolean().default(false),
+    secondary_keys: z.array(z.string()).default([]),
+    constant: z.boolean().default(false),
+    position: characterBookPositionSchema.catch("before_char").default("before_char"),
+    depth: z.number().optional(),
+    role: characterBookRoleSchema.optional(),
+  })
+  .passthrough();
+
+export const characterBookSchema = z
+  .object({
+    name: z.string().default(""),
+    description: z.string().default(""),
+    scan_depth: z.number().default(2),
+    token_budget: z.number().default(512),
+    recursive_scanning: z.boolean().default(false),
+    extensions: z.record(z.unknown()).default({}),
+    entries: z.array(characterBookEntrySchema).default([]),
+  })
+  .passthrough();
+
+export const characterDataSchema = z
+  .object({
+    name: z.string().trim().min(1),
+    summary: z.string().trim().max(500).default(""),
+    description: z.string().default(""),
+    personality: z.string().default(""),
+    scenario: z.string().default(""),
+    first_mes: z.string().default(""),
+    mes_example: z.string().default(""),
+    creator_notes: z.string().default(""),
+    system_prompt: z.string().default(""),
+    post_history_instructions: z.string().default(""),
+    tags: z.array(z.string()).default([]),
+    creator: z.string().default(""),
+    character_version: z.string().default("1.0"),
+    alternate_greetings: z.array(z.string()).default([]),
+    extensions: characterExtensionsSchema.default({}),
+    character_book: characterBookSchema.nullable().default(null),
+  })
+  .passthrough();
+
+export const characterCardV2Schema = z.object({
+  spec: z.literal("chara_card_v2"),
+  spec_version: z.literal("2.0"),
+  data: characterDataSchema,
+});
+
+export const createCharacterSchema = z.object({
+  data: characterDataSchema,
+});
+
+const updateCharacterExtensionsSchema = characterExtensionsSchema.partial().extend({
+  // Zod 3 short-circuits these optional wrappers before applying the nested
+  // schema defaults. Revalidate this omission behavior before upgrading to Zod 4.
+  depth_prompt: depthPromptSchema.partial().optional(),
+  convoBehavior: convoBehaviorConfigSchema.partial().optional(),
+});
+
+export const updateCharacterSchema = z.object({
+  data: characterDataSchema.partial().extend({
+    extensions: updateCharacterExtensionsSchema.optional(),
+    character_book: characterBookSchema.partial().nullable().optional(),
+  }),
+});
+
+export const createGroupSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().default(""),
+  avatarPath: z.string().nullable().optional(),
+  characterIds: z.array(z.string()).default([]),
+});
+
+export const updateGroupSchema = createGroupSchema.partial();
+
+export const createPersonaGroupSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().default(""),
+  personaIds: z.array(z.string()).default([]),
+});
+
+export const updatePersonaGroupSchema = createPersonaGroupSchema.partial();
+
+export type CreateCharacterInput = z.infer<typeof createCharacterSchema>;
+export type UpdateCharacterInput = z.infer<typeof updateCharacterSchema>;
+export type CharacterCardV2Input = z.infer<typeof characterCardV2Schema>;
+export type CreateGroupInput = z.infer<typeof createGroupSchema>;
+export type UpdateGroupInput = z.infer<typeof updateGroupSchema>;
+export type CreatePersonaGroupInput = z.infer<typeof createPersonaGroupSchema>;
+export type UpdatePersonaGroupInput = z.infer<typeof updatePersonaGroupSchema>;

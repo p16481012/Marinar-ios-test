@@ -1,0 +1,62 @@
+// ──────────────────────────────────────────────
+// Schema: Game Checkpoints
+// ──────────────────────────────────────────────
+import { fileTable, text, integer } from "../file-schema.js";
+
+export const gameCheckpoints = fileTable("game_checkpoints", {
+  id: text("id").primaryKey(),
+  chatId: text("chat_id").notNull(),
+  /** Spatial snapshot captured alongside the Game snapshot, when enabled. */
+  spatialSnapshotId: text("spatial_snapshot_id"),
+  /** FK to game_state_snapshots.id */
+  snapshotId: text("snapshot_id").notNull(),
+  /** Immutable JSON copy of the captured Game snapshot. */
+  snapshotData: text("snapshot_data"),
+  /** Immutable JSON copy of the captured Spatial Context snapshot, when enabled. */
+  spatialSnapshotData: text("spatial_snapshot_data"),
+  /** Immutable JSON array of the chat's newest game_engine_state blob per gameType at capture
+   *  time ([{gameType, schemaVersion, state}], #5102) — restore clones these instead of the
+   *  legacy createdAt re-lookup, which same-anchor rewrites (experience saves, silent turn
+   *  games) invalidate. Null on checkpoints from before this field or with no engine state. */
+  engineStateData: text("engine_state_data"),
+  /** Immutable JSON object of the game's own chat-metadata keys at capture time (party cards, NPCs,
+   *  journal, inventory, …; see CHECKPOINT_GAME_METADATA_KEYS), so a load rewinds them too (#7742).
+   *  `{}` when the game had none of them yet; null on checkpoints from before this field. */
+  gameMetadataData: text("game_metadata_data"),
+  /** Immutable JSON array of the chat's characterIds column at capture time: the party's library
+   *  members, which session start trusts over gamePartyCharacterIds. A load rewinds it in the same
+   *  write as gameMetadataData (#7742). Null on checkpoints from before this field. */
+  chatCharacterIdsData: text("chat_character_ids_data"),
+  /** Immutable JSON object `{ edits }` of the world's hand-edits layer (gameWorld.edits) at capture
+   *  time (#7783): `edits: null` for a world without any, so a load clears what was added later.
+   *  Null for a chat with no world, and on checkpoints from before this field. */
+  gameWorldEditsData: text("game_world_edits_data"),
+  /** FK to messages.id — the message this checkpoint was taken at */
+  messageId: text("message_id").notNull(),
+
+  /** Human-readable label (e.g. "Session 3 Start", "Before Boss Fight") */
+  label: text("label").notNull(),
+  /** What triggered this checkpoint */
+  triggerType: text("trigger_type", {
+    enum: [
+      "manual",
+      "session_start",
+      "session_end",
+      "combat_start",
+      "combat_end",
+      "location_change",
+      "auto_interval",
+      "state_editor_save",
+    ],
+  }).notNull(),
+
+  /** Denormalised context for UI display (avoids joining snapshot) */
+  location: text("location"),
+  gameState: text("game_state"),
+  weather: text("weather"),
+  timeOfDay: text("time_of_day"),
+  /** Approximate turn number at checkpoint */
+  turnNumber: integer("turn_number"),
+
+  createdAt: text("created_at").notNull(),
+});

@@ -1,0 +1,93 @@
+name: iOS prototype
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['docs/**', '*.md']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ios-prototype-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  runtime:
+    name: Build and test packaged server
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SKIP_PWA: '1'
+      NODE_OPTIONS: --max-old-space-size=6144
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm --filter @marinara-engine/shared build
+      - run: pnpm --filter @marinara-engine/server exec tsc --noEmit --composite false --incremental false
+      - run: pnpm --filter @marinara-engine/client build
+      - run: node ios-app/scripts/prepare.mjs
+      - run: node scripts/ios/run-chat-lifecycle.mjs --entry ios-app/Resources/runtime/bootstrap.cjs
+      - name: Archive runtime without changing file permissions
+        run: tar -czf ios-app/build/runtime.tar.gz -C ios-app/Resources runtime
+      - uses: actions/upload-artifact@v4
+        with:
+          name: embedded-runtime
+          path: ios-app/build/runtime.tar.gz
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: host-validation
+          path: |
+            .tmp/ios-chat-lifecycle/report.json
+            .tmp/ios-chat-lifecycle/server-*.log
+          include-hidden-files: true
+          retention-days: 7
+  ios:
+    name: iOS Simulator and unsigned IPA
+    needs: runtime
+    runs-on: macos-15
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: embedded-runtime
+          path: ios-app/build
+      - run: |
+          mkdir -p ios-app/Resources
+          tar -xzf ios-app/build/runtime.tar.gz -C ios-app/Resources
+          uname -m
+          xcodebuild -version
+      - run: node ios-app/scripts/download-node.mjs
+      - run: node ios-app/scripts/validate-simulator.mjs
+      - name: Build device app
+        run: >-
+          xcodebuild -project ios-app/Marinar.xcodeproj -scheme Marinar
+          -configuration Release -sdk iphoneos -destination 'generic/platform=iOS'
+          -derivedDataPath ios-app/build/Device
+          CURRENT_PROJECT_VERSION=${{ github.run_number }}
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=
+          build > ios-app/build/device-build.log 2>&1
+      - run: node ios-app/scripts/package-ipa.mjs --app ios-app/build/Device/Build/Products/Release-iphoneos/Marinar.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Marinar-ios-test-unsigned-ipa
+          path: ios-app/build/release/*
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-validation
+          path: |
+            ios-app/build/validation
+            ios-app/build/device-build.log
+          retention-days: 14

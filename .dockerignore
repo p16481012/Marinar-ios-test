@@ -1,0 +1,13 @@
+node_modules
+packages/*/node_modules
+.pnpm-store
+.git
+**/*.tsbuildinfo
+packages/*/dist
+packages/server/data
+.env
+.env.*
+*.log
+# Developer tools and their local state are not part of the image
+tools/
+.dev-mcp

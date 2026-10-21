@@ -1,0 +1,354 @@
+import { DEFAULT_GENERATION_PARAMS, type AgentContext } from "@marinara-engine/shared";
+import {
+  buildCharacterAppearanceReferenceBlock,
+  NOVELAI_V5_MAX_CHARACTER_PROMPTS,
+  personaEntityId,
+  readIllustratorImageAppearanceOverride,
+} from "../image/character-prompts.js";
+import { logger } from "../../lib/logger.js";
+import {
+  agentRequestOptions,
+  gateAgentTemperature,
+  normalizeAgentContextSize,
+  renderAgentPromptTemplate,
+  resolveAgentCallMaxTokens,
+} from "../agents/agent-executor.js";
+import type { ResolvedAgent } from "../agents/agent-pipeline.js";
+import { measureContextBudget, type ChatCompletionResult, type ChatMessage } from "../llm/base-provider.js";
+import { normalizeAgentMaxTokens, normalizeMaxContext } from "./generation-parameters.js";
+import { appendImagePromptInstructions } from "./image-prompt-instructions.js";
+
+const DEFAULT_MANUAL_ILLUSTRATION_MAX_TOKENS = 1_800;
+const MANUAL_ILLUSTRATION_SYSTEM_PROMPT = [
+  "You are the Illustrator prompt writer for a manual Gallery illustration request.",
+  "For this manual request, ignore automatic-generation conditions, cadence, and response schemas in the selected prompt above. Preserve its visual instructions and use the manual response schema below.",
+  "The user already pressed Illustration. Do not decide whether to generate an image, do not discuss that decision, and do not return shouldGenerate or generateBackground fields.",
+  "Write one detailed, provider-ready prompt for an image model that depicts the most visually important current scene established by the supplied conversation.",
+  "Use the supplied character cards and user persona to keep identities, clothing, physical traits, relationships, and setting details consistent.",
+  "Name every character who should be visible in the characters array. Do not add characters who are absent from the chosen moment.",
+  "The selected Illustrator prompt mode controls the required visual format, layout, framing, text behavior, and aspect ratio. Preserve comic pages, manga pages, selfies, backgrounds, and other selected formats exactly; never collapse a requested multi-panel page into one ordinary scene.",
+  "The prompt should describe subjects, actions, expressions, environment, camera/framing, lighting, atmosphere, and important props without narrating your reasoning.",
+  "Return valid JSON only, with no markdown:",
+  '{"prompt":"detailed provider-ready image prompt","negativePrompt":"optional exclusions","style":"optional scene-specific art direction","characters":["visible names"],"aspectRatio":"portrait|landscape|square","reason":"brief description of the chosen moment"}',
+].join("\n");
+
+export type ManualIllustratorPromptPlan = {
+  prompt: string;
+  negativePrompt: string;
+  style: string;
+  characters: string[];
+  aspectRatio: "portrait" | "landscape" | "square" | "";
+  reason: string;
+  /** Raw NovelAI character captions; validated against characters at dispatch time. */
+  characterPrompts: unknown[];
+};
+
+export type ManualIllustratorPromptResult = {
+  plan: ManualIllustratorPromptPlan;
+  tokensUsed: number;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function readTrimmedString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function parseRecord(value: unknown): Record<string, unknown> {
+  if (isRecord(value)) return value;
+  if (typeof value !== "string") return {};
+  const text = value
+    .trim()
+    .replace(/^```(?:json)?\s*/iu, "")
+    .replace(/\s*```$/u, "");
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) return {};
+  try {
+    const parsed = JSON.parse(text.slice(start, end + 1));
+    return isRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeCharacterNames(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return Array.from(
+    new Set(
+      value
+        .map(readTrimmedString)
+        .filter(Boolean)
+        .map((name) => name.slice(0, 120)),
+    ),
+  ).slice(0, NOVELAI_V5_MAX_CHARACTER_PROMPTS);
+}
+
+function normalizeAspectRatio(value: unknown): ManualIllustratorPromptPlan["aspectRatio"] {
+  const normalized = readTrimmedString(value).toLowerCase();
+  if (normalized === "portrait" || normalized === "landscape" || normalized === "square") {
+    return normalized;
+  }
+  return "";
+}
+
+export function parseManualIllustratorPromptPlan(value: unknown): ManualIllustratorPromptPlan | null {
+  const record = parseRecord(value);
+  const prompt = readTrimmedString(record.prompt ?? record.imagePrompt ?? record.description).slice(0, 7_000);
+  if (!prompt) return null;
+  return {
+    prompt,
+    negativePrompt: readTrimmedString(record.negativePrompt ?? record.negative_prompt).slice(0, 5_000),
+    style: readTrimmedString(record.style ?? record.artStyle).slice(0, 1_000),
+    characters: normalizeCharacterNames(record.characters ?? record.visibleCharacters),
+    aspectRatio: normalizeAspectRatio(record.aspectRatio ?? record.aspect_ratio),
+    reason: readTrimmedString(record.reason).slice(0, 500),
+    characterPrompts: Array.isArray(record.characterPrompts) ? record.characterPrompts.slice(0, 32) : [],
+  };
+}
+
+function appendContextField(parts: string[], label: string, value: string | undefined, maxLength: number): void {
+  const text = value?.trim();
+  if (text) parts.push(`${label}: ${text.slice(0, maxLength)}`);
+}
+
+function escapeContextAttribute(value: string): string {
+  return value
+    .trim()
+    .slice(0, 120)
+    .replace(/&/gu, "&amp;")
+    .replace(/"/gu, "&quot;")
+    .replace(/'/gu, "&apos;")
+    .replace(/</gu, "&lt;")
+    .replace(/>/gu, "&gt;");
+}
+
+function buildCharacterPersonaContext(context: AgentContext): string {
+  const parts: string[] = ["<visual_identity_context>"];
+  if (context.characters.length > 0) {
+    parts.push("<characters>");
+    for (const character of context.characters) {
+      parts.push(`<character name="${escapeContextAttribute(character.name)}">`);
+      appendContextField(parts, "Description", character.description, 2_000);
+      appendContextField(parts, "Appearance", character.appearance, 1_500);
+      appendContextField(parts, "Personality", character.personality, 1_000);
+      appendContextField(parts, "Backstory", character.backstory, 1_000);
+      appendContextField(parts, "Scenario", character.scenario, 1_000);
+      parts.push("</character>");
+    }
+    parts.push("</characters>");
+  }
+  if (context.persona) {
+    parts.push("<user_persona>");
+    appendContextField(parts, "Name", context.persona.name, 120);
+    appendContextField(parts, "Description", context.persona.description, 2_000);
+    appendContextField(parts, "Appearance", context.persona.appearance, 1_500);
+    appendContextField(parts, "Personality", context.persona.personality, 1_000);
+    appendContextField(parts, "Backstory", context.persona.backstory, 1_000);
+    appendContextField(parts, "Scenario", context.persona.scenario, 1_000);
+    parts.push("</user_persona>");
+  }
+  if (context.gameState) {
+    parts.push("<current_tracker_state>");
+    parts.push(JSON.stringify(context.gameState));
+    parts.push("</current_tracker_state>");
+  }
+  parts.push("</visual_identity_context>");
+  return parts.join("\n");
+}
+
+function appendConversationMessage(messages: ChatMessage[], role: "user" | "assistant", content: string): void {
+  const clean = content.trim().slice(0, 4_000);
+  if (!clean) return;
+  const previous = messages.at(-1);
+  if (previous?.role === role) {
+    previous.content = `${previous.content}\n\n${clean}`;
+    return;
+  }
+  messages.push({ role, content: clean, contextKind: "history" });
+}
+
+/**
+ * NovelAI caption rules for a manual prompt writer, followed by the card and persona
+ * Appearance reference when Attach card appearance is on, so the writer turns them
+ * into per-character captions instead of the server appending them to the prompt.
+ */
+export function buildManualIllustratorCharacterPromptInstruction(
+  context: AgentContext,
+  characterPromptInstruction: string | undefined,
+  attachCardAppearance: boolean,
+): string | undefined {
+  if (!characterPromptInstruction) return undefined;
+  if (!attachCardAppearance) return characterPromptInstruction;
+  return [
+    characterPromptInstruction,
+    buildCharacterAppearanceReferenceBlock([
+      ...context.characters.map((char) => ({
+        name: char.name,
+        // #7053: the image override replaces the card appearance for the
+        // manual illustrator prompt only.
+        appearance: readIllustratorImageAppearanceOverride(context.memory, char.id) ?? char.appearance ?? "",
+      })),
+      ...(context.persona
+        ? [
+            {
+              name: context.persona.name,
+              // Personas are keyed by their own id, like characters (#7053).
+              appearance:
+                readIllustratorImageAppearanceOverride(context.memory, personaEntityId(context.memory)) ??
+                context.persona.appearance ??
+                "",
+            },
+          ]
+        : []),
+    ]),
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function buildManualIllustratorPromptMessages(args: {
+  context: AgentContext;
+  contextSize: unknown;
+  selectedPromptTemplate?: string;
+  styleInstruction?: string;
+  characterPromptInstruction?: string;
+  imagePromptInstructions?: string;
+  request?: string;
+}): ChatMessage[] {
+  // Custom prompts may mix visual instructions with schemas or generation conditions.
+  // Preserve them intact; the manual contract below overrides only when/how to return the prompt.
+  const promptModeInstruction = args.selectedPromptTemplate?.trim();
+  const systemPrompt = [
+    promptModeInstruction
+      ? [
+          "<selected_illustrator_prompt_mode>",
+          "Selected Illustrator instructions for the scene, perspective, style, and visual format:",
+          promptModeInstruction,
+          "</selected_illustrator_prompt_mode>",
+        ].join("\n")
+      : "No selected Illustrator prompt mode supplied; use one coherent scene illustration.",
+    MANUAL_ILLUSTRATION_SYSTEM_PROMPT,
+    args.styleInstruction
+      ? `Additional Image Style instruction for the image prompt you write: ${args.styleInstruction}\nCombine it with the selected Illustrator prompt mode. It may refine rendering and visual treatment, but it must not replace or weaken the selected format, layout, framing, or text requirements. Express it as words for the image model; never copy its sentences into the JSON fields.`
+      : "No visual style profile is selected. Infer only the visual treatment supported by the scene context.",
+    args.characterPromptInstruction?.trim() ?? "",
+    buildCharacterPersonaContext(args.context),
+  ].join("\n\n");
+  const messages: ChatMessage[] = [
+    {
+      role: "system",
+      content: systemPrompt,
+      contextKind: "prompt",
+    },
+  ];
+  const recentMessages = args.context.recentMessages.slice(-normalizeAgentContextSize(args.contextSize));
+  for (const message of recentMessages) {
+    appendConversationMessage(messages, message.role === "assistant" ? "assistant" : "user", message.content);
+  }
+  // The image connection's instructions sit next to the request, as in the automatic
+  // Illustrator call, so the writer follows them instead of losing them above the chat (#7357).
+  const instruction = appendImagePromptInstructions(
+    [
+      "<manual_gallery_illustration_request>",
+      "Write the image-model prompt now for the current scene. The Illustration button has already selected the output type.",
+      ...(args.request ? [`Depict this explicit request: ${args.request}`] : []),
+      "</manual_gallery_illustration_request>",
+    ].join("\n"),
+    args.imagePromptInstructions,
+  );
+  const last = messages.at(-1);
+  if (last?.role === "user") {
+    last.content = `${last.content}\n\n${instruction}`;
+  } else {
+    messages.push({ role: "user", content: instruction, contextKind: "prompt" });
+  }
+  return messages;
+}
+
+export async function writeManualIllustratorPromptPlan(args: {
+  illustratorAgent: ResolvedAgent;
+  context: AgentContext;
+  styleInstruction?: string;
+  characterPromptInstruction?: string;
+  imagePromptInstructions?: string;
+  request?: string;
+  signal?: AbortSignal;
+  debugLog?: (message: string, ...args: unknown[]) => void;
+}): Promise<ManualIllustratorPromptResult> {
+  const selectedPromptTemplate = renderAgentPromptTemplate(
+    args.illustratorAgent.promptTemplate,
+    args.illustratorAgent.settings,
+    args.context,
+    { escapeValues: true },
+  );
+  const messages = buildManualIllustratorPromptMessages({
+    context: args.context,
+    contextSize: args.illustratorAgent.settings.contextSize,
+    selectedPromptTemplate,
+    styleInstruction: args.styleInstruction,
+    characterPromptInstruction: args.characterPromptInstruction,
+    imagePromptInstructions: args.imagePromptInstructions,
+    request: args.request,
+  });
+  args.debugLog?.(
+    "[debug/illustrator/manual-illustration-prompt] messages:\n%s",
+    messages.map((message) => `${message.role}:\n${message.content}`).join("\n\n"),
+  );
+
+  const maxContext =
+    normalizeMaxContext(args.illustratorAgent.provider.maxContextValue) ?? DEFAULT_GENERATION_PARAMS.maxContext;
+  const callPromptWriter = async (requestMessages: ChatMessage[]): Promise<ChatCompletionResult> => {
+    // Thinking room only takes what the window leaves free; the writer's own budget must still fit (#7131).
+    const maxTokens = resolveAgentCallMaxTokens(
+      args.illustratorAgent.provider,
+      args.illustratorAgent,
+      normalizeAgentMaxTokens(args.illustratorAgent.settings.maxTokens, DEFAULT_MANUAL_ILLUSTRATION_MAX_TOKENS),
+      { messages: requestMessages, maxContext },
+    );
+    if (!measureContextBudget(requestMessages, { maxContext, maxTokens }).fits) {
+      throw new Error(
+        "Manual Illustrator request exceeds the connection context limit. Shorten the selected prompt or reduce Illustrator context size, or increase the connection context limit.",
+      );
+    }
+    return args.illustratorAgent.provider.chatComplete(requestMessages, {
+      model: args.illustratorAgent.model,
+      // The prompt writer keeps its own temperature; the connection decides whether one is sent (#7131).
+      temperature: gateAgentTemperature(args.illustratorAgent, 0.55),
+      maxTokens,
+      maxContext,
+      preserveContext: true,
+      enableCaching: args.illustratorAgent.enableCaching,
+      anthropicExtendedCacheTtl: args.illustratorAgent.anthropicExtendedCacheTtl,
+      cachingAtDepth: args.illustratorAgent.cachingAtDepth,
+      ...agentRequestOptions(args.illustratorAgent, false),
+      signal: args.signal,
+    });
+  };
+
+  let response = await callPromptWriter(messages);
+  let tokensUsed = response.usage?.totalTokens ?? 0;
+  let raw = response.content ?? "";
+  let plan = parseManualIllustratorPromptPlan(raw);
+  if (!plan && !args.signal?.aborted) {
+    logger.warn("[illustrator-manual] Prompt writer returned invalid JSON; retrying once");
+    response = await callPromptWriter([
+      ...messages,
+      { role: "assistant", content: raw.slice(0, 7_000), contextKind: "history" },
+      {
+        role: "user",
+        content:
+          'Return the requested JSON object now. "prompt" must be a non-empty string. Do not include shouldGenerate or generateBackground.',
+        contextKind: "prompt",
+      },
+    ]);
+    tokensUsed += response.usage?.totalTokens ?? 0;
+    raw = response.content ?? "";
+    plan = parseManualIllustratorPromptPlan(raw);
+  }
+  if (!plan) throw new Error("Illustrator returned an invalid manual illustration prompt.");
+  args.debugLog?.("[debug/illustrator/manual-illustration-prompt] plan:\n%s", JSON.stringify(plan, null, 2));
+  return { plan, tokensUsed };
+}

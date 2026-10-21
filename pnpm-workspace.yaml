@@ -1,0 +1,40 @@
+packages:
+  - "packages/*"
+
+# Let plain pnpm fallbacks delegate to the exact repo pin. The package engine
+# range also permits the previous 10.33.2 launcher to finish the one-time handoff;
+# refreshed launchers then obtain the hash-pinned version without a manual restart.
+managePackageManagerVersions: true
+
+# Supply-chain guardrails: delay newly published package versions long enough for
+# registry takedowns and advisory systems to catch common compromise waves.
+minimumReleaseAge: 1440
+minimumReleaseAgeIgnoreMissingTime: false
+# Released installs must remain reproducible even when older dependency versions
+# lose trust metadata across pnpm or registry updates.
+trustPolicy: off
+# Updaters and installers run non-interactively; allow pnpm to repair stale or
+# partially created node_modules instead of aborting on its confirmation prompt.
+confirmModulesPurge: false
+blockExoticSubdeps: true
+
+patchedDependencies:
+  # Let an explicit speech-clock opening override held vowels; voice and idle without it stay native.
+  # The painted mouth opens across the whole lip line (rig halfLen), not its middle half, for every vowel.
+  mesh-avatar@0.1.1: patches/mesh-avatar@0.1.1.patch
+  onnxruntime-node@1.30.0: patches/onnxruntime-node@1.30.0.patch
+  # Upstream READY-handshake fix (pinojs/thread-stream#246, #251). Drop once a release after 4.2.0 ships it.
+  thread-stream@4.2.0: patches/thread-stream@4.2.0.patch
+
+# Native/build dependencies permitted to run install scripts.
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
+  - onnxruntime-node
+  - protobufjs
+
+# Dependencies whose install scripts are known no-ops. Listing them keeps pnpm from asking every
+# installer, launcher and updater run to "approve-builds", which would edit this tracked file.
+ignoredBuiltDependencies:
+  - "@google/genai"
+

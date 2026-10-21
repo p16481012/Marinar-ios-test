@@ -1,0 +1,258 @@
+#!/usr/bin/env node
+import { spawn, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import { createRequire } from 'node:module';
+import os from 'node:os';
+import path from 'node:path';
+import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
+
+const FILE_TIMEOUT_MS = 30_000;
+const REGRESSION_SUFFIXES = ['.regression.ts', '.regression.mjs', '.regression.js'];
+const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143, SIGBREAK: 1 };
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const regressionsRoot = path.join(repositoryRoot, 'scripts', 'regressions');
+const serverRequire = createRequire(path.join(repositoryRoot, 'packages', 'server', 'package.json'));
+let activeChild;
+let activeTermination = false;
+let activeForceTimer;
+let interruption;
+
+function repositoryRelative(file) {
+  return path.relative(repositoryRoot, file).split(path.sep).join('/');
+}
+
+export function regressionTimeoutMs(relativePath) {
+  if (relativePath === 'scripts/regressions/server-signal-shutdown.regression.ts') {
+    // 20s main-server phase + six sequential 40s PTY bounds + 10s setup/cleanup margin.
+    return 270_000;
+  }
+  if (relativePath === 'scripts/regressions/restart-supervisor.regression.ts') return 90_000;
+  // Two provider deadlines (8 s each): a silent getContext and a claim that answers late.
+  if (relativePath === 'scripts/regressions/scene-package-origin.regression.ts') return 60_000;
+  // Two slow Decision recall passes (5.5 s each) prove that each has its own time limit.
+  if (relativePath === 'scripts/regressions/advanced-memory-recall-shortlist.regression.ts') return 60_000;
+  // Hundreds of complete d20 and dice-pool fights: 75-130 s on CI runners and up to about 180 s locally.
+  if (relativePath === 'scripts/regressions/ruleset-combat-director.regression.ts') return 300_000;
+  // An out-of-memory control, then a small-heap server exports and re-imports a 64 MB gallery: 16-23 s on CI.
+  if (relativePath === 'scripts/regressions/native-export-memory.regression.ts') return 60_000;
+  // Eighteen blink and talk pictures lined up with their face at full size: about 10 s, more on a busy runner.
+  if (relativePath === 'scripts/regressions/avatar-variant-composite.regression.ts') return 120_000;
+  return FILE_TIMEOUT_MS;
+}
+
+function discoverRegressions(directory = regressionsRoot) {
+  const files = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...discoverRegressions(entryPath));
+    } else if (entry.isFile() && REGRESSION_SUFFIXES.some((suffix) => entry.name.endsWith(suffix))) {
+      files.push(repositoryRelative(entryPath));
+    }
+  }
+  return files.sort();
+}
+
+function parseArguments(args) {
+  let list = false;
+  let filter;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === '--') {
+      continue;
+    } else if (argument === '--list') {
+      list = true;
+    } else if (argument === '--filter') {
+      if (filter !== undefined || index + 1 === args.length || args[index + 1] === '') {
+        throw new Error('Usage: node scripts/run-regressions.mjs [--list] [--filter <text>]');
+      }
+      filter = args[index + 1];
+      index += 1;
+    } else {
+      throw new Error(`Unknown argument: ${argument}`);
+    }
+  }
+
+  return { filter, list };
+}
+
+function pipeWithContext(stream, relativePath, label, destination) {
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  lines.on('line', (line) => destination.write(`[${relativePath}] ${label}: ${line}\n`));
+}
+
+function terminateChild(child) {
+  if (!child?.pid) return;
+
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+    return;
+  }
+
+  try {
+    process.kill(-child.pid, 'SIGTERM');
+  } catch {
+    child.kill('SIGTERM');
+  }
+}
+
+function forceTerminateChild(child) {
+  if (!child?.pid || process.platform === 'win32') return;
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    child.kill('SIGKILL');
+  }
+}
+
+function terminateActiveChild() {
+  if (!activeChild || activeTermination) return;
+  activeTermination = true;
+  terminateChild(activeChild);
+  activeForceTimer = setTimeout(() => forceTerminateChild(activeChild), 2_000);
+}
+
+function releaseActiveChild(child) {
+  if (activeChild !== child) return;
+  clearTimeout(activeForceTimer);
+  activeForceTimer = undefined;
+  activeChild = undefined;
+  activeTermination = false;
+}
+
+function handleRunnerSignal(signal) {
+  if (interruption) return;
+  interruption = signal;
+  process.exitCode = SIGNAL_EXIT_CODES[signal];
+  process.stderr.write(`[runner] ${signal} received; terminating active regression.\n`);
+  terminateActiveChild();
+}
+
+function commandFor(relativePath) {
+  if (relativePath.endsWith('.regression.ts')) {
+    return {
+      command: process.execPath,
+      args: [serverRequire.resolve('tsx/cli'), path.join(repositoryRoot, relativePath)],
+      cwd: path.join(repositoryRoot, 'packages', 'server'),
+    };
+  }
+
+  return {
+    command: process.execPath,
+    args: [relativePath],
+    cwd: repositoryRoot,
+  };
+}
+
+// Each file gets throwaway storage and an empty .env: the repo .env can point DATA_DIR and FILE_STORAGE_DIR at a
+// real data folder, and a regression that forgets to isolate itself must never open (or be blocked by) that store.
+function regressionEnvironment(scratchDir) {
+  const dataDir = path.join(scratchDir, 'data');
+  return {
+    ...process.env,
+    MARINARA_ENV_FILE: path.join(scratchDir, '.env'),
+    DATA_DIR: dataDir,
+    FILE_STORAGE_DIR: path.join(dataDir, 'storage'),
+    // Overworld games are locked by default; the lanes that make worlds run with them on, and the lock's own
+    // checks turn them off themselves.
+    MARINARA_OVERWORLD_GAMES: process.env.MARINARA_OVERWORLD_GAMES ?? 'true',
+  };
+}
+
+function runRegression(relativePath) {
+  const { args, command, cwd } = commandFor(relativePath);
+  const timeoutMs = regressionTimeoutMs(relativePath);
+  const startedAt = Date.now();
+  process.stdout.write(`[${relativePath}] START\n`);
+  const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'marinara-regression-'));
+
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd,
+      detached: process.platform !== 'win32',
+      env: regressionEnvironment(scratchDir),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    activeChild = child;
+    pipeWithContext(child.stdout, relativePath, 'stdout', process.stdout);
+    pipeWithContext(child.stderr, relativePath, 'stderr', process.stderr);
+
+    let settled = false;
+    let timedOut = false;
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      process.stderr.write(`[${relativePath}] TIMEOUT after ${timeoutMs / 1000}s; terminating child.\n`);
+      terminateActiveChild();
+    }, timeoutMs);
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      releaseActiveChild(child);
+      try {
+        fs.rmSync(scratchDir, { recursive: true, force: true, maxRetries: 3 });
+      } catch {
+        // A child still exiting can hold a file open on Windows; the OS temp cleaner removes it.
+      }
+      resolve({ ...result, durationMs: Date.now() - startedAt });
+    };
+
+    child.once('error', (error) => finish({ status: 'start-error', error }));
+    child.once('close', (code, signal) => {
+      if (timedOut) {
+        finish({ status: 'timeout' });
+      } else if (code === 0) {
+        finish({ status: 'passed' });
+      } else {
+        finish({ status: 'failed', code, signal });
+      }
+    });
+  });
+}
+
+async function main() {
+  for (const signal of process.platform === 'win32' ? ['SIGINT', 'SIGTERM', 'SIGBREAK'] : ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => handleRunnerSignal(signal));
+  }
+  const { filter, list } = parseArguments(process.argv.slice(2));
+  const discovered = discoverRegressions();
+  if (discovered.length === 0) throw new Error('No regression files were discovered.');
+
+  const selected = filter === undefined ? discovered : discovered.filter((file) => file.includes(filter));
+  if (selected.length === 0) throw new Error(`No regression files matched filter: ${filter}`);
+
+  if (list) {
+    for (const file of selected) process.stdout.write(`${file}\n`);
+    return;
+  }
+
+  const results = [];
+  for (const file of selected) {
+    if (interruption) return;
+    const result = await runRegression(file);
+    results.push({ file, ...result });
+    if (interruption) return;
+    const detail = result.status === 'failed'
+      ? ` (exit ${result.code ?? 'unknown'}${result.signal ? `, ${result.signal}` : ''})`
+      : result.status === 'start-error'
+        ? ` (${result.error.message})`
+        : '';
+    process.stdout.write(`[${file}] ${result.status.toUpperCase()} (${result.durationMs}ms)${detail}\n`);
+  }
+
+  const failed = results.filter((result) => result.status !== 'passed');
+  for (const result of failed) process.stdout.write(`Regression not passed (${result.status}): ${result.file}\n`);
+  process.stdout.write(`Regression summary: ${results.length - failed.length}/${results.length} passed; ${failed.length} failed.\n`);
+  if (failed.length > 0) process.exitCode = 1;
+}
+
+if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    process.stderr.write(`[runner] ${error.message}\n`);
+    process.exitCode = 1;
+  });
+}

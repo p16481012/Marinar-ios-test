@@ -1,0 +1,524 @@
+import type { CapabilityAchievementHost } from "./achievement.js";
+import type { CapabilityIntegrationHost } from "./generation-integration.js";
+import type { ChatMode, ConversationPresenceStatus, MessageRole } from "./chat.js";
+import type { SpatialContextSnapshot, SpatialSnapshotSource } from "./spatial-context.js";
+
+export type CapabilityRuntimeLogArgument = unknown;
+
+export interface CapabilityRuntimeLogger {
+  debug(message: string, ...args: CapabilityRuntimeLogArgument[]): void;
+  info(message: string, ...args: CapabilityRuntimeLogArgument[]): void;
+  warn(message: string, ...args: CapabilityRuntimeLogArgument[]): void;
+  error(error: unknown, message: string, ...args: CapabilityRuntimeLogArgument[]): void;
+  debugOverride(overrideEnabled: boolean, message: string, ...args: CapabilityRuntimeLogArgument[]): void;
+  /** Capability API 1.341: whether the Engine logger writes this level now. */
+  isLevelEnabled?(level: "trace" | "debug" | "info" | "warn" | "error" | "fatal"): boolean;
+}
+
+/** Capability API 1.341: services other packages registered with `api.registerService`. */
+export interface CapabilityServiceLookupHost {
+  /**
+   * Another package's service registered with api.registerService. null while absent, during a shared-room
+   * generation, or for an `agent-runtime:` or `mari-actions:` key (only the Engine reads those).
+   */
+  get<T = unknown>(key: string): T | null;
+}
+
+/** Capability API 1.341: the conversation commands every package registered, read with the Engine's grammar. */
+export interface CapabilityConversationCommandHost {
+  /** Commands registered by every package, parsed with the host grammar. */
+  parse(content: string): Array<{ type: "capability"; commandType: string; payload: string | null }>;
+  /** Content with every registered command tag removed. */
+  strip(content: string): string;
+  /** Prompt lines for registered commands that have handlers. */
+  instructions(): string[];
+}
+
+/** One message for `persistence.appendMessages` (capability API 1.341). */
+export interface CapabilityAppendMessageInput {
+  role: MessageRole;
+  characterId: string | null;
+  content: string;
+  extra?: Record<string, unknown>;
+  createdAt?: string | null;
+}
+
+/** A `[schedule_update]` for one character, with the fields the command carries. Needs a status or an activity. */
+export interface CapabilityCharacterStatusUpdate {
+  status?: ConversationPresenceStatus;
+  /** What the character is doing now, at most 500 characters. */
+  activity?: string;
+  /** How long it lasts, as the command writes it ("2h", "30m", "1h30m"): 60 minutes when absent or unreadable, at most
+   *  a week. */
+  duration?: string;
+}
+
+/** The status the character card carries after the update, until `expiresAt`. */
+export interface CapabilityCharacterStatusResult {
+  status: ConversationPresenceStatus;
+  activity: string | null;
+  expiresAt: string;
+}
+
+export interface CapabilityChatRecord {
+  id: string;
+  name: string;
+  mode: ChatMode;
+  characterIds: string[];
+  groupId: string | null;
+  personaId: string | null;
+  connectionId: string | null;
+  metadata: unknown;
+  branch: {
+    title: string | null;
+    parentChatId: string | null;
+    parentMessageId: string | null;
+    childMessageId: string | null;
+  } | null;
+  lastMessageAt: string | null;
+  updatedAt: string;
+}
+
+export interface CapabilityCharacterRecord {
+  id: string;
+  data: unknown;
+  comment: string;
+}
+
+export interface CapabilityPersonaRecord {
+  id: string;
+  data: unknown;
+}
+
+export interface CapabilityLorebookRecord {
+  id: string;
+  data: unknown;
+  entries: unknown[];
+}
+
+export interface CapabilityLorebookEntryRecord {
+  id: string;
+  lorebookId: string;
+  lorebookName: string;
+  name: string;
+  content: string;
+  description: string;
+}
+
+export interface CapabilityLorebookEntrySelection {
+  lorebookIds: string[];
+  entryIds: string[];
+  excludedLorebookIds?: string[];
+  excludedSourceAgentIds?: string[];
+}
+
+// Inputs for the resource write surface. Thin, storage-agnostic shapes the server impl maps to storage.
+/** Fields accepted when a package creates the player persona. */
+export interface CapabilityPersonaCreateInput {
+  name: string;
+  description: string;
+  avatarPath?: string;
+  comment?: string;
+  appearance?: string;
+  tags?: string;
+}
+/** Fields a package may revise on a persona it created. The name is fixed once stored. */
+export interface CapabilityPersonaUpdateInput {
+  description?: string;
+  comment?: string;
+  appearance?: string;
+  tags?: string;
+}
+/** Lorebook categories the host understands. Spelled out here rather than left as a free string so a
+ *  wrong value is a compile error in the package instead of a silent rejection at write time. */
+export type CapabilityLorebookCategory = "uncategorized" | "world" | "character" | "npc" | "spellbook";
+
+/** Fields accepted when a package creates a lorebook to hold its own world content. */
+export interface CapabilityLorebookCreateInput {
+  name: string;
+  description?: string;
+  category?: CapabilityLorebookCategory;
+  scanDepth?: number;
+  tokenBudget?: number;
+  personaId?: string;
+  enabled?: boolean;
+}
+/** The retrieval knobs a package may retune on a lorebook it owns. */
+export interface CapabilityLorebookUpdateInput {
+  scanDepth?: number;
+  tokenBudget?: number;
+}
+/** One lorebook entry to store. Extra keys pass through to storage; see the index signature below. */
+export interface CapabilityLorebookEntryInput {
+  /** Required: an entry with no name cannot be stored, so accepting one here only defers the failure. */
+  name: string;
+  content?: string;
+  keys?: string[];
+  [key: string]: unknown;
+}
+
+export interface CapabilityResourceHost {
+  listCharacters(characterIds?: string[]): Promise<CapabilityCharacterRecord[]>;
+  listPersonas(personaIds?: string[]): Promise<CapabilityPersonaRecord[]>;
+  listLorebooks(lorebookIds?: string[]): Promise<CapabilityLorebookRecord[]>;
+  listEligibleLorebookEntries(selection: CapabilityLorebookEntrySelection): Promise<CapabilityLorebookEntryRecord[]>;
+  // Write surface, used by a package's setup to find-or-create the player persona and its lorebook.
+  // OPTIONAL on purpose: the engine's host implements all six, but requiring them would make adding them
+  // a breaking change for any other implementation of this published interface. A package feature-detects
+  // (`typeof resources.createPersona === "function"`) the way it already does for `registerPromptContext`.
+  createPersona?(input: CapabilityPersonaCreateInput): Promise<CapabilityPersonaRecord>;
+  updatePersona?(personaId: string, updates: CapabilityPersonaUpdateInput): Promise<void>;
+  createLorebook?(input: CapabilityLorebookCreateInput): Promise<CapabilityLorebookRecord>;
+  updateLorebook?(lorebookId: string, updates: CapabilityLorebookUpdateInput): Promise<void>;
+  bulkCreateLorebookEntries?(lorebookId: string, entries: CapabilityLorebookEntryInput[]): Promise<void>;
+  removeLorebookEntry?(entryId: string): Promise<void>;
+}
+
+export interface CapabilityLanguageModelMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string;
+}
+
+export interface CapabilityLanguageModelCompletionOptions {
+  temperature?: number;
+  maxTokens?: number;
+  debugMode?: boolean;
+  reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
+  verbosity?: "low" | "medium" | "high";
+  signal?: AbortSignal;
+  responseFormat?: Readonly<{ type: string; [key: string]: unknown }>;
+}
+
+export interface CapabilityLanguageModelCompletion {
+  content: string | null;
+  finishReason: string;
+  usage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    completionReasoningTokens?: number;
+    totalTokens?: number;
+  };
+}
+
+export interface CapabilityLanguageModelContextFit {
+  messages: CapabilityLanguageModelMessage[];
+  maxTokens?: number;
+  estimatedTokensBefore: number;
+  estimatedTokensAfter: number;
+  trimmed: boolean;
+}
+
+export interface CapabilityResolvedLanguageModel {
+  name: string;
+  connectionId: string;
+  model: string;
+  maxContext: number | null;
+  maxOutputTokens: number | null;
+  chatComplete(
+    messages: CapabilityLanguageModelMessage[],
+    options?: CapabilityLanguageModelCompletionOptions,
+  ): Promise<CapabilityLanguageModelCompletion>;
+  fitContext(
+    messages: CapabilityLanguageModelMessage[],
+    options?: Pick<CapabilityLanguageModelCompletionOptions, "maxTokens">,
+  ): CapabilityLanguageModelContextFit;
+}
+
+export interface CapabilityLanguageModelRequest {
+  connectionId?: string | null;
+  chatConnectionId?: string | null;
+  model?: string;
+}
+
+export interface CapabilityLanguageModelHost {
+  resolve(connectionId?: string | null): Promise<CapabilityResolvedLanguageModel>;
+  resolveForRequest(request: CapabilityLanguageModelRequest): Promise<CapabilityResolvedLanguageModel>;
+}
+
+export interface CapabilityJsonHost {
+  parseJsonish(raw: string): unknown;
+}
+
+export interface CapabilityMessageRecord {
+  id: string;
+  chatId: string;
+  role: MessageRole;
+  characterId: string | null;
+  content: string;
+  activeSwipeIndex: number;
+  extra: string;
+  createdAt: string;
+  /**
+   * The message as Engine agents read it (capability API 1.71): each live whisper at its saved place as
+   * `[Private whisper to <name>: …]`, a whisper-only message as its whispers alone, a reply's documents after it, and
+   * no leftover private notes. `listMessages` sets it in Roleplay chats outside hosted multiplayer rooms; it is absent
+   * elsewhere and on older Engines, so read `agentContent ?? content`. `extra` still holds every whisper in all modes.
+   */
+  agentContent?: string;
+}
+
+export interface CapabilitySpatialSnapshotWrite {
+  /**
+   * Must be globally unique across ALL chats (use a UUID). The store rejects
+   * an id that collides with a loaded chat's snapshot, but under lazy storage
+   * (#5592) a collision with a chat that is not yet in memory cannot be
+   * detected at write time — the duplicate is resolved later by dropping one
+   * copy, so a package that reuses ids across chats loses data silently.
+   */
+  id: string;
+  chatId: string;
+  messageId: string;
+  swipeIndex: number;
+  currentLocationId: string | null;
+  definitionRevision: number;
+  source: SpatialSnapshotSource;
+  transitionCommandId: string | null;
+  transitionPayloadHash: string | null;
+  createdAt: string;
+}
+
+export interface CapabilitySpatialSnapshotStore {
+  /** chatId is optional but keeps the lazy file store from loading every chat's shards for a bare-id probe. */
+  getById(id: string, chatId?: string): Promise<SpatialContextSnapshot | null>;
+  getByAnchor(chatId: string, messageId: string, swipeIndex: number): Promise<SpatialContextSnapshot | null>;
+  getByCommand(chatId: string, commandId: string): Promise<SpatialContextSnapshot | null>;
+  listByAnchors(
+    chatId: string,
+    anchors: Array<{ messageId: string; swipeIndex: number }>,
+  ): Promise<SpatialContextSnapshot[]>;
+  listForChat(chatId: string): Promise<SpatialContextSnapshot[]>;
+  hasMessageSnapshots(chatId: string): Promise<boolean>;
+  getLatest(chatId: string): Promise<SpatialContextSnapshot | null>;
+  getBootstrap(chatId: string): Promise<SpatialContextSnapshot | null>;
+  create(input: CapabilitySpatialSnapshotWrite): Promise<SpatialContextSnapshot>;
+  replaceBootstrap(input: CapabilitySpatialSnapshotWrite): Promise<SpatialContextSnapshot>;
+  replaceAtAnchor(input: CapabilitySpatialSnapshotWrite): Promise<SpatialContextSnapshot>;
+}
+
+/** Package-owned JSON document stored independently from chats. */
+export interface CapabilityDocumentRecord {
+  id: string;
+  packageId: string;
+  kind: string;
+  name: string;
+  description: string;
+  data: unknown;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CapabilityDocumentWrite {
+  id: string;
+  packageId: string;
+  kind: string;
+  name: string;
+  description: string;
+  data: unknown;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CapabilityDocumentUpdate {
+  id: string;
+  packageId: string;
+  expectedRevision: number;
+  name: string;
+  description: string;
+  data: unknown;
+  updatedAt: string;
+}
+
+/** Generic persistence for package-owned reusable records such as map templates. */
+export interface CapabilityDocumentStore {
+  list(packageId: string, kind: string): Promise<CapabilityDocumentRecord[]>;
+  getById(packageId: string, id: string): Promise<CapabilityDocumentRecord | null>;
+  create(input: CapabilityDocumentWrite): Promise<CapabilityDocumentRecord>;
+  update(input: CapabilityDocumentUpdate): Promise<CapabilityDocumentRecord | null>;
+  remove(packageId: string, id: string, expectedRevision: number): Promise<boolean>;
+}
+
+export interface CapabilityCreateMessageWithSwipeInput {
+  id: string;
+  swipeId: string;
+  chatId: string;
+  role: MessageRole;
+  characterId: string | null;
+  content: string;
+  extra: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface CapabilityChatActivityUpdate {
+  chatId: string;
+  lastMessageAt: string;
+  updatedAt: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CapabilityChatMetadataUpdate {
+  chatId: string;
+  metadata: Record<string, unknown>;
+  updatedAt: string;
+}
+
+/** Read-only snapshot of the latest committed World State for a chat. */
+export interface CapabilityGameStateRecord {
+  snapshotId: string;
+  chatId: string;
+  messageId: string;
+  swipeIndex: number;
+  date: string | null;
+  time: string | null;
+  location: string | null;
+  weather: string | null;
+  temperature: string | null;
+  presentCharacterIds: string[];
+}
+
+export type CapabilityRoleplayEventAudience = "public" | "user-only" | { characterIds: string[] };
+
+export interface CapabilityRoleplayEventInput {
+  id: string;
+  chatId: string;
+  messageId: string;
+  swipeIndex: number;
+  sourcePackageId: string;
+  eventType: string;
+  subjectCharacterIds: string[];
+  audience: CapabilityRoleplayEventAudience;
+  text: string;
+  data: unknown;
+  createdAt: string;
+  idempotencyKey: string;
+}
+
+export interface CapabilityRoleplayEventRecord extends CapabilityRoleplayEventInput {}
+
+export interface CapabilityPersistenceSession {
+  getChat(chatId: string): Promise<CapabilityChatRecord | null>;
+  listChats(): Promise<CapabilityChatRecord[]>;
+  listMessages(chatId: string): Promise<CapabilityMessageRecord[]>;
+  /** Read-only. Optional so packages feature-detect and degrade on older Engines. */
+  getGameState?(chatId: string): Promise<CapabilityGameStateRecord | null>;
+  appendRoleplayEvent?(input: CapabilityRoleplayEventInput): Promise<CapabilityRoleplayEventRecord | null>;
+  listExistingLorebookEntryIds(entryIds: string[]): Promise<string[]>;
+  createMessageWithSwipe(input: CapabilityCreateMessageWithSwipeInput): Promise<CapabilityMessageRecord>;
+  markGameStateSnapshotCommitted(chatId: string, snapshotId: string): Promise<void>;
+  updateChatActivity(input: CapabilityChatActivityUpdate): Promise<void>;
+  updateChatMetadata(input: CapabilityChatMetadataUpdate): Promise<void>;
+  documents: CapabilityDocumentStore;
+  spatialSnapshots: CapabilitySpatialSnapshotStore;
+}
+
+export interface CapabilityPersistenceHost extends CapabilityPersistenceSession {
+  withChatLock<T>(chatId: string, operation: () => Promise<T>): Promise<T>;
+  transaction<T>(operation: (session: CapabilityPersistenceSession) => Promise<T>): Promise<T>;
+  /**
+   * Capability API 1.341. The Engine's queued metadata patch: one queue per chat, the multiplayer room guard and
+   * write ordinals. Keys in the patch replace those keys; every other key stays. Inside `withChatLock` for the same
+   * chat it runs within that lock. Requires `chat-write`.
+   */
+  patchChatMetadata?(
+    chatId: string,
+    patch:
+      | Record<string, unknown>
+      | ((current: Record<string, unknown>) => Record<string, unknown> | Promise<Record<string, unknown>>),
+    options?: { touchUpdatedAt?: boolean },
+  ): Promise<void>;
+  /** Capability API 1.341. Adds messages, each with its first swipe, as the Engine's batch write does. Requires `chat-write`. */
+  appendMessages?(chatId: string, messages: CapabilityAppendMessageInput[]): Promise<CapabilityMessageRecord[]>;
+  /** Capability API 1.341. A durable note from a conversation to its connected roleplay. Requires `chat-write`. */
+  createChatNote?(sourceChatId: string, targetChatId: string, content: string, anchorMessageId?: string): Promise<void>;
+  /** Capability API 1.341. A one-time influence from a conversation to its connected roleplay. Requires `chat-write`. */
+  createChatInfluence?(
+    sourceChatId: string,
+    targetChatId: string,
+    content: string,
+    anchorMessageId?: string,
+  ): Promise<void>;
+  /**
+   * Applies a `[schedule_update]` for a character of a Conversation chat as the Engine does after a reply: a temporary
+   * status on the character card, so presence shows it in every chat. Resolves the card's new status, or null when
+   * nothing changed: a status the user set by hand stays in charge, and a shared room keeps its own routines. Rejects
+   * bad input, a chat that is not a Conversation chat and a character that is not in it. Requires chat-write. Added
+   * to capability API 1.341 after it was first reported, so feature-detect it.
+   */
+  updateCharacterStatus?(
+    chatId: string,
+    characterId: string,
+    update: CapabilityCharacterStatusUpdate,
+  ): Promise<CapabilityCharacterStatusResult | null>;
+}
+
+export interface CapabilityEmbeddingHost {
+  spaceId: string;
+  label: string;
+  /**
+   * Pass `"query"` for search text; texts default to `"document"`. Some models (e5, nomic) add a
+   * different prefix to each. Capability API 1.68: older Engines ignore the third argument.
+   */
+  embed(texts: string[], signal?: AbortSignal, inputType?: "query" | "document"): Promise<number[][] | null>;
+}
+
+/** One bounded question for the user's Decision model. */
+export interface CapabilityDecisionQuestion {
+  /** Unique within one request; the answer comes back under this id. */
+  id: string;
+  /** A yes/no statement about the context, at most 500 characters. */
+  question: string;
+  /** Present for a Choice question: the options the model chooses between. */
+  options?: string[];
+}
+
+export interface CapabilityDecisionRequest {
+  /** Caller-provided context, oldest first. The oldest messages are dropped to fit the model. */
+  /** `name` is at most 100 characters. */
+  messages: Array<{ role: "system" | "user" | "assistant"; name?: string; content: string }>;
+  questions: CapabilityDecisionQuestion[];
+  signal?: AbortSignal;
+  debugMode?: boolean;
+}
+
+export interface CapabilityDecisionResult {
+  model: string | null;
+  /** Probability of yes, per yes/no question id. A question missing here was not answered. */
+  answers: Record<string, number>;
+  /** Chosen option, per Choice question id, or "none of these" when no option fits. */
+  choices: Record<string, string>;
+  /** The model's own yes threshold. Probabilities are not comparable across Decision models. */
+  threshold: number;
+}
+
+export interface CapabilityDecisionHost {
+  /**
+   * Ask the user's configured Decision model. Resolves null when no Decision model is
+   * configured, or it gave no answer at all (unreachable, timed out or cancelled);
+   * throws only for an invalid request.
+   */
+  evaluate(request: CapabilityDecisionRequest): Promise<CapabilityDecisionResult | null>;
+}
+
+export interface CapabilityRuntimeHost {
+  /** Read and unlock the package's own achievements. Requires the `achievements`
+   *  permission and capability API 1.36. */
+  achievements: CapabilityAchievementHost;
+  /** The user's Decision model. Optional: feature-detect it on older Engines. */
+  decisions?: CapabilityDecisionHost;
+  /** Live provider/media services. Requires capability API 1.31. */
+  integrations?: CapabilityIntegrationHost;
+  embeddings: CapabilityEmbeddingHost;
+  /** Resolve the package's current embedding configuration. Requires capability API 1.15. */
+  resolveEmbeddings(): Promise<CapabilityEmbeddingHost>;
+  getAgentConfig(): Promise<{ connectionId: string | null; settings: Record<string, unknown> } | null>;
+  isDebugAgentsEnabled(): boolean;
+  json: CapabilityJsonHost;
+  languageModels: CapabilityLanguageModelHost;
+  logger: CapabilityRuntimeLogger;
+  persistence: CapabilityPersistenceHost;
+  resources: CapabilityResourceHost;
+  /** Capability API 1.341. */
+  services?: CapabilityServiceLookupHost;
+  /** Capability API 1.341. */
+  commands?: CapabilityConversationCommandHost;
+}

@@ -1,0 +1,6 @@
+export {
+  DIALOGUE_QUOTE_CAPTURE_GROUP_PATTERN_SOURCE,
+  DIALOGUE_QUOTE_PATTERN_SOURCE,
+  HTML_SAFE_DIALOGUE_QUOTE_PATTERN_SOURCE,
+  stripSurroundingDialogueQuotes,
+} from "@marinara-engine/shared";

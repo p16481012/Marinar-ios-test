@@ -1,0 +1,35 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "declaration": false,
+    "declarationMap": false,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node", "vite/client"],
+    "typeRoots": [
+      "../../node_modules/@types",
+      "../../packages/server/node_modules/@types",
+      "../../packages/client/node_modules"
+    ],
+    "paths": {
+      "@marinara-engine/shared": ["../../packages/shared/src/index.ts"]
+    }
+  },
+  "include": [
+    "game-setup-suggestions.regression.ts",
+    "tts-safari-play-guard.regression.ts",
+    "client-runtime-diagnostics.regression.ts",
+    "ruleset-catalog-picker.regression.ts",
+    "ruleset-catalog-refresh.regression.ts",
+    "ruleset-combat-bridge-client.regression.ts",
+    "ruleset-combat-screen-client.regression.ts",
+    "ruleset-dice-pool-client.regression.ts",
+    "ruleset-layers-client.regression.ts",
+    "nanogpt-usage-meter-gate.regression.ts",
+    "game-inventory-refusal-client.regression.ts",
+    "onboarding-preview-highlight.regression.ts",
+    "state-editor.regression.ts",
+    "marinara-host-namespace.regression.ts"
+  ]
+}

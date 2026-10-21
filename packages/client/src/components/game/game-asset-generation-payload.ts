@@ -1,0 +1,132 @@
+import { resolveAssetTag } from "../../lib/asset-fuzzy-match";
+
+type AssetManifestMap = Record<string, { path: string }> | null;
+
+export type SceneAssetNpcAvatarCandidate = {
+  name: string;
+  description: string;
+  gender?: string | null;
+  pronouns?: string | null;
+  avatarUrl?: string | null;
+};
+
+type MissingSceneAssetGenerationPayload = {
+  chatId: string;
+  backgroundTag?: string;
+  npcsNeedingAvatars?: SceneAssetNpcAvatarCandidate[];
+  forceNpcAvatarNames?: string[];
+};
+
+type MissingSceneAssetGenerationInput = {
+  gameImageGenerationEnabled: boolean;
+  gameBackgroundGenerationEnabled?: boolean;
+  activeChatId: string | null;
+  currentBackground: string | null;
+  savedSceneBackground: string | undefined;
+  assetMap: AssetManifestMap;
+  sceneAssetNpcs: SceneAssetNpcAvatarCandidate[];
+  npcAvatarLookup: Map<string, string>;
+  npcsNeedingAvatars: SceneAssetNpcAvatarCandidate[];
+  failedNpcAvatarNames?: Iterable<string>;
+};
+
+export function normalizeSceneAssetNameForGeneration(value: string): string {
+  return value.trim().toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
+}
+
+function isChatOwnedNpcAvatar(avatarUrl: string | undefined, chatId: string): boolean {
+  if (!avatarUrl) return false;
+  try {
+    const pathname = new URL(avatarUrl, "http://marinara.local").pathname;
+    return pathname.startsWith(`/api/avatars/npc/${encodeURIComponent(chatId)}/`);
+  } catch {
+    return false;
+  }
+}
+
+export function getMissingBackgroundTag(
+  backgroundTag: string | undefined | null,
+  manifest: AssetManifestMap,
+): string | null {
+  const cleaned = backgroundTag?.trim();
+  if (!cleaned || cleaned === "black" || cleaned === "none") return null;
+  const resolved = resolveAssetTag(cleaned, "backgrounds", manifest);
+  return manifest?.[resolved] ? null : cleaned;
+}
+
+export function buildMissingSceneAssetGenerationPayload({
+  gameImageGenerationEnabled,
+  gameBackgroundGenerationEnabled = gameImageGenerationEnabled,
+  activeChatId,
+  currentBackground,
+  savedSceneBackground,
+  assetMap,
+  sceneAssetNpcs,
+  npcAvatarLookup,
+  npcsNeedingAvatars,
+  failedNpcAvatarNames,
+}: MissingSceneAssetGenerationInput): MissingSceneAssetGenerationPayload | null {
+  if (!gameImageGenerationEnabled) return null;
+  if (!activeChatId) return null;
+
+  const unresolvedBackground = gameBackgroundGenerationEnabled
+    ? getMissingBackgroundTag(currentBackground || savedSceneBackground, assetMap)
+    : null;
+  const savedGeneratedBackgroundMissing =
+    !!savedSceneBackground &&
+    unresolvedBackground === savedSceneBackground &&
+    savedSceneBackground.startsWith("backgrounds:");
+  const npcAssetCandidates = sceneAssetNpcs
+    .filter((npc) => npc.description && npc.name)
+    .map((npc) => ({
+      name: npc.name,
+      description: npc.description,
+      gender: npc.gender ?? null,
+      pronouns: npc.pronouns ?? null,
+    }))
+    .slice(0, 10);
+  const forceNpcAvatarNameSet = new Set<string>();
+  if (savedGeneratedBackgroundMissing) {
+    for (const npc of npcAssetCandidates) {
+      const avatarUrl = npcAvatarLookup.get(normalizeSceneAssetNameForGeneration(npc.name));
+      if (isChatOwnedNpcAvatar(avatarUrl, activeChatId)) {
+        forceNpcAvatarNameSet.add(npc.name);
+      }
+    }
+  }
+  const failedNpcAvatarNameSet = new Set(
+    [...(failedNpcAvatarNames ?? [])].map(normalizeSceneAssetNameForGeneration).filter(Boolean),
+  );
+  for (const npc of npcAssetCandidates) {
+    const normalizedName = normalizeSceneAssetNameForGeneration(npc.name);
+    const avatarUrl = npcAvatarLookup.get(normalizedName);
+    if (failedNpcAvatarNameSet.has(normalizedName) && isChatOwnedNpcAvatar(avatarUrl, activeChatId)) {
+      forceNpcAvatarNameSet.add(npc.name);
+    }
+  }
+  const forceNpcAvatarNames = [...forceNpcAvatarNameSet];
+  const forcedNpcPayload = npcAssetCandidates.filter((npc) => forceNpcAvatarNameSet.has(npc.name));
+  const npcPayload =
+    savedGeneratedBackgroundMissing && forceNpcAvatarNames.length > 0
+      ? npcAssetCandidates
+      : [
+          ...npcsNeedingAvatars,
+          ...forcedNpcPayload.filter(
+            (forcedNpc) =>
+              !npcsNeedingAvatars.some(
+                (npc) =>
+                  normalizeSceneAssetNameForGeneration(npc.name) ===
+                  normalizeSceneAssetNameForGeneration(forcedNpc.name),
+              ),
+          ),
+        ].slice(0, 10);
+
+  if (!unresolvedBackground && npcPayload.length === 0) return null;
+
+  return {
+    chatId: activeChatId,
+    backgroundTag: unresolvedBackground ?? undefined,
+    npcsNeedingAvatars: npcPayload.length > 0 ? npcPayload : undefined,
+    forceNpcAvatarNames: forceNpcAvatarNames.length > 0 ? forceNpcAvatarNames : undefined,
+  };
+}

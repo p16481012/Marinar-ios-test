@@ -1,0 +1,725 @@
+import { readImageAppearanceOverride, stripMacroComments } from "@marinara-engine/shared";
+import { readPreferredFullBodySpriteBase64 } from "../game/sprite.service.js";
+import { readAvatarBase64 } from "../game/game-asset-generation.js";
+import { readFile } from "node:fs/promises";
+import { extname } from "node:path";
+import { resolveStoredGalleryFile } from "./gallery-file-lifecycle.js";
+import { isAllowedImageBuffer } from "../../utils/security.js";
+
+type CharacterRowLike = {
+  id: string;
+  data: unknown;
+  avatarPath?: string | null;
+};
+
+type CharacterReferenceSource = {
+  id: string;
+  name: string;
+  avatarPath: string | null;
+  appearance: string | null;
+  /** Normalized `extensions.imageAppearance` when the toggle is on (#7053); wins over `appearance`. */
+  appearanceOverride?: string | null;
+  aliases: string[];
+  promptAliases: string[];
+  sourceOrder: number;
+  characterSheetImageId: string | null;
+  useCharacterSheetAsReference: boolean;
+};
+
+export type CharacterGalleryReferenceStore = {
+  getById: (id: string) => Promise<{ characterId: string; filePath: string } | null>;
+};
+
+export type PersonaGalleryReferenceStore = {
+  getById: (id: string) => Promise<{ personaId: string; filePath: string } | null>;
+};
+
+export type IllustratorPersonaReference = {
+  id: string | null;
+  name: string;
+  avatarPath?: string | null;
+  appearance?: string | null;
+  /**
+   * Image-prompt appearance override (#7053). Same contract as the character
+   * field: when set it wins over `appearance` for image prompts only.
+   */
+  appearanceOverride?: string | null;
+  characterSheetImageId?: string | null;
+  useCharacterSheetAsReference?: boolean;
+};
+
+export type IllustratorChatCharacterReference = {
+  id: string;
+  name: string;
+  avatarPath?: string | null;
+  appearance?: string | null;
+  /**
+   * Image-prompt appearance override (#7053). When set it wins over BOTH the
+   * caller `appearance` and the DB row, because the card's explicit override is
+   * authoritative for image prompts regardless of which caller supplied text.
+   */
+  appearanceOverride?: string | null;
+};
+
+export type IllustratorReferenceResolution = {
+  characterIds: string[];
+  personaId: string | null;
+  referenceImages: string[];
+  referenceNames: string[];
+  referenceLine: string | null;
+  appearanceNames: string[];
+  appearanceSources: Array<{ name: string; appearance: string }>;
+  appearanceBlock: string | null;
+};
+
+export function isNovelAiImageConnection(args: {
+  model?: unknown;
+  baseUrl?: unknown;
+  imageService?: unknown;
+  imageGenerationSource?: unknown;
+}): boolean {
+  return [args.model, args.baseUrl, args.imageService, args.imageGenerationSource].some((value) => {
+    if (typeof value !== "string") return false;
+    const normalized = value.trim().toLowerCase();
+    return normalized === "novelai" || normalized.includes("novelai.net") || /^nai-diffusion-/i.test(normalized);
+  });
+}
+
+type ReferencePromptImageProvider = {
+  model?: unknown;
+  baseUrl?: unknown;
+  imageService?: unknown;
+  imageGenerationSource?: unknown;
+  serviceHint?: unknown;
+  source?: unknown;
+};
+
+const LOCAL_STABLE_DIFFUSION_SERVICES = new Set(["comfyui", "automatic1111", "drawthings"]);
+const LOCAL_STABLE_DIFFUSION_PORTS = new Set(["8188", "7860"]);
+const LOOPBACK_IMAGE_HOSTS = new Set(["localhost", "localhost.localdomain", "127.0.0.1", "::1"]);
+
+function isLocalStableDiffusionUrl(value: unknown): boolean {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname
+      .replace(/^\[|\]$/g, "")
+      .replace(/\.$/, "")
+      .toLowerCase();
+    return (
+      (url.protocol === "http:" || url.protocol === "https:") &&
+      LOOPBACK_IMAGE_HOSTS.has(hostname) &&
+      LOCAL_STABLE_DIFFUSION_PORTS.has(url.port)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function providerSuppressesReferencePromptLine(args: ReferencePromptImageProvider): boolean {
+  if (
+    isNovelAiImageConnection({
+      model: args.model,
+      baseUrl: args.baseUrl,
+      imageService: args.imageService ?? args.serviceHint,
+      imageGenerationSource: args.imageGenerationSource ?? args.source,
+    })
+  ) {
+    return true;
+  }
+  const explicitServiceValues = [args.imageService, args.imageGenerationSource, args.serviceHint, args.source];
+  return (
+    explicitServiceValues.some(
+      (value) => typeof value === "string" && LOCAL_STABLE_DIFFUSION_SERVICES.has(value.trim().toLowerCase()),
+    ) || isLocalStableDiffusionUrl(args.baseUrl)
+  );
+}
+
+/**
+ * Providers for which the prose "Attached are reference images…" line should be
+ * omitted from the image prompt. NovelAI receives references through its native
+ * character-reference fields. Local Stable Diffusion backends receive reference
+ * images out-of-band, so this prose does not encode the image and only consumes
+ * prompt tokens. When a fallback is configured, every possible provider must
+ * support omission because the same compiled prompt is reused for the retry.
+ */
+export function suppressesReferencePromptLine(
+  args: ReferencePromptImageProvider,
+  fallback?: ReferencePromptImageProvider | null,
+): boolean {
+  return providerSuppressesReferencePromptLine(args) && (!fallback || providerSuppressesReferencePromptLine(fallback));
+}
+
+const MAX_ILLUSTRATOR_REFERENCE_IMAGES = 6;
+const MAX_ILLUSTRATOR_APPEARANCE_CHARS = 1400;
+export const NAME_STOPWORDS = new Set(["the", "a", "an", "il", "la", "le", "de", "van", "von", "dr", "mr", "ms"]);
+
+export const ILLUSTRATOR_TEXT_NEGATIVE_PROMPT =
+  "dialogue boxes, speech bubbles, word balloons, captions, narration boxes, text boxes, manga sound effect text, SFX lettering, readable text, letters, subtitles, watermark, logo, signature";
+
+export const ILLUSTRATOR_NON_TEXT_ARTIFACT_NEGATIVE_PROMPT = "watermark, logo, signature";
+
+const ILLUSTRATOR_RENDERED_TEXT_CONFLICTS = new Set([
+  "text",
+  "letters",
+  "readable text",
+  "dialogue boxes",
+  "speech bubbles",
+  "word balloons",
+  "captions",
+  "narration boxes",
+  "text boxes",
+  "manga sound effect text",
+  "sfx lettering",
+  "subtitles",
+]);
+
+const ILLUSTRATOR_RENDERED_TEXT_REQUEST_PATTERNS = [
+  /\b(?:caption|sfx|sound effect|speech bubble|dialogue bubble|word balloon)s?\s*(?:\([^\n)]{1,80}\))?\s*:/iu,
+  /\b(?:include|add|show|draw|render|display|feature|place|contain|use|keep|preserve)\b[^\n.!?]{0,100}\b(?:dialogue boxes?|speech bubbles?|word balloons?|captions?|narration boxes?|text boxes?|sfx lettering|sound effect text|readable text|comic lettering|manga lettering)\b/iu,
+  /\b(?:expressive|readable|clear|clean|hand[- ]?lettered|stylized)(?:\s+(?:readable|comic|manga))*\s+(?:lettering|dialogue boxes?|speech bubbles?|word balloons?|captions?|sfx)\b/iu,
+  /\b(?:short\s+)?readable text plan\b/iu,
+  /\b(?:sign|poster|screen|label|title)\s+(?:reading|reads|saying)\b/iu,
+];
+
+export function illustratorPromptRequestsRenderedText(prompt: string): boolean {
+  return ILLUSTRATOR_RENDERED_TEXT_REQUEST_PATTERNS.some((pattern) => pattern.test(prompt));
+}
+
+/**
+ * Dedicated comic/manga prompt templates own their framing and must not inherit
+ * the generic Illustration composition. Ordinary Illustration templates should
+ * still receive the selected profile's per-image tags.
+ */
+export function illustratorPromptTemplateOwnsComposition(promptTemplate: string): boolean {
+  return (
+    illustratorPromptRequestsRenderedText(promptTemplate) ||
+    /\b(?:comic page|manga (?:illustration|page|scene|beat)|panel(?:led|s?\b|-inspired| layout| composition| flow| language))\b/iu.test(
+      promptTemplate,
+    )
+  );
+}
+
+/**
+ * Preserve the default ban on accidental image text for ordinary illustrations,
+ * but do not contradict comic pages or other prompts that explicitly request
+ * lettering. User- and agent-authored negative prompts remain intact.
+ */
+export function mergeIllustratorNegativePrompt(
+  prompt: string,
+  negativePrompt?: string | null,
+  authoredNegativePrompt?: string | null,
+  provider?: ReferencePromptImageProvider | null,
+): string {
+  if (provider && isNovelAiImageConnection(provider)) {
+    const seen = new Set<string>();
+    return (negativePrompt ?? "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => {
+        const key = item.toLowerCase();
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .join(", ");
+  }
+
+  const requestsRenderedText = illustratorPromptRequestsRenderedText(prompt);
+  const authoredItems = new Set(
+    (authoredNegativePrompt ?? "")
+      .split(",")
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const requestedItems = (negativePrompt ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(
+      (item) =>
+        !requestsRenderedText ||
+        authoredItems.has(item.toLowerCase()) ||
+        !ILLUSTRATOR_RENDERED_TEXT_CONFLICTS.has(item.toLowerCase()),
+    );
+  const builtInNegativePrompt = requestsRenderedText
+    ? ILLUSTRATOR_NON_TEXT_ARTIFACT_NEGATIVE_PROMPT
+    : ILLUSTRATOR_TEXT_NEGATIVE_PROMPT;
+  const mergedItems = [...requestedItems, ...builtInNegativePrompt.split(",").map((item) => item.trim())];
+  const seen = new Set<string>();
+  return mergedItems
+    .filter((item) => {
+      const key = item.toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .join(", ");
+}
+
+function parseRecord(value: unknown): Record<string, unknown> {
+  if (!value) return {};
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  }
+  return typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function normalizeReferenceName(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildNameAliases(name: string, opts: { includeStandaloneTokens?: boolean } = {}): string[] {
+  const normalized = normalizeReferenceName(name);
+  if (!normalized) return [];
+
+  const aliases = new Set<string>([normalized]);
+  const withoutParenthetical = normalizeReferenceName(name.replace(/\([^)]*\)/g, " "));
+  if (withoutParenthetical) aliases.add(withoutParenthetical);
+
+  const tokens = normalized.split(" ").filter(Boolean);
+  if (tokens.length > 1) {
+    const withoutLeadingTitle = tokens.filter((token, index) => index > 0 || !NAME_STOPWORDS.has(token)).join(" ");
+    if (withoutLeadingTitle) aliases.add(withoutLeadingTitle);
+  }
+
+  if (opts.includeStandaloneTokens !== false) {
+    for (const token of tokens) {
+      if (token.length >= 4 && !NAME_STOPWORDS.has(token)) aliases.add(token);
+    }
+  }
+
+  return [...aliases].sort((a, b) => b.length - a.length);
+}
+
+export function normalizeIllustratorAppearance(value: unknown): string | null {
+  const cleaned = typeof value === "string" ? stripMacroComments(value).replace(/\s+/g, " ").trim() : "";
+  if (!cleaned) return null;
+  if (cleaned.length <= MAX_ILLUSTRATOR_APPEARANCE_CHARS) return cleaned;
+  const limit = MAX_ILLUSTRATOR_APPEARANCE_CHARS - 3;
+  const clipped = cleaned.slice(0, limit).trimEnd();
+  const wordBoundary = clipped.lastIndexOf(" ");
+  return `${(wordBoundary > 0 ? clipped.slice(0, wordBoundary) : clipped).trimEnd()}...`;
+}
+
+/**
+ * Resolves the appearance text used for IMAGE prompts (#7053): the card's
+ * `extensions.imageAppearance` wins over `extensions.appearance`/`appearance`
+ * when the toggle is on and the override is non-empty. Both candidates go
+ * through `normalizeIllustratorAppearance` so macro-stripping and clipping are
+ * unchanged; the helper only picks override-vs-fallback.
+ */
+export function readIllustratorAppearance(data: Record<string, unknown>): string | null {
+  const extensions = parseRecord(data.extensions);
+  const stored =
+    normalizeIllustratorAppearance(extensions.appearance) ?? normalizeIllustratorAppearance(data.appearance);
+  // The helper is trim-only, so the override is normalized here too.
+  return normalizeIllustratorAppearance(readImageAppearanceOverride(extensions, stored));
+}
+
+function textContainsAlias(normalizedText: string, alias: string): boolean {
+  if (!normalizedText || !alias) return false;
+  return new RegExp(`(?:^| )${alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?: |$)`).test(normalizedText);
+}
+
+function characterRowToSource(row: CharacterRowLike, sourceOrder: number): CharacterReferenceSource | null {
+  const data = parseRecord(row.data);
+  const extensions = parseRecord(data.extensions);
+  const rawName = typeof data.name === "string" ? stripMacroComments(data.name).trim() : "";
+  if (!rawName) return null;
+  return {
+    id: row.id,
+    name: rawName,
+    avatarPath: typeof row.avatarPath === "string" ? row.avatarPath : null,
+    appearance: readIllustratorAppearance(data),
+    appearanceOverride: readImageAppearanceOverride(extensions, null),
+    aliases: buildNameAliases(rawName),
+    promptAliases: buildNameAliases(rawName, { includeStandaloneTokens: false }),
+    sourceOrder,
+    characterSheetImageId:
+      typeof extensions.characterSheetImageId === "string" ? extensions.characterSheetImageId : null,
+    useCharacterSheetAsReference: extensions.useCharacterSheetAsReference === true,
+  };
+}
+
+async function readCharacterSheetReference(
+  source: Pick<CharacterReferenceSource, "id" | "characterSheetImageId" | "useCharacterSheetAsReference">,
+  gallery: CharacterGalleryReferenceStore | undefined,
+): Promise<string | undefined> {
+  if (!gallery || !source.useCharacterSheetAsReference || !source.characterSheetImageId) return undefined;
+  try {
+    const image = await gallery.getById(source.characterSheetImageId);
+    if (!image || image.characterId !== source.id) return undefined;
+    const storedFile = resolveStoredGalleryFile(image.filePath);
+    if (!storedFile) return undefined;
+    const buffer = await readFile(storedFile.absolutePath);
+    if (!isAllowedImageBuffer(buffer, extname(storedFile.filename))) return undefined;
+    return buffer.toString("base64");
+  } catch {
+    return undefined;
+  }
+}
+
+async function readPersonaSheetReference(
+  source: { id: string; characterSheetImageId: string | null; useCharacterSheetAsReference: boolean },
+  gallery: PersonaGalleryReferenceStore | undefined,
+): Promise<string | undefined> {
+  if (!gallery || !source.useCharacterSheetAsReference || !source.characterSheetImageId) return undefined;
+  try {
+    const image = await gallery.getById(source.characterSheetImageId);
+    if (!image || image.personaId !== source.id) return undefined;
+    const storedFile = resolveStoredGalleryFile(image.filePath);
+    if (!storedFile) return undefined;
+    const buffer = await readFile(storedFile.absolutePath);
+    if (!isAllowedImageBuffer(buffer, extname(storedFile.filename))) return undefined;
+    return buffer.toString("base64");
+  } catch {
+    return undefined;
+  }
+}
+
+async function readBestReferenceImage(
+  source: Pick<
+    CharacterReferenceSource,
+    "id" | "avatarPath" | "characterSheetImageId" | "useCharacterSheetAsReference"
+  >,
+  gallery: CharacterGalleryReferenceStore | undefined,
+) {
+  return (
+    await readPreferredCharacterReferenceImage({
+      characterId: source.id,
+      avatarPath: source.avatarPath,
+      characterSheetImageId: source.characterSheetImageId,
+      useCharacterSheetAsReference: source.useCharacterSheetAsReference,
+      characterGallery: gallery,
+    })
+  )?.base64;
+}
+
+export async function readPreferredCharacterReferenceImage(args: {
+  characterId: string;
+  avatarPath?: string | null;
+  characterSheetImageId?: string | null;
+  useCharacterSheetAsReference?: boolean;
+  characterGallery?: CharacterGalleryReferenceStore;
+  loaders?: {
+    characterSheet?: () => Promise<string | undefined>;
+    avatar?: () => string | undefined;
+    sprite?: () => string | undefined;
+  };
+}): Promise<{ base64: string; source: "character-sheet" | "avatar" | "sprite" } | null> {
+  const characterSheet =
+    args.useCharacterSheetAsReference === true
+      ? await (args.loaders?.characterSheet
+          ? args.loaders.characterSheet()
+          : readCharacterSheetReference(
+              {
+                id: args.characterId,
+                characterSheetImageId: args.characterSheetImageId ?? null,
+                useCharacterSheetAsReference: true,
+              },
+              args.characterGallery,
+            ))
+      : undefined;
+  if (characterSheet) return { base64: characterSheet, source: "character-sheet" };
+  const avatar = args.loaders?.avatar ? args.loaders.avatar() : readAvatarBase64(args.avatarPath);
+  if (avatar) return { base64: avatar, source: "avatar" };
+  const sprite = args.loaders?.sprite
+    ? args.loaders.sprite()
+    : readPreferredFullBodySpriteBase64(args.characterId)?.base64;
+  return sprite ? { base64: sprite, source: "sprite" } : null;
+}
+
+export async function readPreferredPersonaReferenceImage(args: {
+  personaId: string;
+  avatarPath?: string | null;
+  characterSheetImageId?: string | null;
+  useCharacterSheetAsReference?: boolean;
+  personaGallery?: PersonaGalleryReferenceStore;
+  loaders?: {
+    characterSheet?: () => Promise<string | undefined>;
+    avatar?: () => string | undefined;
+    sprite?: () => string | undefined;
+  };
+}): Promise<{ base64: string; source: "character-sheet" | "avatar" | "sprite" } | null> {
+  const characterSheet =
+    args.useCharacterSheetAsReference === true
+      ? await (args.loaders?.characterSheet
+          ? args.loaders.characterSheet()
+          : readPersonaSheetReference(
+              {
+                id: args.personaId,
+                characterSheetImageId: args.characterSheetImageId ?? null,
+                useCharacterSheetAsReference: true,
+              },
+              args.personaGallery,
+            ))
+      : undefined;
+  if (characterSheet) return { base64: characterSheet, source: "character-sheet" };
+  const avatar = args.loaders?.avatar ? args.loaders.avatar() : readAvatarBase64(args.avatarPath);
+  if (avatar) return { base64: avatar, source: "avatar" };
+  const sprite = args.loaders?.sprite
+    ? args.loaders.sprite()
+    : readPreferredFullBodySpriteBase64(args.personaId)?.base64;
+  return sprite ? { base64: sprite, source: "sprite" } : null;
+}
+
+/**
+ * Re-read the reference images a regenerated chat image was originally sent with (#7767),
+ * from the characters/persona it recorded, using their current sheet/avatar/sprite.
+ * Sources that no longer exist or have no picture are skipped.
+ */
+export async function readRecordedReferenceImages(args: {
+  characterIds: readonly string[];
+  personaId: string | null;
+  /** The persona picture first sent; "sprite" skips the avatar like Game mode's lookup does. */
+  personaSource?: "character-sheet" | "avatar" | "sprite" | null;
+  charactersStore: {
+    getById: (id: string) => Promise<CharacterRowLike | null>;
+    getPersona: (id: string) => Promise<{
+      id: string;
+      avatarPath?: string | null;
+      characterSheetImageId?: string | null;
+      useCharacterSheetAsReference?: unknown;
+    } | null>;
+  };
+  characterGallery?: CharacterGalleryReferenceStore;
+  personaGallery?: PersonaGalleryReferenceStore;
+}): Promise<string[]> {
+  const images: string[] = [];
+  for (const characterId of args.characterIds) {
+    const row = await args.charactersStore.getById(characterId).catch(() => null);
+    const source = row ? characterRowToSource(row, 0) : null;
+    if (!source) continue;
+    const image = await readPreferredCharacterReferenceImage({
+      characterId: source.id,
+      avatarPath: source.avatarPath,
+      characterSheetImageId: source.characterSheetImageId,
+      useCharacterSheetAsReference: source.useCharacterSheetAsReference,
+      characterGallery: args.characterGallery,
+    });
+    if (image) images.push(image.base64);
+  }
+  if (args.personaId) {
+    const persona = await args.charactersStore.getPersona(args.personaId).catch(() => null);
+    // The recorded picture comes first, so a sheet enabled (or avatar added) since does not change
+    // the re-roll; the usual order applies when it is gone or unknown. A sprite-sourced persona
+    // never falls back to the avatar, matching Game mode's lookup.
+    const recorded =
+      persona && args.personaSource === "sprite"
+        ? readPreferredFullBodySpriteBase64(persona.id)?.base64
+        : persona && args.personaSource === "avatar"
+          ? readAvatarBase64(persona.avatarPath)
+          : undefined;
+    const image = recorded
+      ? { base64: recorded }
+      : persona
+        ? await readPreferredPersonaReferenceImage({
+            personaId: persona.id,
+            avatarPath: persona.avatarPath,
+            characterSheetImageId: persona.characterSheetImageId ?? null,
+            useCharacterSheetAsReference:
+              persona.useCharacterSheetAsReference === true || persona.useCharacterSheetAsReference === "true",
+            personaGallery: args.personaGallery,
+            ...(args.personaSource === "sprite" ? { loaders: { avatar: () => undefined } } : {}),
+          })
+        : null;
+    if (image) images.push(image.base64);
+  }
+  return images;
+}
+
+export async function resolveIllustratorCharacterReferences(args: {
+  charactersStore: { list: () => Promise<CharacterRowLike[]> };
+  chatCharacters: IllustratorChatCharacterReference[];
+  persona?: IllustratorPersonaReference | null;
+  requestedNames: string[];
+  promptText: string;
+  fallbackToChatCharacters?: boolean;
+  maxReferences?: number;
+  includeReferenceImages?: boolean;
+  includePersonaWhenMentionedInPrompt?: boolean;
+  characterGallery?: CharacterGalleryReferenceStore;
+  personaGallery?: PersonaGalleryReferenceStore;
+}): Promise<IllustratorReferenceResolution> {
+  const maxReferences = Math.max(1, Math.min(args.maxReferences ?? MAX_ILLUSTRATOR_REFERENCE_IMAGES, 12));
+  const allRows = await args.charactersStore.list().catch(() => []);
+  const allSources = allRows
+    .map((row, index) => characterRowToSource(row, index + args.chatCharacters.length))
+    .filter((source): source is CharacterReferenceSource => Boolean(source));
+  const allSourcesById = new Map(allSources.map((source) => [source.id, source]));
+
+  const sourcesById = new Map<string, CharacterReferenceSource>();
+  args.chatCharacters.forEach((character, index) => {
+    const fromDb = allSourcesById.get(character.id);
+    // #7053: an explicit override wins over BOTH the caller appearance and the
+    // DB row — the card's override is authoritative for image prompts no matter
+    // which caller supplied text.
+    const override =
+      normalizeIllustratorAppearance(character.appearanceOverride) ??
+      normalizeIllustratorAppearance(fromDb?.appearanceOverride) ??
+      null;
+    sourcesById.set(character.id, {
+      id: character.id,
+      name: character.name,
+      avatarPath: character.avatarPath ?? fromDb?.avatarPath ?? null,
+      appearance: override ?? normalizeIllustratorAppearance(character.appearance) ?? fromDb?.appearance ?? null,
+      aliases: buildNameAliases(character.name),
+      promptAliases: buildNameAliases(character.name, { includeStandaloneTokens: false }),
+      sourceOrder: index,
+      characterSheetImageId: fromDb?.characterSheetImageId ?? null,
+      useCharacterSheetAsReference: fromDb?.useCharacterSheetAsReference ?? false,
+    });
+  });
+  for (const source of allSources) {
+    if (!sourcesById.has(source.id)) sourcesById.set(source.id, source);
+  }
+
+  const sources = [...sourcesById.values()];
+  const chatIds = new Set(args.chatCharacters.map((character) => character.id));
+  const chatSources = sources.filter((source) => chatIds.has(source.id));
+  const globalSources = sources.filter((source) => !chatIds.has(source.id));
+  const normalizedPromptText = normalizeReferenceName(args.promptText);
+  const requestedNames = args.requestedNames.map((name) => normalizeReferenceName(name)).filter(Boolean);
+  const selected = new Map<string, CharacterReferenceSource>();
+
+  for (const requestedName of requestedNames) {
+    const exactChatMatches = chatSources.filter((source) => normalizeReferenceName(source.name) === requestedName);
+    const chatMatches =
+      exactChatMatches.length > 0
+        ? exactChatMatches
+        : chatSources.filter(
+            (source) =>
+              source.aliases.some((alias) => alias === requestedName || textContainsAlias(requestedName, alias)) ||
+              source.aliases.some((alias) => textContainsAlias(alias, requestedName)),
+          );
+    // Chat aliases are useful for nicknames; outside the chat, require a unique full name.
+    const matches =
+      chatMatches.length > 0
+        ? chatMatches
+        : globalSources.filter((source) => normalizeReferenceName(source.name) === requestedName);
+    if (matches.length === 1) selected.set(matches[0]!.id, matches[0]!);
+  }
+
+  for (const source of chatSources) {
+    if (selected.has(source.id)) continue;
+    if (
+      source.promptAliases.some(
+        (alias) =>
+          textContainsAlias(normalizedPromptText, alias) &&
+          chatSources.filter((candidate) => candidate.promptAliases.includes(alias)).length === 1,
+      )
+    ) {
+      selected.set(source.id, source);
+    }
+  }
+
+  const personaName = args.persona?.name?.trim() ?? "";
+  const personaAliases = personaName ? buildNameAliases(personaName) : [];
+  const personaPromptAliases = personaName ? buildNameAliases(personaName, { includeStandaloneTokens: false }) : [];
+  const personaExplicitlyRequested = requestedNames.some((requestedName) =>
+    personaAliases.some((alias) => alias === requestedName || textContainsAlias(requestedName, alias)),
+  );
+  const personaRequested =
+    personaAliases.length > 0 &&
+    (personaExplicitlyRequested ||
+      (args.includePersonaWhenMentionedInPrompt !== false &&
+        personaPromptAliases.some((alias) => textContainsAlias(normalizedPromptText, alias))));
+
+  if (selected.size === 0 && args.fallbackToChatCharacters === true) {
+    for (const character of args.chatCharacters) {
+      const source = sourcesById.get(character.id);
+      if (source) selected.set(source.id, source);
+    }
+  }
+
+  const orderedSelectedSources = [...selected.values()].sort((a, b) => a.sourceOrder - b.sourceOrder);
+  const orderedSources = orderedSelectedSources.slice(0, maxReferences);
+  const referenceImages: string[] = [];
+  const referenceNames: string[] = [];
+  const appearanceSources: IllustratorReferenceResolution["appearanceSources"] = [];
+  const appearanceNames: string[] = [];
+
+  const pushAppearanceLine = (name: string, appearance: string | null | undefined) => {
+    const trimmed = normalizeIllustratorAppearance(appearance);
+    if (!trimmed || appearanceNames.includes(name)) return;
+    appearanceNames.push(name);
+    appearanceSources.push({ name, appearance: trimmed });
+  };
+
+  for (const source of orderedSources) {
+    pushAppearanceLine(source.name, source.appearance);
+  }
+
+  for (const source of orderedSources) {
+    if (args.includeReferenceImages === false) continue;
+    const b64 = await readBestReferenceImage(source, args.characterGallery);
+    if (!b64) continue;
+    referenceImages.push(b64);
+    referenceNames.push(source.name);
+  }
+
+  if (
+    args.includeReferenceImages !== false &&
+    args.persona &&
+    personaRequested &&
+    referenceImages.length < maxReferences
+  ) {
+    const preferred = args.persona.id
+      ? await readPreferredPersonaReferenceImage({
+          personaId: args.persona.id,
+          avatarPath: args.persona.avatarPath,
+          characterSheetImageId: args.persona.characterSheetImageId,
+          useCharacterSheetAsReference: args.persona.useCharacterSheetAsReference,
+          personaGallery: args.personaGallery,
+        })
+      : null;
+    const fallbackAvatar = preferred ? null : readAvatarBase64(args.persona.avatarPath ?? null);
+    if (preferred?.base64 || fallbackAvatar) {
+      referenceImages.push(preferred?.base64 ?? fallbackAvatar!);
+      referenceNames.push(args.persona.name);
+    }
+  }
+  if (args.persona && personaRequested) {
+    // #7053: personas take the same override-wins rule as characters. Without
+    // this the persona half of `appearanceBlock` (the text appended verbatim to
+    // provider prompts, e.g. Chroma/NanoGPT) kept sending the raw Appearance
+    // prose while the character half sent image tags.
+    pushAppearanceLine(
+      args.persona.name,
+      normalizeIllustratorAppearance(args.persona.appearanceOverride) ?? args.persona.appearance,
+    );
+  }
+
+  return {
+    // Gallery persistence is not constrained by the reference-image cap: every
+    // depicted character should receive the generated image even when only the
+    // first few likeness references can be sent to the provider.
+    characterIds: orderedSelectedSources.map((source) => source.id),
+    personaId: args.persona && personaRequested ? args.persona.id : null,
+    referenceImages,
+    referenceNames,
+    referenceLine:
+      referenceNames.length > 0
+        ? `Attached are reference images of ${referenceNames.join(", ")}. Use them only to preserve character likeness and visual identity; the written scene prompt is authoritative for composition, setting, action, mood, framing, and whether any text appears.`
+        : null,
+    appearanceNames,
+    appearanceSources,
+    // No "Character appearance notes:" header: every consumer appends this straight to an image
+    // prompt, so the label is only ever read by a diffusion model as something to draw.
+    appearanceBlock:
+      appearanceSources.length > 0
+        ? appearanceSources.map(({ name, appearance }) => `${name}'s Appearance: ${appearance}`).join("\n")
+        : null,
+  };
+}

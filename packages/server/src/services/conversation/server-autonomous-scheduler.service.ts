@@ -1,0 +1,507 @@
+import type { FastifyInstance } from "fastify";
+import { logger } from "../../lib/logger.js";
+import { logRateLimited } from "../../lib/log-rate-limit.js";
+import { androidLocalAuthInjectHeaders } from "../../middleware/android-local-auth.js";
+import { createChatsStorage } from "../storage/chats.storage.js";
+import {
+  clearGenerationInProgress,
+  getActivityState,
+  getRecentAutonomousClientPresence,
+} from "./autonomous.service.js";
+import { isIntentOnCooldown, resolveIntent, type MessageIntent } from "./intent.service.js";
+import { getBusyDelay, getEffectiveCurrentStatus, type WeekSchedule } from "./schedule.service.js";
+import { resolveConversationTimeZone, toZonedWallClockDate } from "./timezone.js";
+import type { MultiplayerAutonomy } from "../multiplayer/autonomy.js";
+
+const SERVER_AUTONOMOUS_INITIAL_DELAY_MS = 20_000;
+const SERVER_AUTONOMOUS_POLL_MS = 60_000;
+const RECENT_CLIENT_PRESENCE_MS = 75_000;
+const OFFLINE_MAX_FOLLOWUPS = 2;
+const MAX_SERVER_AUTONOMOUS_CONCURRENT_EVALUATIONS = 2;
+const AUTONOMOUS_FAILURE_BASE_BACKOFF_MS = 5 * 60_000;
+const AUTONOMOUS_FAILURE_MAX_BACKOFF_MS = 60 * 60_000;
+const AUTONOMOUS_HARD_FAILURE_BACKOFF_MS = 30 * 60_000;
+
+type AutonomousFailureBackoff = {
+  attempts: number;
+  nextAllowedAt: number;
+  lastError: string;
+  hardFailure: boolean;
+};
+
+type RawChat = {
+  id: string;
+  mode?: string | null;
+  metadata?: string | Record<string, unknown> | null;
+};
+
+type AutonomousCheckResult = {
+  shouldTrigger?: boolean;
+  characterIds?: string[];
+  reason?: string;
+  inactivityMs?: number;
+  generationStartedAt?: number;
+  autonomousIntentKey?: string;
+};
+
+function resolveAvailableIntent(
+  chatId: string,
+  characterId: string,
+  schedule: WeekSchedule | null,
+  chatMeta: Record<string, unknown>,
+  now: Date,
+): { intent: MessageIntent | null; onCooldown: boolean; disabled: boolean } {
+  if (!schedule) return { intent: null, onCooldown: false, disabled: false };
+
+  const state = getActivityState(chatId);
+  const msSinceUserLastSpoke = state ? Date.now() - state.lastUserMessageAt : 0;
+  const hadUnansweredUserMessage = state ? state.lastUserMessageAt > state.lastAssistantMessageAt : false;
+  const intent = resolveIntent(schedule, msSinceUserLastSpoke, hadUnansweredUserMessage, now);
+
+  return {
+    intent,
+    onCooldown: isIntentOnCooldown(chatMeta, characterId, intent),
+    disabled: intent !== "check_in" && (schedule.disabledAutonomousIntents?.includes(intent) ?? false),
+  };
+}
+
+function parseMetadata(raw: RawChat["metadata"]): Record<string, unknown> {
+  if (!raw) return {};
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  }
+  return raw;
+}
+
+function shouldConsiderChat(chat: RawChat): boolean {
+  if (chat.mode !== "conversation") return false;
+  const meta = parseMetadata(chat.metadata);
+  if (meta.internalAssistant === "professor-mari") return false;
+  if (meta.multiplayerSetup === true && !meta.multiplayer) return false;
+  return meta.autonomousMessages === true && meta.sceneStatus !== "active";
+}
+
+function parseSsePayload(payload: string): { done: boolean; discarded: boolean; saved: boolean; error: string | null } {
+  let done = false;
+  let discarded = false;
+  let saved = false;
+  let error: string | null = null;
+
+  for (const block of payload.split(/\n\n/u)) {
+    const line = block
+      .split(/\n/u)
+      .find((entry) => entry.startsWith("data:"))
+      ?.slice(5)
+      .trim();
+    if (!line) continue;
+    try {
+      const event = JSON.parse(line) as { type?: string; data?: unknown };
+      if (event.type === "done") done = true;
+      if (event.type === "generation_discarded") discarded = true;
+      if (event.type === "message_saved" && (event.data as { role?: unknown } | null)?.role === "assistant") {
+        saved = true;
+      }
+      if (event.type === "error") {
+        error = typeof event.data === "string" ? event.data : "Generation failed";
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return { done, discarded, saved, error };
+}
+
+function isHardGenerationFailure(error: string, statusCode?: number): boolean {
+  if (statusCode !== undefined) {
+    return statusCode >= 400 && statusCode < 500 && statusCode !== 408 && statusCode !== 409 && statusCode !== 429;
+  }
+  return /\b(?:400|401|403|404|405|410|422)\b/u.test(error);
+}
+
+/**
+ * Sweep-gate decisions (#4705), exported pure so the regression suite pins the
+ * state machine against refactors — recording an idle conclusion from a sweep
+ * that didn't evaluate every chat is the dormant-scheduler regression class.
+ */
+export function shouldSkipAutonomousSweep(
+  idleSweepGeneration: number | null,
+  currentGeneration: number | null,
+): boolean {
+  return idleSweepGeneration !== null && currentGeneration !== null && currentGeneration === idleSweepGeneration;
+}
+
+/** Returns the generation to remember as "idle since", or null when the sweep proves nothing. */
+export function concludeAutonomousSweep(args: {
+  inconclusive: boolean;
+  sawEligible: boolean;
+  generation: number | null;
+}): number | null {
+  return !args.inconclusive && !args.sawEligible ? args.generation : null;
+}
+
+export function startServerAutonomousScheduler(app: FastifyInstance, multiplayer?: MultiplayerAutonomy) {
+  const chats = createChatsStorage(app.db);
+  const runningChats = new Set<string>();
+  const failureBackoffByChat = new Map<string, AutonomousFailureBackoff>();
+  let stopped = false;
+  let polling = false;
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const scheduleNext = (delayMs = SERVER_AUTONOMOUS_POLL_MS) => {
+    if (stopped) return;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(() => {
+      void poll();
+    }, delayMs);
+    pollTimer.unref?.();
+  };
+
+  const isChatOnFailureBackoff = (chatId: string) => {
+    const backoff = failureBackoffByChat.get(chatId);
+    if (!backoff) return false;
+    if (Date.now() < backoff.nextAllowedAt) return true;
+    return false;
+  };
+
+  const clearFailureBackoff = (chatId: string) => {
+    failureBackoffByChat.delete(chatId);
+  };
+
+  const recordFailureBackoff = (chatId: string, error: string, statusCode?: number, cause?: unknown) => {
+    const previous = failureBackoffByChat.get(chatId);
+    const attempts = (previous?.attempts ?? 0) + 1;
+    const hardFailure = isHardGenerationFailure(error, statusCode);
+    const delayMs = hardFailure
+      ? Math.min(AUTONOMOUS_FAILURE_MAX_BACKOFF_MS, AUTONOMOUS_HARD_FAILURE_BACKOFF_MS * attempts)
+      : Math.min(
+          AUTONOMOUS_FAILURE_MAX_BACKOFF_MS,
+          AUTONOMOUS_FAILURE_BASE_BACKOFF_MS * 2 ** Math.max(0, attempts - 1),
+        );
+    failureBackoffByChat.set(chatId, {
+      attempts,
+      nextAllowedAt: Date.now() + delayMs,
+      lastError: error,
+      hardFailure,
+    });
+    logger.warn(
+      cause === undefined ? {} : { err: cause },
+      "[autonomous-scheduler] Pausing retries for chat %s for %d seconds after %s failure: %s",
+      chatId,
+      Math.ceil(delayMs / 1000),
+      hardFailure ? "hard" : "transient",
+      error,
+    );
+  };
+
+  const generateAutonomousMessage = async (
+    chatId: string,
+    characterId: string,
+    schedule: WeekSchedule | null,
+    chatMeta: Record<string, unknown>,
+    claimedAt?: number,
+    checkIntentKey?: string,
+  ): Promise<boolean> => {
+    const promptTimeZone = resolveConversationTimeZone(chatMeta);
+    const promptNow = toZonedWallClockDate(new Date(), promptTimeZone);
+    const { intent, onCooldown, disabled } = resolveAvailableIntent(chatId, characterId, schedule, chatMeta, promptNow);
+    if (onCooldown || disabled) {
+      clearGenerationInProgress(chatId, claimedAt);
+      return false;
+    }
+    // Without a schedule only the check knows why this message is due; forwarding it records
+    // the intent's cooldown, so a long-absence check-in is not repeated every poll (#7055).
+    const autonomousIntentKey = intent ?? checkIntentKey ?? "";
+    if (chatMeta.multiplayer) {
+      try {
+        if (!multiplayer || !(await multiplayer.canGenerate(chatId))) return false;
+        const generated = await multiplayer.generate({
+          chatId,
+          characterId,
+          autonomousIntentKey,
+          userTimeZone: promptTimeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
+        });
+        if (generated) {
+          clearFailureBackoff(chatId);
+          await chats.markAutonomousUnread(chatId, { characterId });
+        }
+        return generated;
+      } catch (error) {
+        // Both direct and delayed dispatch use this branch. A declined claim is
+        // normal, but a thrown storage/coordinator failure must not retry each poll.
+        recordFailureBackoff(chatId, error instanceof Error ? error.message : String(error), undefined, error);
+        return false;
+      } finally {
+        clearGenerationInProgress(chatId, claimedAt);
+      }
+    }
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/generate",
+      headers: androidLocalAuthInjectHeaders(),
+      payload: {
+        chatId,
+        connectionId: null,
+        forCharacterId: characterId,
+        streaming: false,
+        userStatus: "idle",
+        userActivity: "away or offline",
+        autonomous: true,
+        skipPresenceDelay: true,
+        autonomousIntentKey,
+        userTimeZone: promptTimeZone,
+      },
+    });
+
+    if (response.statusCode === 409) {
+      clearGenerationInProgress(chatId, claimedAt);
+      return false;
+    }
+
+    if (response.statusCode !== 200) {
+      clearGenerationInProgress(chatId, claimedAt);
+      recordFailureBackoff(chatId, response.payload.slice(0, 300), response.statusCode);
+      logger.warn(
+        "[autonomous-scheduler] Generate failed for chat %s with status %d: %s",
+        chatId,
+        response.statusCode,
+        response.payload.slice(0, 300),
+      );
+      return false;
+    }
+
+    const result = parseSsePayload(response.payload);
+    if (result.error) {
+      clearGenerationInProgress(chatId, claimedAt);
+      recordFailureBackoff(chatId, result.error);
+      logger.warn("[autonomous-scheduler] Generate failed for chat %s: %s", chatId, result.error);
+      return false;
+    }
+    if (!result.done) {
+      clearGenerationInProgress(chatId, claimedAt);
+      logger.warn("[autonomous-scheduler] Generate ended without a done event for chat %s", chatId);
+      return false;
+    }
+
+    // Nothing was saved, e.g. every responder was offline or out of today's check-ins.
+    if (result.discarded || !result.saved) {
+      clearGenerationInProgress(chatId, claimedAt);
+      clearFailureBackoff(chatId);
+      return false;
+    }
+
+    clearFailureBackoff(chatId);
+    await chats.markAutonomousUnread(chatId, { characterId });
+    return true;
+  };
+
+  // Runs after a busy delay on a per-chat timer so the poll loop isn't blocked.
+  // Owns the runningChats slot until it finishes.
+  const scheduleDelayedGeneration = (
+    chatId: string,
+    characterId: string,
+    schedule: WeekSchedule | null,
+    chatMeta: Record<string, unknown>,
+    claimedAt: number | undefined,
+    delayMs: number,
+  ) => {
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          if (stopped) return;
+          if (getRecentAutonomousClientPresence(chatId, RECENT_CLIENT_PRESENCE_MS)) {
+            clearGenerationInProgress(chatId, claimedAt);
+            return;
+          }
+          if (isChatOnFailureBackoff(chatId)) {
+            clearGenerationInProgress(chatId, claimedAt);
+            return;
+          }
+          const generated = await generateAutonomousMessage(chatId, characterId, schedule, chatMeta, claimedAt);
+          if (generated) {
+            logger.info("[autonomous-scheduler] Generated autonomous message for chat %s (after delay)", chatId);
+          }
+        } catch (err) {
+          clearGenerationInProgress(chatId, claimedAt);
+          logger.warn(err, "[autonomous-scheduler] Failed during delayed generation for chat %s", chatId);
+        } finally {
+          runningChats.delete(chatId);
+        }
+      })();
+    }, delayMs);
+    timer.unref?.();
+  };
+
+  const evaluateChat = async (chat: RawChat) => {
+    if (runningChats.has(chat.id)) return;
+    if (isChatOnFailureBackoff(chat.id)) return;
+    const activeGenerations = (app as unknown as { activeGenerations?: Map<string, unknown> }).activeGenerations;
+    if (activeGenerations?.has(chat.id)) return;
+
+    const recentPresence = getRecentAutonomousClientPresence(chat.id, RECENT_CLIENT_PRESENCE_MS);
+    if (recentPresence) return;
+
+    runningChats.add(chat.id);
+    let generationStartedAt: number | undefined;
+    let handedOffToTimer = false;
+    try {
+      if (parseMetadata(chat.metadata).multiplayer && (!multiplayer || !(await multiplayer.canGenerate(chat.id)))) {
+        return;
+      }
+      const checkResponse = await app.inject({
+        method: "POST",
+        url: "/api/conversation/autonomous/check",
+        // Injected requests come from 127.0.0.1, which Android local auth does not trust on its own (#7475).
+        headers: androidLocalAuthInjectHeaders(),
+        payload: {
+          chatId: chat.id,
+          userStatus: "idle",
+          maxFollowups: OFFLINE_MAX_FOLLOWUPS,
+          source: "server",
+        },
+      });
+
+      if (checkResponse.statusCode !== 200) {
+        logger.warn(
+          "[autonomous-scheduler] Eligibility check failed for chat %s with status %d",
+          chat.id,
+          checkResponse.statusCode,
+        );
+        return;
+      }
+
+      const result = JSON.parse(checkResponse.payload) as AutonomousCheckResult;
+      generationStartedAt = result.generationStartedAt;
+      const characterId = result.shouldTrigger ? result.characterIds?.[0] : null;
+      if (!characterId) return;
+
+      const presence = await chats.resolveConversationPresenceState(chat.id);
+      const freshChat = await chats.getById(chat.id);
+      if (!freshChat) return;
+      const freshMeta = parseMetadata(freshChat.metadata);
+      const promptTimeZone = resolveConversationTimeZone(freshMeta);
+      const nowInstant = new Date();
+      const promptNow = toZonedWallClockDate(nowInstant, promptTimeZone);
+      const freshSchedules = presence.schedules;
+      const statusOverrides = presence.statusOverrides;
+      const schedule = freshSchedules[characterId] ?? null;
+
+      if (schedule) {
+        const { status } = getEffectiveCurrentStatus(
+          schedule,
+          statusOverrides[characterId],
+          nowInstant,
+          "free time",
+          promptNow,
+        );
+        if (status === "offline") {
+          clearGenerationInProgress(chat.id, generationStartedAt);
+          return;
+        }
+        const delayMs = getBusyDelay(status, schedule);
+        if (delayMs > 0) {
+          handedOffToTimer = true;
+          scheduleDelayedGeneration(chat.id, characterId, schedule, freshMeta, generationStartedAt, delayMs);
+          return;
+        }
+      }
+
+      const generated = await generateAutonomousMessage(
+        chat.id,
+        characterId,
+        schedule,
+        freshMeta,
+        generationStartedAt,
+        result.autonomousIntentKey,
+      );
+      if (generated) {
+        logger.info("[autonomous-scheduler] Generated autonomous message for chat %s", chat.id);
+      }
+    } catch (err) {
+      clearGenerationInProgress(chat.id, generationStartedAt);
+      // One warning per failure: the backoff line carries the error, and the backoff itself spaces them out.
+      recordFailureBackoff(chat.id, err instanceof Error ? err.message : String(err), undefined, err);
+    } finally {
+      if (!handedOffToTimer) runningChats.delete(chat.id);
+    }
+  };
+
+  // Sweep gate (#4705): when a CONCLUSIVE sweep found no eligible chats and
+  // the chats table hasn't been written since, skip the full list + metadata
+  // parse. Any chats-table write (including enabling autonomous messages from
+  // any device — all writes come through this server, and transaction
+  // rollbacks bump the counter too) re-arms the sweep, so pickup stays within
+  // one poll interval. When the store doesn't expose the counter, the gate
+  // degrades to always sweeping.
+  const readChatsWriteGeneration = (): number | null => {
+    const fileStore = (app.db as { _fileStore?: { getTableWriteGeneration?: (table: string) => number } })._fileStore;
+    const generation = fileStore?.getTableWriteGeneration?.("chats");
+    return typeof generation === "number" ? generation : null;
+  };
+  let idleSweepGeneration: number | null = null;
+  // When each enabled chat was last evaluated, so the concurrency cap takes turns through all of them.
+  let lastEvaluatedAt = new Map<string, number>();
+
+  const poll = async () => {
+    if (stopped || polling) return;
+    polling = true;
+    try {
+      // Capture BEFORE listing: a write that lands mid-sweep bumps the live
+      // generation past this snapshot, so the next poll re-sweeps (safe side).
+      const generation = readChatsWriteGeneration();
+      if (shouldSkipAutonomousSweep(idleSweepGeneration, generation)) {
+        return;
+      }
+      const eligibleChats = ((await chats.list()) as RawChat[]).filter(shouldConsiderChat);
+      // Least recently evaluated first: the list is newest-first, so always starting
+      // at its top let the same chats take every slot while the rest starved (#7055).
+      // Rebuilt from this sweep so deleted or disabled chats are forgotten.
+      lastEvaluatedAt = new Map(eligibleChats.map((chat) => [chat.id, lastEvaluatedAt.get(chat.id) ?? 0]));
+      eligibleChats.sort((a, b) => lastEvaluatedAt.get(a.id)! - lastEvaluatedAt.get(b.id)!);
+      let inconclusive = false;
+      for (const chat of eligibleChats) {
+        if (stopped) {
+          inconclusive = true;
+          break;
+        }
+        if (runningChats.size >= MAX_SERVER_AUTONOMOUS_CONCURRENT_EVALUATIONS) break;
+        lastEvaluatedAt.set(chat.id, Date.now());
+        void evaluateChat(chat);
+      }
+      // Only a sweep that saw EVERY chat may record the none-eligible
+      // conclusion: delayed generations can finish through paths that never
+      // write the chats table, so recording it from an inconclusive sweep
+      // could leave the scheduler dormant with enabled chats (#4705).
+      idleSweepGeneration = concludeAutonomousSweep({
+        inconclusive,
+        sawEligible: eligibleChats.length > 0,
+        generation,
+      });
+    } catch (err) {
+      // The poll repeats every few seconds; a lasting failure logs once a minute with a repeat count.
+      logRateLimited("warn", "autonomous-scheduler:poll", err, "[autonomous-scheduler] Poll failed");
+    } finally {
+      polling = false;
+      scheduleNext();
+    }
+  };
+
+  const stop = () => {
+    stopped = true;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
+  };
+
+  scheduleNext(SERVER_AUTONOMOUS_INITIAL_DELAY_MS);
+  app.addHook("onClose", async () => {
+    stop();
+  });
+
+  logger.info("[autonomous-scheduler] Server-side autonomous scheduler started");
+
+  return { stop };
+}
