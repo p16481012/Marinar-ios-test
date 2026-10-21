@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One fresh-install picker-only comparison without tracing; not the main gate."""
+"""One fresh-install share-then-picker comparison without tracing; not the main gate."""
 import datetime
 import hashlib
 import json
@@ -18,7 +18,7 @@ import urllib.request
 BASE_SHA = "c3ed42954c52c013e8495f5559c022e78fad58aa"
 SOURCE_RUN = 39618057694
 BUNDLE_ID = "com.p16481012.marinar.ios.test"
-TESTS = ["testFilePickerWithoutPriorShare", "testSystemFilesProviderCanOpenFixture"]
+TESTS = ["testBlobDownloadShareAndFilePicker", "testSystemFilesProviderCanOpenFixture"]
 DEBUG_FILES = ["ios-app/App/AppDelegate.swift", "ios-app/App/MarinarViewController.swift"]
 EXPECTED_JSON = '{"fixture":"restored-file-fixture","text":"실제 파일 선택 확인"}'
 
@@ -118,17 +118,17 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     derived = root / "ios-app/build/fresh-picker/DerivedData"
     result = output / "fresh-picker.xcresult"
-    report = {"scope": "fresh-install-picker-only-without-debug-file-tracing", "passed": False,
+    report = {"scope": "fresh-install-share-then-picker-without-debug-file-tracing", "passed": False,
               "sourceCommit": os.environ.get("GITHUB_SHA"), "productionSourceCommit": BASE_SHA,
               "runtimeSourceRun": SOURCE_RUN, "startedAt": now(), "commands": [], "errors": [],
               "coverage": {"chat": False, "fullBackupRestore": False, "largeStreamedBackup": False, "smallBlobByteIntegrity": False,
                            "smallBlobExportAndNativeShare": False, "nativeDialogs": False,
                            "physicalDevice": False, "externalProvider": False},
               "installationPolicy": "No simctl install/launch or API seed; one XCTest session performs the first install",
-              "diagnosticDifference": "Picker-only test performs no preceding export, share or alert; DEBUG MARINARA_TEST_NO_FILE_TRACING=1 selects ordinary UIWindow and disables two file trace writers; FILE_PANEL=1 and DIAGNOSTICS=1 unchanged",
+              "diagnosticDifference": "Original export/share/dialog then picker sequence; dismiss popover once at the center of an observed unobstructed region; DEBUG MARINARA_TEST_NO_FILE_TRACING=1 selects ordinary UIWindow and disables two file trace writers; FILE_PANEL=1 and DIAGNOSTICS=1 unchanged",
               "productionDiffAllowlist": DEBUG_FILES,
-              "limits": ["Independent diagnostic, not the main gate", "No export, share or alert coverage",
-                         "A changed outcome cannot be attributed to instrumentation alone: prior share presentation is also absent"]}
+              "limits": ["Independent diagnostic, not the main gate", "Blob bytes are not claimed without the disabled hash recorder",
+                         "The dismissal input differs from the original automatic edge hit point; this is not a product fix"]}
     device = None
     container = None
     boot_requested = False
@@ -219,7 +219,7 @@ def main():
         report["runtime"] = runtime
         types = json.loads(run(["xcrun", "simctl", "list", "devicetypes", "--json"], "device-types"))["devicetypes"]
         device_type = next(v for v in types if v["name"] == "iPhone 16 Pro")
-        device = run(["xcrun", "simctl", "create", "MarinarPickerOnlyNoTracing", device_type["identifier"], runtime["identifier"]], "create-device").strip()
+        device = run(["xcrun", "simctl", "create", "MarinarShareThenPickerNoTracing", device_type["identifier"], runtime["identifier"]], "create-device").strip()
         assert re.fullmatch(r"[A-F0-9]{8}(?:-[A-F0-9]{4}){3}-[A-F0-9]{12}", device)
         report["deviceID"] = device
         run(["defaults", "write", "com.apple.iphonesimulator", "ConnectHardwareKeyboard", "-bool", "false"], "global-keyboard")
@@ -308,6 +308,8 @@ def main():
                             and evidence.get("actualCancelReturnedToInput") is True
                             and evidence.get("actualFileReaderExactText") is True
                             and evidence.get("quickLookExactJSON") is True)
+        if report.get("tests", {}).get(TESTS[0]) == "passed":
+            report["coverage"].update({"smallBlobExportAndNativeShare": True, "nativeDialogs": True})
         if report["passed"]:
             report["coverage"].update({"actualEmbeddedNodeAndWKWebViewReady": True, "htmlFilePickerCancel": True,
                                        "htmlFilePickerReadText": True, "sameFixtureFilesQuickLookExactText": True})

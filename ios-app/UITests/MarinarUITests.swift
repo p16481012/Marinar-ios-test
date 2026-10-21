@@ -638,9 +638,47 @@ final class MarinarUITests: XCTestCase {
             // family. Use its observed native dismissal region, not a guessed
             // point on the underlying page or an iPad-only assumption.
             XCTAssertTrue(dismissPopup.isHittable, "The popover dismissal region is not available")
-            attachGeometry("\(screenshotName)-dismiss-geometry", elements: [("dismissPopup", dismissPopup),
-                ("popover", app.popovers.firstMatch)])
-            dismissPopup.tap()
+            let popover = app.popovers.firstMatch
+            let webView = app.webViews["marinar-webview"]
+            XCTAssertTrue(popover.exists && webView.exists, "The visible popover and WebView geometry are required")
+            let regionFrame = dismissPopup.frame
+            let visible = regionFrame.intersection(app.frame).intersection(webView.frame)
+            XCTAssertFalse(visible.isNull || visible.isEmpty, "The dismissal region has no visible area inside the app")
+            // The automatic hit point reached the extreme left edge and was
+            // cancelled. Choose one observed exposed rectangle, with margins
+            // from both the popover and the region bounds; do not retry a tap.
+            let excluded = popover.frame.insetBy(dx: -12, dy: -12)
+            let overlap = visible.intersection(excluded)
+            let candidates: [CGRect]
+            if overlap.isNull || overlap.isEmpty {
+                candidates = [visible]
+            } else {
+                candidates = [
+                    CGRect(x: visible.minX, y: visible.minY, width: visible.width, height: overlap.minY - visible.minY),
+                    CGRect(x: visible.minX, y: overlap.maxY, width: visible.width, height: visible.maxY - overlap.maxY),
+                    CGRect(x: visible.minX, y: visible.minY, width: overlap.minX - visible.minX, height: visible.height),
+                    CGRect(x: overlap.maxX, y: visible.minY, width: visible.maxX - overlap.maxX, height: visible.height),
+                ]
+            }
+            guard let exposed = candidates.filter({ $0.width > 16 && $0.height > 16 })
+                .max(by: { $0.width * $0.height < $1.width * $1.height }) else {
+                XCTFail("The popover leaves no visible dismissal rectangle with a safe boundary margin")
+                return
+            }
+            let target = exposed.insetBy(dx: 8, dy: 8)
+            let coordinate = dismissPopup.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+                .withOffset(CGVector(dx: target.midX - regionFrame.minX, dy: target.midY - regionFrame.minY))
+            let point = coordinate.screenPoint
+            attachGeometry("\(screenshotName)-dismiss-geometry", elements: [("app", app), ("webView", webView),
+                ("dismissPopup", dismissPopup), ("popover", popover)])
+            let evidence = XCTAttachment(string: "visible=\(visible), excludedPopover=\(excluded), exposed=\(exposed), target=\(target), screenPoint=\(point)")
+            evidence.name = "\(screenshotName)-dismiss-coordinate"
+            evidence.lifetime = .keepAlways
+            add(evidence)
+            XCTAssertTrue(target.contains(point) && regionFrame.contains(point) && app.frame.contains(point)
+                && webView.frame.contains(point) && visible.contains(point), "The dismissal touch is outside the observed visible region")
+            XCTAssertFalse(excluded.contains(point), "The dismissal touch overlaps the popover or its margin")
+            coordinate.tap()
         } else { XCTFail("The native share UI has no available dismissal action") }
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: filename)
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: save)
