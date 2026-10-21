@@ -603,6 +603,9 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
             return
         }
         sharing = true
+        // Keep a popover dismissal touch from reaching a web control behind it.
+        // UIKit's passthrough setting alone can still allow this during transitions.
+        webView.isUserInteractionEnabled = false
         recordExportEventIfNeeded("share-presenting")
         let url = pendingShares.removeFirst()
         let share = UIActivityViewController(activityItems: [url], applicationActivities: nil)
@@ -617,6 +620,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
             try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                 self?.sharing = false
+                self?.webView.isUserInteractionEnabled = true
                 if let error = error { self?.showExportError(error.localizedDescription) }
                 self?.presentNextShare()
             }
