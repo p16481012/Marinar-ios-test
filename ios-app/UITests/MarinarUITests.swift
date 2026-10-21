@@ -4,6 +4,7 @@ import UIKit
 final class MarinarUITests: XCTestCase {
     private let app = XCUIApplication()
     private var systemFilesApp: XCUIApplication?
+    private var moreTouchRetryUsed = false
     private let prompt = "[IOS_STREAM_TEST] Hello. Please remember the blue lantern."
     private let reply = "The blue lantern is remembered."
 
@@ -162,7 +163,11 @@ final class MarinarUITests: XCTestCase {
     func testSettingsFullBackupRestoresAfterProcessRelaunch() throws {
         app.terminate()
         app.launchEnvironment["MARINARA_TEST_SETTINGS_RESTORE"] = "1"
-        defer { app.launchEnvironment.removeValue(forKey: "MARINARA_TEST_SETTINGS_RESTORE") }
+        app.launchEnvironment["MARINARA_TEST_MORE_TOUCH_TRACE"] = "1"
+        defer {
+            app.launchEnvironment.removeValue(forKey: "MARINARA_TEST_SETTINGS_RESTORE")
+            app.launchEnvironment.removeValue(forKey: "MARINARA_TEST_MORE_TOUCH_TRACE")
+        }
         launchReady()
         _ = prepareComposerForInput()
         openSettingsBackupSection()
@@ -265,11 +270,110 @@ final class MarinarUITests: XCTestCase {
         return elements.firstMatch
     }
 
+    private struct MoreTouchSnapshot: Decodable {
+        struct Gesture: Decodable {
+            let sequence: Int
+            let maxDistance: Double
+            let trusted, sameTarget, unknown, opened: Bool
+            let pointerdown, pointerup, pointercancel, touchstart, touchend, touchcancel, click: Int
+        }
+        let version, sequence: Int
+        let targetPresent, targetStable, open: Bool
+        let current: Gesture?
+
+        var permitsSingleRedelivery: Bool {
+            guard let gesture = current else { return false }
+            return version == 1 && sequence == 1 && gesture.sequence == sequence
+                && targetPresent && targetStable && !open && !gesture.opened
+                && gesture.trusted && gesture.sameTarget && !gesture.unknown
+                && gesture.maxDistance == 0
+                && gesture.pointerdown == 1 && gesture.touchstart == 1
+                && gesture.pointercancel == 1 && gesture.touchcancel == 1
+                && gesture.pointerup == 0 && gesture.touchend == 0 && gesture.click == 0
+        }
+    }
+
+    private func openMoreMenuWithObservedTouch() {
+        let web = app.webViews["marinar-webview"]
+        let prefix = "Marinar More touch: "
+        // Use a predicate, not an identifier subscript: JSON labels can exceed
+        // XCTest's 128-character identifier-query limit.
+        let trace = web.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", prefix)).firstMatch
+        func snapshot() -> MoreTouchSnapshot? {
+            guard trace.exists, trace.label.hasPrefix(prefix),
+                  let data = String(trace.label.dropFirst(prefix.count)).data(using: .utf8) else { return nil }
+            return try? JSONDecoder().decode(MoreTouchSnapshot.self, from: data)
+        }
+        func settingsVisible() -> Bool {
+            web.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "Settings"))
+                .allElementsBoundByIndex.contains { $0.elementType != .staticText && $0.isEnabled && $0.isHittable }
+        }
+        func evidence(_ name: String) {
+            attachScreen(name)
+            let attachment = XCTAttachment(string: trace.exists ? trace.label : "More passive trace missing")
+            attachment.name = "\(name)-touch-trace"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        func tapObservedCenter(_ suffix: String) {
+            let more = hittableWebElement(named: "More")
+            // Use whole screen points so PointerEvent and Touch coordinates
+            // can be compared without introducing a fractional tap position.
+            let center = CGPoint(x: more.frame.midX.rounded(), y: more.frame.midY.rounded())
+            let visible = app.frame.intersection(web.frame)
+            XCTAssertTrue(more.frame.width > 0 && more.frame.height > 0
+                && center.x.isFinite && center.y.isFinite && visible.contains(center)
+                && more.frame.contains(center), "The observed More center is outside the app's visible WebView")
+            attachGeometry("settings-more-\(suffix)-geometry", elements: [("app", app), ("webView", web), ("more", more)])
+            app.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: center.x - app.frame.minX, dy: center.y - app.frame.minY)).tap()
+        }
+
+        XCTAssertTrue(trace.waitForExistence(timeout: 15), "The DEBUG passive More trace was not installed")
+        guard let initial = snapshot(), initial.version == 1, initial.sequence == 0,
+              initial.current == nil, initial.targetPresent, initial.targetStable, !initial.open else {
+            evidence("settings-more-invalid-initial-state")
+            XCTFail("More was already interacted with or its initial state is unknown")
+            return
+        }
+        evidence("settings-more-before-first-tap")
+        tapObservedCenter("first-tap")
+        let opened = NSPredicate { _, _ in settingsVisible() }
+        let result = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: opened, object: app)], timeout: 20)
+        if result == .completed { return }
+        evidence("settings-more-first-tap-failed")
+        // Retry at most once in this entire test, only for a stationary,
+        // trusted touch cancelled before any click or menu opening. A moved,
+        // wrong-target, unknown or delivered click remains a test failure.
+        guard result == .timedOut, !moreTouchRetryUsed, !settingsVisible(),
+              snapshot()?.permitsSingleRedelivery == true else {
+            XCTFail("Settings did not appear and the first More touch is not safely retryable")
+            return
+        }
+        let hierarchy = XCTAttachment(string: app.debugDescription)
+        hierarchy.name = "settings-more-cancelled-before-redelivery-hierarchy"
+        hierarchy.lifetime = .keepAlways
+        add(hierarchy)
+        // Recheck after collecting evidence, so a late click cannot cause a
+        // second tap that closes a menu which has meanwhile opened.
+        guard !settingsVisible(), snapshot()?.permitsSingleRedelivery == true else {
+            if settingsVisible() { return }
+            XCTFail("More changed state before the proposed cancelled-touch redelivery")
+            return
+        }
+        moreTouchRetryUsed = true
+        tapObservedCenter("single-redelivery")
+        let retried = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: opened, object: app)], timeout: 20)
+        evidence("settings-more-after-single-redelivery")
+        XCTAssertEqual(retried, .completed, "Settings did not appear after one evidenced cancelled-touch redelivery")
+    }
+
+
     private func openSettingsBackupSection() {
         let web = app.webViews["marinar-webview"]
         let settings = web.buttons["Settings"].firstMatch
         if !(settings.exists && settings.isEnabled && settings.isHittable) {
-            hittableWebElement(named: "More").tap()
+            openMoreMenuWithObservedTouch()
         }
         hittableWebElement(named: "Settings").tap()
         hittableWebElement(named: "Advanced").tap()

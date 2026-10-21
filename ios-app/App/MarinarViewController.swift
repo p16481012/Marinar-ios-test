@@ -295,6 +295,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
                 self.webView.accessibilityValue = "ready"
                 #if DEBUG
                 self.prepareSettingsRestoreFixtureIfNeeded()
+                self.installMoreTouchDiagnosticsIfNeeded()
                 #endif
                 self.installFileDiagnosticsIfNeeded()
                 self.recordRestoreDiagnosticsIfNeeded()
@@ -749,6 +750,92 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         }
         #endif
     }
+
+    #if DEBUG
+    private func installMoreTouchDiagnosticsIfNeeded() {
+        guard ProcessInfo.processInfo.environment["MARINARA_TEST_MORE_TOUCH_TRACE"] == "1" else { return }
+        let script = """
+        (() => {
+          if (document.getElementById('ios-more-touch-trace')) return;
+          const output = document.createElement('p');
+          output.id = 'ios-more-touch-trace';
+          output.style = 'position:fixed;left:8px;bottom:2px;right:8px;height:12px;overflow:hidden;font-size:8px;line-height:12px;z-index:2147483647;pointer-events:none';
+          document.body.append(output);
+          let sequence = 0, current = null, trigger = null, queued = false;
+          const button = () => document.querySelector('button[data-topbar-more]');
+          const opened = () => button()?.getAttribute('aria-expanded') === 'true'
+            || !!document.querySelector('[data-component="TopbarMoreMenu"][role="menu"]');
+          const publish = () => {
+            queued = false;
+            if (current && opened()) current.opened = true;
+            output.textContent = 'Marinar More touch: ' + JSON.stringify({
+              version: 1, sequence, targetPresent: !!button(),
+              targetStable: !current || (button() === trigger && trigger.isConnected),
+              open: opened(), current
+            });
+          };
+          const schedule = () => {
+            if (!queued) { queued = true; queueMicrotask(publish); }
+          };
+          // Observe only test metadata. Never dispatch events, call a product
+          // handler, prevent defaults, capture a pointer, or change app state.
+          let observedButton = button();
+          const observer = new MutationObserver(records => {
+            const next = button();
+            let changed = next !== observedButton;
+            if (current) {
+              const removed = records.some(r => Array.from(r.removedNodes).some(n => n === trigger || n.contains(trigger)));
+              if ((next !== trigger || removed) && !current.unknown) { current.unknown = true; changed = true; }
+              const attributes = records.filter(r => r.type === 'attributes' && r.target === trigger);
+              if (attributes.length) {
+                if (opened() || attributes.some(r => r.oldValue === 'true')) current.opened = true;
+                changed = true;
+              }
+            }
+            observedButton = next;
+            if (changed) schedule();
+          });
+          observer.observe(document.body, {childList:true, subtree:true, attributes:true,
+            attributeFilter:['aria-expanded'], attributeOldValue:true});
+          const types = ['pointerdown', 'pointermove', 'pointerup', 'pointercancel',
+                         'touchstart', 'touchmove', 'touchend', 'touchcancel', 'click'];
+          for (const type of types) document.addEventListener(type, event => {
+            const target = event.target instanceof Element ? event.target.closest('button[data-topbar-more]') : null;
+            if (type === 'pointerdown' && target) {
+              trigger = target;
+              current = {sequence: ++sequence, pointerId:event.pointerId, touchId:null,
+                x:event.clientX, y:event.clientY, maxDistance:0, trusted:true, sameTarget:true,
+                unknown:false, opened:opened(), pointerdown:0, pointerup:0, pointercancel:0,
+                touchstart:0, touchend:0, touchcancel:0, click:0, events:[]};
+            }
+            if (!current) return;
+            if (target !== trigger) current.sameTarget = false;
+            if (!event.isTrusted) current.trusted = false;
+            let point = event;
+            if (type.startsWith('pointer')) {
+              if (event.pointerId !== current.pointerId || event.pointerType !== 'touch' || !event.isPrimary) current.unknown = true;
+            } else if (type.startsWith('touch')) {
+              if (event.changedTouches.length !== 1 || (event.touches.length !== 1 && !['touchend', 'touchcancel'].includes(type))) current.unknown = true;
+              point = event.changedTouches[0];
+              if (type === 'touchstart' && point) current.touchId = point.identifier;
+              if (!point || point.identifier !== current.touchId) current.unknown = true;
+            }
+            if (!point || !Number.isFinite(point.clientX) || !Number.isFinite(point.clientY)) current.unknown = true;
+            else current.maxDistance = Math.max(current.maxDistance, Math.hypot(point.clientX-current.x, point.clientY-current.y));
+            if (Object.hasOwn(current, type)) current[type]++;
+            if (current.events.length < 16) current.events.push({
+              type, x:point?.clientX ?? null, y:point?.clientY ?? null,
+              sameTarget:target === trigger, trusted:event.isTrusted
+            }); else current.unknown = true;
+            schedule();
+          }, {capture:true, passive:true});
+          publish();
+        })();
+        """
+        webView.evaluateJavaScript(script, completionHandler: nil)
+    }
+    #endif
+
 
     #if DEBUG
     private func prepareSettingsRestoreFixtureIfNeeded() {
