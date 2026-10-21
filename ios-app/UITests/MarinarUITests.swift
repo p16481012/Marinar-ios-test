@@ -12,6 +12,7 @@ final class MarinarUITests: XCTestCase {
         XCUIDevice.shared.orientation = .portrait
         app.launchArguments = ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchEnvironment["MARINARA_TEST_DIAGNOSTICS"] = "1"
+        app.launchEnvironment["MARINARA_TEST_MODERN_FILE_PICKER"] = "1"
     }
 
     override func tearDownWithError() throws {

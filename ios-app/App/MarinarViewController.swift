@@ -1,6 +1,9 @@
 import UIKit
 import WebKit
 import CryptoKit
+#if DEBUG
+import UniformTypeIdentifiers
+#endif
 
 final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, UIPopoverPresentationControllerDelegate {
     private var configuration: RuntimeConfiguration?
@@ -19,6 +22,9 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     private var testSelectionInstalled = false
     #if DEBUG
     private var testImportFixtureFilename: String?
+    private var diagnosticFilePicker: UIDocumentPickerViewController?
+    private var diagnosticFileCompletion: (@MainActor @Sendable ([URL]?) -> Void)?
+    private var diagnosticFileRequestID: String?
     #endif
     private var elapsed: TimeInterval = 0
     private var lastPoll = Date()
@@ -289,6 +295,9 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        #if DEBUG
+        if let picker = diagnosticFilePicker { finishDiagnosticPicker(picker, urls: nil, reason: "web-process-terminated") }
+        #endif
         guard !terminalFailure else { return }
         loaded = false
         overlay.isHidden = false
@@ -342,6 +351,76 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     private func canPresentDialog(from frame: WKFrameInfo) -> Bool {
         active && presentedViewController == nil && frame.isMainFrame && frame.request.url.map(isLocal) == true
     }
+
+    #if DEBUG
+    // Advertise the public optional callback only for this explicit diagnostic.
+    // Ordinary Debug launches keep WebKit's default file upload implementation.
+    override func responds(to aSelector: Selector!) -> Bool {
+        if #available(iOS 18.4, *),
+           aSelector == #selector(webView(_:runOpenPanelWith:initiatedByFrame:completionHandler:)) {
+            return ProcessInfo.processInfo.environment["MARINARA_TEST_MODERN_FILE_PICKER"] == "1"
+                && ProcessInfo.processInfo.environment["MARINARA_TEST_FILE_PANEL"] == "1"
+        }
+        return super.responds(to: aSelector)
+    }
+
+    @available(iOS 18.4, *)
+    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
+                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping @MainActor @Sendable ([URL]?) -> Void) {
+        let requestID = UUID().uuidString
+        let enabled = ProcessInfo.processInfo.environment["MARINARA_TEST_MODERN_FILE_PICKER"] == "1"
+            && ProcessInfo.processInfo.environment["MARINARA_TEST_FILE_PANEL"] == "1"
+        let origin = frame.securityOrigin
+        let local = frame.isMainFrame && frame.request.url.map(isLocal) == true
+            && origin.protocol == "http" && origin.host == "127.0.0.1" && origin.port == configuration?.port
+            && webView === self.webView && webView.url.map(isLocal) == true
+        recordExportEventIfNeeded("modern-open-panel-requested", fields: ["requestID": requestID,
+            "mainFrame": frame.isMainFrame, "localOrigin": local, "enabled": enabled,
+            "allowsMultiple": parameters.allowsMultipleSelection, "allowsDirectories": parameters.allowsDirectories])
+        guard enabled, local, active, viewIfLoaded?.window != nil, presentedViewController == nil,
+              diagnosticFilePicker == nil, diagnosticFileCompletion == nil,
+              !parameters.allowsMultipleSelection, !parameters.allowsDirectories else {
+            recordExportEventIfNeeded("modern-open-panel-completed", fields: ["requestID": requestID,
+                "reason": "rejected", "returnedCount": 0, "returnedNil": true])
+            completionHandler(nil)
+            return
+        }
+        // JSON is the single diagnostic fixture type, not a production import policy.
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.json], asCopy: true)
+        picker.allowsMultipleSelection = false
+        picker.delegate = self
+        diagnosticFilePicker = picker
+        diagnosticFileCompletion = completionHandler
+        diagnosticFileRequestID = requestID
+        picker.presentationController?.delegate = self
+        present(picker, animated: true) { [weak self, weak picker] in
+            picker?.presentationController?.delegate = self
+            self?.recordExportEventIfNeeded("modern-open-panel-presented", fields: ["requestID": requestID, "asCopy": true])
+        }
+    }
+
+    private func finishDiagnosticPicker(_ picker: UIDocumentPickerViewController, urls: [URL]?, reason: String) {
+        guard picker === diagnosticFilePicker, let completion = diagnosticFileCompletion,
+              let requestID = diagnosticFileRequestID else {
+            recordExportEventIfNeeded("modern-open-panel-duplicate-callback", fields: ["reason": reason])
+            return
+        }
+        // Consume first: UIKit cancellation/dismissal callbacks cannot deliver twice.
+        diagnosticFileCompletion = nil
+        picker.delegate = nil
+        picker.presentationController?.delegate = nil
+        let deliver: @MainActor @Sendable () -> Void = { [weak self] in
+            self?.diagnosticFilePicker = nil
+            self?.diagnosticFileRequestID = nil
+            self?.recordExportEventIfNeeded("modern-open-panel-completed", fields: ["requestID": requestID,
+                "reason": reason, "returnedCount": urls?.count ?? 0, "returnedNil": urls == nil])
+            completion(urls)
+            self?.presentNextShare()
+        }
+        if picker.presentingViewController != nil { picker.dismiss(animated: true, completion: deliver) }
+        else { deliver() }
+    }
+    #endif
 
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
         guard canPresentDialog(from: frame) else { completionHandler(); return }
@@ -770,3 +849,35 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         #endif
     }
 }
+
+#if DEBUG
+extension MarinarViewController: UIDocumentPickerDelegate {
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        finishDiagnosticPicker(controller, urls: nil, reason: "cancel")
+    }
+
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        guard let picker = presentationController.presentedViewController as? UIDocumentPickerViewController else { return }
+        finishDiagnosticPicker(picker, urls: nil, reason: "dismissed")
+    }
+
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        guard controller === diagnosticFilePicker, let requestID = diagnosticFileRequestID,
+              urls.count == 1, let url = urls.first, url.isFileURL,
+              url.pathExtension.lowercased() == "json", url.lastPathComponent == testImportFixtureFilename,
+              webView.url.map(isLocal) == true else {
+            finishDiagnosticPicker(controller, urls: nil, reason: "invalid-selection")
+            return
+        }
+        var fields: [String: Any] = ["requestID": requestID, "filename": url.lastPathComponent,
+            "returnedURLCount": urls.count, "isFileURL": url.isFileURL]
+        if let bytes = try? Data(contentsOf: url) {
+            fields["bytes"] = bytes.count
+            fields["sha256"] = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        }
+        recordExportEventIfNeeded("modern-open-panel-picked", fields: fields)
+        // Pass UIKit's real copied file URL unchanged. WebKit owns reading the File.
+        finishDiagnosticPicker(controller, urls: urls, reason: "selected")
+    }
+}
+#endif

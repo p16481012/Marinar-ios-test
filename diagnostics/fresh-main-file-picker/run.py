@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One fresh-install file diagnostic of the real Marinar app; not the main validation gate."""
+"""One DEBUG modern-WebKit-picker diagnostic; not the main validation gate."""
 import datetime
 import hashlib
 import json
@@ -19,6 +19,58 @@ BASE_SHA = "c3ed42954c52c013e8495f5559c022e78fad58aa"
 SOURCE_RUN = 39618057694
 BUNDLE_ID = "com.p16481012.marinar.ios.test"
 TESTS = ["testBlobDownloadShareAndFilePicker", "testSystemFilesProviderCanOpenFixture"]
+CONTROLLER = "ios-app/App/MarinarViewController.swift"
+
+
+def release_source(source):
+    """Strip DEBUG-only regions, rejecting ambiguous preprocessing changes."""
+    lines = []
+    depth = 0
+    for line in source.splitlines():
+        directive = line.strip()
+        if directive.startswith("#if "):
+            if depth == 0 and directive != "#if DEBUG":
+                raise ValueError("Unexpected non-DEBUG source condition")
+            depth += 1
+        elif directive == "#endif":
+            if depth == 0:
+                raise ValueError("Unmatched source condition")
+            depth -= 1
+        elif directive.startswith(("#else", "#elseif")):
+            raise ValueError("Ambiguous DEBUG else branch")
+        elif depth == 0 and line.strip():
+            lines.append(line)
+    if depth:
+        raise ValueError("Unclosed source condition")
+    # DEBUG blocks add separators only; every nonblank Release source line must match.
+    return "\n".join(lines)
+
+
+def modern_picker_evidence(events, filename):
+    requests = [v for v in events if v.get("event") == "modern-open-panel-requested"]
+    presented = [v for v in events if v.get("event") == "modern-open-panel-presented"]
+    completed = [v for v in events if v.get("event") == "modern-open-panel-completed"]
+    picked = [v for v in events if v.get("event") == "modern-open-panel-picked"]
+    duplicates = [v for v in events if v.get("event") == "modern-open-panel-duplicate-callback"]
+    ids = [v.get("requestID") for v in requests]
+    expected = '{"fixture":"restored-file-fixture","text":"실제 파일 선택 확인"}'.encode()
+    verified = (len(ids) == 2 and all(isinstance(v, str) and v for v in ids) and len(set(ids)) == 2
+                and len(presented) == len(completed) == 2 and len(picked) == 1 and not duplicates
+                and all(v.get("enabled") is True and v.get("mainFrame") is True and v.get("localOrigin") is True
+                        and v.get("allowsMultiple") is False and v.get("allowsDirectories") is False for v in requests)
+                and [v.get("requestID") for v in presented] == ids
+                and [v.get("requestID") for v in completed] == ids
+                and all(v.get("asCopy") is True for v in presented)
+                and completed[0].get("reason") in ["cancel", "dismissed"]
+                and completed[0].get("returnedNil") is True and completed[0].get("returnedCount") == 0
+                and completed[1].get("reason") == "selected"
+                and completed[1].get("returnedNil") is False and completed[1].get("returnedCount") == 1
+                and picked[0].get("requestID") == ids[1] and picked[0].get("filename") == filename
+                and picked[0].get("returnedURLCount") == 1 and picked[0].get("isFileURL") is True
+                and picked[0].get("bytes") == len(expected)
+                and picked[0].get("sha256") == hashlib.sha256(expected).hexdigest())
+    return {"verified": verified, "requests": requests, "presented": presented,
+            "completed": completed, "picked": picked, "duplicateCallbacks": duplicates}
 
 
 def now():
@@ -33,12 +85,15 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     derived = root / "ios-app/build/fresh-picker/DerivedData"
     result = output / "fresh-picker.xcresult"
-    report = {"scope": "fresh-install-native-file-path-only", "passed": False,
+    report = {"scope": "debug-public-modern-webkit-picker-only", "passed": False,
               "sourceCommit": os.environ.get("GITHUB_SHA"), "productionSourceCommit": BASE_SHA,
               "runtimeSourceRun": SOURCE_RUN, "startedAt": now(), "commands": [], "errors": [],
               "coverage": {"chat": False, "fullBackupRestore": False, "largeStreamedBackup": False,
                            "physicalDevice": False, "externalProvider": False},
-              "installationPolicy": "No simctl install/launch or API seed; one XCTest session performs the first install"}
+              "installationPolicy": "No simctl install/launch or API seed; one XCTest session performs the first install",
+              "diagnosticDifference": "DEBUG env-gated public WKUIDelegate callback; modern JSON document picker asCopy=true",
+              "productionDiffAllowlist": [CONTROLLER],
+              "limits": ["JSON diagnostic fixture only; no production picker claim", "No large asset seed or streamed full-backup export"]}
     device = None
     boot_requested = False
 
@@ -86,7 +141,14 @@ def main():
         assert provenance["id"] == SOURCE_RUN and provenance["head_sha"] == BASE_SHA
         assert any(v["name"] == "Build and test packaged server" and v["conclusion"] == "success" for v in jobs)
         run(["git", "diff", "--exit-code", BASE_SHA, "--", "ios-app/App", "ios-app/Marinar.xcodeproj",
-             "ios-app/Info.plist", "ios-app/scripts", "packages"], "production-source-identical")
+             "ios-app/Info.plist", "ios-app/scripts", "packages", f":(exclude){CONTROLLER}"], "production-source-identical-except-debug-controller")
+        baseline = run(["git", "show", f"{BASE_SHA}:{CONTROLLER}"], "baseline-controller")
+        current = (root / CONTROLLER).read_text(encoding="utf-8")
+        baseline_release, current_release = release_source(baseline), release_source(current)
+        assert baseline_release == current_release, "Controller changes must exist only inside DEBUG regions"
+        run(["git", "diff", BASE_SHA, "--", CONTROLLER], "debug-controller-diff")
+        report["controllerReleaseSourceVerified"] = {"identical": True, "normalization": "DEBUG regions and blank lines removed",
+                                                     "sha256": hashlib.sha256(current_release.encode()).hexdigest()}
         runtime_root = root / "ios-app/Resources/runtime"
         manifest = json.loads((runtime_root / "runtime-manifest.json").read_text())
         canonical = ""
@@ -116,7 +178,7 @@ def main():
         report["runtime"] = runtime
         types = json.loads(run(["xcrun", "simctl", "list", "devicetypes", "--json"], "device-types"))["devicetypes"]
         device_type = next(v for v in types if v["name"] == "iPhone 16 Pro")
-        device = run(["xcrun", "simctl", "create", "MarinarFreshFilePicker", device_type["identifier"], runtime["identifier"]], "create-device").strip()
+        device = run(["xcrun", "simctl", "create", "MarinarModernWebKitPicker", device_type["identifier"], runtime["identifier"]], "create-device").strip()
         assert re.fullmatch(r"[A-F0-9]{8}(?:-[A-F0-9]{4}){3}-[A-F0-9]{12}", device)
         report["deviceID"] = device
         run(["defaults", "write", "com.apple.iphonesimulator", "ConnectHardwareKeyboard", "-bool", "false"], "global-keyboard")
@@ -205,17 +267,20 @@ def main():
                              and downloads[0].get("sha256") == hashlib.sha256(expected).hexdigest())
             report["nativeEvidence"] = {"sameVerifiedFixtureReused": fixture_verified, "smallBlobBytesMatch": blob_verified,
                                         "fixtureFilename": created[0].get("filename") if created else None}
+            report["modernPickerEvidence"] = modern_picker_evidence(events, report["nativeEvidence"]["fixtureFilename"])
         except (ValueError, OSError, TypeError, KeyError) as error:
             report["nativeEvidenceError"] = type(error).__name__
         evidence = report.get("nativeEvidence", {})
         report["passed"] = (report.get("xcodebuildSucceeded", False)
                             and all(report.get("tests", {}).get(name) == "passed" for name in TESTS)
                             and evidence.get("sameVerifiedFixtureReused") is True
-                            and evidence.get("smallBlobBytesMatch") is True)
+                            and evidence.get("smallBlobBytesMatch") is True
+                            and report.get("modernPickerEvidence", {}).get("verified") is True)
         if report["passed"]:
             report["coverage"].update({"actualEmbeddedNodeAndWKWebViewReady": True, "htmlFilePickerCancel": True,
                                        "htmlFilePickerReadText": True, "sameFixtureFilesQuickLookExactText": True,
-                                       "smallBlobExportAndNativeShare": True, "nativeDialogs": True})
+                                       "smallBlobExportAndNativeShare": True, "nativeDialogs": True,
+                                       "publicModernPickerActualURLsAndWebKitFileText": True})
         if device:
             if boot_requested:
                 run(["xcrun", "simctl", "shutdown", device], "shutdown-device", required=False)
