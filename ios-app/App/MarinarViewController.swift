@@ -19,6 +19,15 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     private var testSelectionInstalled = false
     #if DEBUG
     private var testImportFixtureFilename: String?
+    // Test outputs and configuration stay outside the user-visible Documents
+    // provider. Preserve them across app launches for independent host checks.
+    private static let diagnosticsDirectory: URL = {
+        let manager = FileManager.default
+        let directory = manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("Diagnostics", isDirectory: true)
+        try? manager.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }()
     #endif
     private var elapsed: TimeInterval = 0
     private var lastPoll = Date()
@@ -240,6 +249,10 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         request.setValue(configuration.token, forHTTPHeaderField: "x-marinara-ios-token")
         request.setValue(configuration.origin.absoluteString, forHTTPHeaderField: "Origin")
         request.setValue("1", forHTTPHeaderField: "x-marinara-csrf")
+        #if DEBUG
+        let backgroundDiagnostics = ProcessInfo.processInfo.environment["MARINARA_TEST_DIAGNOSTICS"] == "1"
+            ? MarinarViewController.diagnosticsDirectory : nil
+        #endif
         session.dataTask(with: request) { [weak self] data, response, error in
             // Do not claim success on a transport/server error. Regular server
             // persistence still applies, but this flush is only best effort.
@@ -253,12 +266,11 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
                 NSLog("[Marinar] Background flush did not complete")
             }
             #if DEBUG
-            if ProcessInfo.processInfo.environment["MARINARA_TEST_DIAGNOSTICS"] == "1" {
+            if let diagnostics = backgroundDiagnostics {
                 let result: [String: Any] = ["succeeded": error == nil && responseCode == 200,
                                            "status": responseCode, "maintenance": maintenance]
-                let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
                 if let json = try? JSONSerialization.data(withJSONObject: result) {
-                    try? json.write(to: documents.appendingPathComponent("ios-background-flush-result.json"), options: .atomic)
+                    try? json.write(to: diagnostics.appendingPathComponent("ios-background-flush-result.json"), options: .atomic)
                 }
             }
             #endif
@@ -480,6 +492,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
 
     #if DEBUG
     func recordNativeTouchIfNeeded(_ fields: [String: Any]) {
+        guard ProcessInfo.processInfo.environment["MARINARA_TEST_NATIVE_TOUCH_TRACE"] == "1" else { return }
         recordExportEventIfNeeded("native-touch", fields: fields)
     }
     #endif
@@ -489,8 +502,8 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         guard ProcessInfo.processInfo.environment["MARINARA_TEST_FILE_PANEL"] == "1" else { return }
         // Keep URLs, credentials, user filenames and server response bodies out
         // of this artifact. Test fixture names, stages and native touches are safe diagnostics.
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let file = documents.appendingPathComponent("ios-export-events.json")
+        let diagnostics = MarinarViewController.diagnosticsDirectory
+        let file = diagnostics.appendingPathComponent("ios-export-events.json")
         var events = (try? Data(contentsOf: file)).flatMap {
             (try? JSONSerialization.jsonObject(with: $0)) as? [[String: Any]]
         } ?? []
@@ -518,8 +531,8 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         #if DEBUG
         if ProcessInfo.processInfo.environment["MARINARA_TEST_DIAGNOSTICS"] == "1" {
             diagnostic = "window.__MARINARA_RESTORE_TEST__ = {restoreID, skipped, removedKeys, remainingKeys: skipped ? [] : keys.filter(key => localStorage.getItem(key) !== null)};"
-            let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-            let fixtureURL = documents.appendingPathComponent("ios-restore-cache-fixture.json")
+            let diagnostics = MarinarViewController.diagnosticsDirectory
+            let fixtureURL = diagnostics.appendingPathComponent("ios-restore-cache-fixture.json")
             if let data = try? Data(contentsOf: fixtureURL),
                let fixture = (try? JSONSerialization.jsonObject(with: data)) as? [String: String],
                let encoded = try? JSONSerialization.data(withJSONObject: fixture),
@@ -554,10 +567,10 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
     private func recordRestoreDiagnosticsIfNeeded() {
         #if DEBUG
         guard ProcessInfo.processInfo.environment["MARINARA_TEST_DIAGNOSTICS"] == "1" else { return }
+        let diagnostics = MarinarViewController.diagnosticsDirectory
         webView.evaluateJavaScript("window.__MARINARA_RESTORE_TEST__ ?? null") { value, _ in
             guard let value = value as? [String: Any], let data = try? JSONSerialization.data(withJSONObject: value) else { return }
-            let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-            try? data.write(to: documents.appendingPathComponent("ios-restore-cache-result.json"), options: .atomic)
+            try? data.write(to: diagnostics.appendingPathComponent("ios-restore-cache-result.json"), options: .atomic)
         }
         #endif
     }
@@ -615,7 +628,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
             }
         }
         guard let fixtureFilename = testImportFixtureFilename else { return }
-        let options = (try? Data(contentsOf: documents.appendingPathComponent("ios-file-test-config.json"))).flatMap {
+        let options = (try? Data(contentsOf: MarinarViewController.diagnosticsDirectory.appendingPathComponent("ios-file-test-config.json"))).flatMap {
             (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any]
         } ?? [:]
         let prepareBackup = options["prepareBackup"] as? Bool == true && !filesControl
@@ -713,7 +726,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         } catch { return }
         let result: [String: Any] = ["filename": url.lastPathComponent, "size": size,
             "sha256": hash.finalize().map { String(format: "%02x", $0) }.joined()]
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let diagnostics = MarinarViewController.diagnosticsDirectory
         if url.pathExtension == "zip", size >= 16 * 1024 * 1024 {
             // Preserve both sides of this DEBUG fixture transfer. The host
             // independently hashes them after XCTest restarts the app again.
@@ -722,13 +735,13 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
             let source = archives.first { $0.lastPathComponent == url.lastPathComponent } ?? (archives.count == 1 ? archives.first : nil)
             if let source = source {
                 for (from, name) in [(source, "ios-streamed-source.zip"), (url, "ios-streamed-download.zip")] {
-                    let target = documents.appendingPathComponent(name)
+                    let target = diagnostics.appendingPathComponent(name)
                     try? FileManager.default.removeItem(at: target)
                     try? FileManager.default.copyItem(at: from, to: target)
                 }
             }
         }
-        let resultURL = documents.appendingPathComponent("ios-download-result.json")
+        let resultURL = diagnostics.appendingPathComponent("ios-download-result.json")
         var previous = (try? Data(contentsOf: resultURL)).flatMap {
             (try? JSONSerialization.jsonObject(with: $0)) as? [[String: Any]]
         } ?? []
@@ -743,8 +756,8 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         #if DEBUG
         // Test-only setup chooses an existing chat; it never fakes a reply or
         // bypasses the real UI send path. This code is absent in Release IPA.
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let selectionURL = documents.appendingPathComponent("ios-test-selection.json")
+        let diagnostics = MarinarViewController.diagnosticsDirectory
+        let selectionURL = diagnostics.appendingPathComponent("ios-test-selection.json")
         let selection = (try? Data(contentsOf: selectionURL)).flatMap {
             (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any]
         } ?? [:]

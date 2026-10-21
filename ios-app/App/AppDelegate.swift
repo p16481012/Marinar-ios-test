@@ -11,7 +11,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         self.controller = controller
         #if DEBUG
         let window: UIWindow
-        if ProcessInfo.processInfo.environment["MARINARA_TEST_FILE_PANEL"] == "1" {
+        if ProcessInfo.processInfo.environment["MARINARA_TEST_NATIVE_TOUCH_TRACE"] == "1" {
             let diagnosticWindow = MarinarDiagnosticWindow(frame: UIScreen.main.bounds)
             diagnosticWindow.diagnosticsController = controller
             window = diagnosticWindow

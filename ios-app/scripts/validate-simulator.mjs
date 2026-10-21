@@ -318,13 +318,23 @@ async function launch() {
 
 async function stop() { await run('xcrun', ['simctl', 'terminate', deviceId, bundleId], { allowFailure: true }); }
 
+function diagnosticFile(filename, appContainer = container) {
+  return path.join(appContainer, 'Library/Application Support/Diagnostics', filename);
+}
+
+async function writeDiagnosticFile(filename, value) {
+  const destination = diagnosticFile(filename);
+  await mkdir(path.dirname(destination), { recursive: true });
+  await writeFile(destination, JSON.stringify(value));
+}
+
 async function preserveLaunchLogs() {
   // Copy before XCTest can migrate the data container, and again after the
   // final launch. A missing old path must not remove an already copied log.
   for (const file of launchLogs) await copyFile(file, path.join(reportDir, path.basename(file))).catch(() => {});
   if (deviceId) {
     const current = await run('xcrun', ['simctl', 'get_app_container', deviceId, bundleId, 'data']).catch(() => undefined);
-    if (current) await copyFile(path.join(current, 'Documents/ios-export-events.json'),
+    if (current) await copyFile(diagnosticFile('ios-export-events.json', current),
       path.join(reportDir, `${deviceId}-ios-export-events.json`)).catch(() => {});
   }
 }
@@ -377,7 +387,7 @@ async function prepareUI(config, stateFile) {
   const persistence = await readFile(path.join(root, 'packages/client/src/lib/ui-persistence.ts'), 'utf8');
   const uiStateVersion = Number(persistence.match(/version:\s*(\d+)/)?.[1]);
   assert.ok(Number.isInteger(uiStateVersion), 'Cannot identify current UI preference format');
-  await writeFile(path.join(container, 'Documents/ios-test-selection.json'), JSON.stringify({ chatId: uiState.chatId, uiStateVersion }));
+  await writeDiagnosticFile('ios-test-selection.json', { chatId: uiState.chatId, uiStateVersion });
   // The DEBUG app creates its import fixture after XCTest has installed and
   // launched it. Creating it here can leave Files with a pre-install item ID.
   return uiState;
@@ -390,7 +400,7 @@ async function prepareStreamedBackup(config) {
   const directory = path.join(config.dataDir, 'knowledge-sources');
   await mkdir(directory, { recursive: true });
   await writeFile(path.join(directory, 'ios-stream-fixture.txt'), Buffer.alloc(16 * 1024 * 1024, 65));
-  await writeFile(path.join(container, 'Documents/ios-file-test-config.json'), JSON.stringify({ prepareBackup: true }));
+  await writeDiagnosticFile('ios-file-test-config.json', { prepareBackup: true });
 }
 
 async function hashFile(file) {
@@ -402,7 +412,7 @@ async function hashFile(file) {
 
 async function verifyBlobDownload(withArchive = false) {
   container = await run('xcrun', ['simctl', 'get_app_container', deviceId, bundleId, 'data']);
-  const results = JSON.parse(await readFile(path.join(container, 'Documents/ios-download-result.json'), 'utf8'));
+  const results = JSON.parse(await readFile(diagnosticFile('ios-download-result.json'), 'utf8'));
   assert.equal(results.length, withArchive ? 2 : 1, 'Failed HTTP download was saved or expected download is missing');
   const result = results.find((item) => item.filename === 'marinar-ios-export.json');
   assert.ok(result, 'WKDownload did not save the blob fixture');
@@ -411,8 +421,8 @@ async function verifyBlobDownload(withArchive = false) {
   assert.equal(result.size, expected.length);
   assert.equal(result.sha256, createHash('sha256').update(expected).digest('hex'), 'WKDownload changed the exported bytes');
   if (!withArchive) return { blob: result };
-  const expectedArchive = await hashFile(path.join(container, 'Documents/ios-streamed-source.zip'));
-  const savedArchive = await hashFile(path.join(container, 'Documents/ios-streamed-download.zip'));
+  const expectedArchive = await hashFile(diagnosticFile('ios-streamed-source.zip'));
+  const savedArchive = await hashFile(diagnosticFile('ios-streamed-download.zip'));
   assert.ok(savedArchive.size >= 16 * 1024 * 1024, 'Backup omitted the large fixture');
   assert.deepEqual(savedArchive, expectedArchive, 'WKDownload archive differs from the server file');
   const archive = results.find((item) => item.sha256 === expectedArchive.sha256);
@@ -426,7 +436,7 @@ async function waitRestoreCache(restoreID, skipped) {
   const deadline = Date.now() + 90_000;
   while (Date.now() < deadline) {
     try {
-      const value = JSON.parse(await readFile(path.join(container, 'Documents/ios-restore-cache-result.json'), 'utf8'));
+      const value = JSON.parse(await readFile(diagnosticFile('ios-restore-cache-result.json'), 'utf8'));
       if (value.restoreID === restoreID && value.skipped === skipped) return value;
     } catch { /* Wait for the real WebView to finish hydrating. */ }
     await sleep(500);
@@ -474,13 +484,13 @@ async function exerciseNativeFullRestore(config, uiState) {
   // Seed browser-side mutations immediately before the restore reset script.
   // A future timestamp previously caused even an empty UI cache to overwrite
   // the restored profile, while the other queues can replay stale data.
-  await writeFile(path.join(container, 'Documents/ios-restore-cache-fixture.json'), JSON.stringify({
+  await writeDiagnosticFile('ios-restore-cache-fixture.json', {
     'marinara-engine-ui-updated-at': String(Date.now() + 86_400_000),
     'marinara:pending-game-state-patches:v1': JSON.stringify([[`${uiState.chatId}\u0000\u0000`, {
       chatId: uiState.chatId, target: {}, fields: { weather: 'Stale browser weather' }, revision: 1,
     }]]),
     'marinara-library-folders-v1': JSON.stringify([{ ...restoredFolder, scope: 'presets', name: 'Stale browser folder' }]),
-  }));
+  });
   await stop();
   config = await launch();
   api = createTestApi(`http://127.0.0.1:${config.port}`, config.token);
@@ -579,7 +589,7 @@ async function runPrimaryChecks(buildArgs) {
     const relaunched = await collectCheck('primary-process-relaunch', async () => { await stop(); config = await launch(); });
     if (relaunched && chatVerified) {
       await collectCheck('primary-background-flush', async () => {
-        const backgroundFlush = JSON.parse(await readFile(path.join(container, 'Documents/ios-background-flush-result.json'), 'utf8'));
+        const backgroundFlush = JSON.parse(await readFile(diagnosticFile('ios-background-flush-result.json'), 'utf8'));
         assert.equal(backgroundFlush.succeeded, true, 'Native background flush did not complete');
         assert.equal(backgroundFlush.status, 200);
         report.coverage.nativeBackgroundFlush = true;
