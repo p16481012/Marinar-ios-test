@@ -107,7 +107,10 @@ async function run(command, commandArgs, { log, allowFailure = false, env, timeo
   // These arguments are tool names, simulator IDs and paths. Runtime tokens
   // are passed separately through env and must never enter the report.
   const commandLabel = [command, ...commandArgs.slice(0, 3)].join(' ');
-  report.command = { name: command, arguments: [...commandArgs], ...(log ? { log } : {}), startedAt: new Date().toISOString(), timeoutMs, status: 'running' };
+  const commandRecord = { name: command, arguments: [...commandArgs], ...(log ? { log } : {}), startedAt: new Date().toISOString(), timeoutMs, status: 'running' };
+  report.command = commandRecord;
+  report.commandHistory ??= [];
+  report.commandHistory.push(commandRecord);
   await checkpoint();
   const output = [];
   const stream = log ? createWriteStream(path.join(reportDir, log)) : null;
@@ -142,6 +145,8 @@ async function run(command, commandArgs, { log, allowFailure = false, env, timeo
     };
     const timer = setTimeout(() => {
       timedOut = true;
+      commandRecord.timedOutAt = new Date().toISOString();
+      commandRecord.processWasRunningAtTimeout = child.exitCode === null && child.signalCode === null;
       signalChild('SIGTERM');
       killTimer = setTimeout(() => signalChild('SIGKILL'), 10_000);
       drainTimer = setTimeout(() => {
@@ -150,14 +155,20 @@ async function run(command, commandArgs, { log, allowFailure = false, env, timeo
       }, 20_000);
     }, timeoutMs);
     child.once('error', (error) => { spawnError = error; finish(null); });
-    child.once('close', finish);
+    child.once('exit', (code, signal) => {
+      Object.assign(commandRecord, { processExitedAt: new Date().toISOString(), processExitCode: code, processExitSignal: signal });
+    });
+    child.once('close', (code, signal) => {
+      Object.assign(commandRecord, { pipesClosedAt: new Date().toISOString(), closeSignal: signal });
+      finish(code);
+    });
   });
   if (stream) await new Promise((resolve) => stream.end(resolve));
   const failed = timedOut || spawnError || code !== 0;
   if (!failed && command === 'xcrun' && commandArgs[0] === 'simctl' && commandArgs[1] === 'shutdown') {
     shutdownDevices.add(commandArgs[2]);
   }
-  Object.assign(report.command, { status: timedOut ? 'timed-out' : failed ? 'failed' : 'passed', endedAt: new Date().toISOString(), exitCode: code });
+  Object.assign(commandRecord, { status: timedOut ? 'timed-out' : failed ? 'failed' : 'passed', endedAt: new Date().toISOString(), exitCode: code });
   if (timedOut) recordFailure('command-timeout', new Error(`${commandLabel} timed out after ${timeoutMs} ms${log ? `; see ${log}` : ''}`));
   await checkpoint();
   const text = Buffer.concat(output).toString('utf8').trim();
@@ -185,7 +196,7 @@ async function startLiveLog(targetDeviceId, label) {
   const filename = `${label}-startup-live.log`;
   const output = createWriteStream(path.join(reportDir, filename));
   const child = spawn('xcrun', ['simctl', 'spawn', targetDeviceId, 'log', 'stream',
-    '--style', 'compact', '--level', 'info', '--predicate', 'process == "Marinar"'],
+    '--style', 'compact', '--level', 'info', '--predicate', `process == "Marinar" OR eventMessage CONTAINS "${bundleId}"`],
   { cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
   const metadata = { deviceId: targetDeviceId, file: filename, startedAt: new Date().toISOString() };
   report.liveDiagnostics ??= [];
@@ -346,6 +357,7 @@ async function launch() {
   const stderr = path.join(logs, `app-${launchNumber}-stderr.log`);
   launchLogs.push(stdout, stderr);
   await run('xcrun', ['simctl', 'launch', `--stdout=${stdout}`, `--stderr=${stderr}`, deviceId, bundleId], {
+    log: `app-${launchNumber}-launcher.log`,
     env: { SIMCTL_CHILD_MARINARA_TEST_DIAGNOSTICS: '1' },
   });
   return await waitForRuntime();

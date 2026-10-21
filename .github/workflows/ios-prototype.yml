@@ -101,6 +101,7 @@ jobs:
             ios-app/build/validation/**/*startup-ready-state*.json
             ios-app/build/validation/**/*settings-restore-fixture.json
             ios-app/build/validation/**/*startup-live.log
+            ios-app/build/validation/**/*launcher.log
             ios-app/build/validation/**/*ui-tests.log
             ios-app/build/validation/**/*file-picker.log
             ios-app/build/validation/**/*build.log
