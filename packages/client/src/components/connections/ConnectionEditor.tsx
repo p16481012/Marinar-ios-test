@@ -12,6 +12,7 @@ import {
   isChatProvider,
 } from "@marinara-engine/shared";
 import { isConnectionFlagFalse, isLanguageGenerationConnection } from "../../lib/connection-filters";
+import { isIosSupportedProvider, isNativeIosApp } from "../../lib/ios-runtime";
 import { useEffectiveGenerationParameters } from "../../hooks/use-effective-generation-parameters";
 // ──────────────────────────────────────────────
 // Full-Page Connection Editor
@@ -1731,6 +1732,11 @@ export function ConnectionEditor() {
       {/* ── Body ── */}
       <div className="mari-editor-content max-md:p-4">
         <div className="mari-editor-content-inner space-y-6">
+          {!isIosSupportedProvider(localProvider) && (
+            <p role="alert" className="rounded-lg border border-[var(--border)] p-3 text-sm">
+              {localizeUi("ios.runtime.providerUnavailable")}
+            </p>
+          )}
           {/* ── Connection Name ── */}
           <FieldGroup
             label={localizeUi("ui.connections.connectioneditor.connectionName_669ca65")}
@@ -1755,71 +1761,73 @@ export function ConnectionEditor() {
             help={localizeUi("ui.connections.connectioneditor.theAiServiceYouWantToConnectToEach")}
           >
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4">
-              {(Object.entries(PROVIDERS) as [APIProvider, typeof providerDef][]).map(([key, info]) => (
-                <button
-                  key={key}
-                  type="button"
-                  onClick={() => {
-                    if (key === localProvider) return;
-                    const defaultModel = MODEL_LISTS[key]?.[0];
-                    setLocalProvider(key);
-                    // Auto-fill base URL
-                    setLocalBaseUrl(info.defaultBaseUrl);
-                    // The base URL and model are reset, so the old image service must be picked again;
-                    // otherwise a hidden-field service like ChatGPT (Codex login) keeps a stale URL.
-                    setLocalImageGenerationSource("");
-                    setLocalImageService(null);
-                    // Leave Grok CLI blank so the local CLI can use its
-                    // account/default model until the user fetches
-                    // `grok models`. Other providers keep their usual seeded
-                    // default model when we know one.
-                    setLocalModel(
-                      key === "grok_subscription" ? "" : (defaultModel?.id ?? (key === "xai" ? "grok-4.5" : "")),
-                    );
-                    setLocalMaxContext(
-                      key === "grok_subscription"
-                        ? GROK_CLI_DEFAULT_CONTEXT_TOKENS
-                        : Number(defaultModel?.context) || 128000,
-                    );
-                    setLocalMaxTokensOverride(null);
-                    setLocalDefaultParametersEnabled(false);
-                    setLocalDefaultParameters(
-                      getEditableGenerationParameters(CONNECTION_PARAMETER_DEFAULTS, null, key),
-                    );
-                    if (key === "decision") {
-                      setLocalDecisionSource("typesafe");
-                      setLocalCredentialsFrom("");
-                      setLocalMaxStateTokens(30000);
-                      setLocalDecisionTimeoutMs(DECISION_TIMEOUT_MS.systemOne);
-                      setLocalModel("jev-latest");
-                    }
-                    if (key === "audio") {
-                      // The provider tile seeds ElevenLabs base URL/model, so
-                      // the audio source must reset to match — otherwise a
-                      // pockettts/openai/xai source survives the switch under
-                      // ElevenLabs endpoints and saves a self-inconsistent row.
-                      setLocalAudioSource("elevenlabs");
-                      setLocalAudioVoice("");
-                      setLocalAudioSoundEffects(false);
-                      setLocalAudioMusic(false);
-                    }
-                    // Provider switches must not keep an encrypted key from
-                    // the previous provider under the new provider identity.
-                    setLocalApiKey("");
-                    setClearStoredApiKeyOnSave(true);
-                    markDirty();
-                  }}
-                  aria-pressed={localProvider === key}
-                  className={cn(
-                    "truncate rounded-md px-3 py-2.5 text-xs font-medium transition-all",
-                    localProvider === key
-                      ? "bg-sky-400/15 text-sky-400 ring-1 ring-sky-400/30"
-                      : "bg-[var(--secondary)] text-[var(--muted-foreground)] ring-1 ring-[var(--border)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
-                  )}
-                >
-                  {key === "decision" ? t("connections.decision.label") : info.name}
-                </button>
-              ))}
+              {(Object.entries(PROVIDERS) as [APIProvider, typeof providerDef][])
+                .filter(([key]) => isIosSupportedProvider(key))
+                .map(([key, info]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => {
+                      if (key === localProvider) return;
+                      const defaultModel = MODEL_LISTS[key]?.[0];
+                      setLocalProvider(key);
+                      // Auto-fill base URL
+                      setLocalBaseUrl(info.defaultBaseUrl);
+                      // The base URL and model are reset, so the old image service must be picked again;
+                      // otherwise a hidden-field service like ChatGPT (Codex login) keeps a stale URL.
+                      setLocalImageGenerationSource("");
+                      setLocalImageService(null);
+                      // Leave Grok CLI blank so the local CLI can use its
+                      // account/default model until the user fetches
+                      // `grok models`. Other providers keep their usual seeded
+                      // default model when we know one.
+                      setLocalModel(
+                        key === "grok_subscription" ? "" : (defaultModel?.id ?? (key === "xai" ? "grok-4.5" : "")),
+                      );
+                      setLocalMaxContext(
+                        key === "grok_subscription"
+                          ? GROK_CLI_DEFAULT_CONTEXT_TOKENS
+                          : Number(defaultModel?.context) || 128000,
+                      );
+                      setLocalMaxTokensOverride(null);
+                      setLocalDefaultParametersEnabled(false);
+                      setLocalDefaultParameters(
+                        getEditableGenerationParameters(CONNECTION_PARAMETER_DEFAULTS, null, key),
+                      );
+                      if (key === "decision") {
+                        setLocalDecisionSource("typesafe");
+                        setLocalCredentialsFrom("");
+                        setLocalMaxStateTokens(30000);
+                        setLocalDecisionTimeoutMs(DECISION_TIMEOUT_MS.systemOne);
+                        setLocalModel("jev-latest");
+                      }
+                      if (key === "audio") {
+                        // The provider tile seeds ElevenLabs base URL/model, so
+                        // the audio source must reset to match — otherwise a
+                        // pockettts/openai/xai source survives the switch under
+                        // ElevenLabs endpoints and saves a self-inconsistent row.
+                        setLocalAudioSource("elevenlabs");
+                        setLocalAudioVoice("");
+                        setLocalAudioSoundEffects(false);
+                        setLocalAudioMusic(false);
+                      }
+                      // Provider switches must not keep an encrypted key from
+                      // the previous provider under the new provider identity.
+                      setLocalApiKey("");
+                      setClearStoredApiKeyOnSave(true);
+                      markDirty();
+                    }}
+                    aria-pressed={localProvider === key}
+                    className={cn(
+                      "truncate rounded-md px-3 py-2.5 text-xs font-medium transition-all",
+                      localProvider === key
+                        ? "bg-sky-400/15 text-sky-400 ring-1 ring-sky-400/30"
+                        : "bg-[var(--secondary)] text-[var(--muted-foreground)] ring-1 ring-[var(--border)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
+                    )}
+                  >
+                    {key === "decision" ? t("connections.decision.label") : info.name}
+                  </button>
+                ))}
             </div>
           </FieldGroup>
 
@@ -2310,82 +2318,84 @@ export function ConnectionEditor() {
               help={localizeUi("ui.connections.connectioneditor.pickTheBackendTypeOnceThenPointBaseUrl")}
             >
               <div className="grid grid-cols-2 gap-1.5">
-                {IMAGE_GENERATION_SOURCES.map((src) => {
-                  const isActive = selectedImageService === src.id;
-                  const sourceName =
-                    src.id === "atlas"
-                      ? t("connections.mediaSources.atlas.name")
-                      : src.id === "swarmui"
-                        ? t("connections.mediaSources.swarmui.name")
-                        : src.id === "zai"
-                          ? t("connections.mediaSources.zai.name")
-                          : src.id === "arli"
-                            ? t("connections.mediaSources.arli.name")
-                            : src.id === "codex_chatgpt"
-                              ? t("connections.mediaSources.codexChatgpt.name")
-                              : src.name;
-                  const sourceDescription =
-                    src.id === "fal"
-                      ? t("connections.mediaSources.fal.imageDescription")
-                      : src.id === "atlas"
-                        ? t("connections.mediaSources.atlas.imageDescription")
+                {IMAGE_GENERATION_SOURCES.filter((src) => !isNativeIosApp() || src.id !== "codex_chatgpt").map(
+                  (src) => {
+                    const isActive = selectedImageService === src.id;
+                    const sourceName =
+                      src.id === "atlas"
+                        ? t("connections.mediaSources.atlas.name")
                         : src.id === "swarmui"
-                          ? t("connections.mediaSources.swarmui.imageDescription")
+                          ? t("connections.mediaSources.swarmui.name")
                           : src.id === "zai"
-                            ? t("connections.mediaSources.zai.imageDescription")
+                            ? t("connections.mediaSources.zai.name")
                             : src.id === "arli"
-                              ? t("connections.mediaSources.arli.imageDescription")
+                              ? t("connections.mediaSources.arli.name")
                               : src.id === "codex_chatgpt"
-                                ? t("connections.mediaSources.codexChatgpt.imageDescription")
-                                : src.id === "spicyapi"
-                                  ? t("connections.mediaSources.spicyapi.imageDescription")
-                                  : src.description;
-                  return (
-                    <button
-                      key={src.id}
-                      onClick={() => {
-                        const previousSource = IMAGE_GENERATION_SOURCES.find(
-                          (candidate) => candidate.id === selectedImageService,
-                        );
-                        const shouldSeedBaseUrl = !localBaseUrl || localBaseUrl === previousSource?.defaultBaseUrl;
-                        setLocalImageGenerationSource(src.id);
-                        setLocalImageService(src.id);
-                        if (shouldSeedBaseUrl) {
-                          setLocalBaseUrl(src.defaultBaseUrl);
-                        }
-                        if (src.id === "zai" && !ZAI_IMAGE_MODELS.some((model) => model.id === localModel.trim())) {
-                          setLocalModel("glm-image");
-                        }
-                        if (src.id === "fal" && selectedImageService !== "fal") {
-                          setLocalModel("fal-ai/flux/schnell");
-                        }
-                        if (src.id === "spicyapi" && selectedImageService !== "spicyapi") {
-                          setLocalModel(SPICYAPI_IMAGE_MODELS[0]!.id);
-                        }
-                        if (src.id === "codex_chatgpt" && selectedImageService !== "codex_chatgpt") {
-                          // The hidden Base URL and API key fields must not keep another service's values.
-                          setLocalBaseUrl(src.defaultBaseUrl);
-                          setLocalApiKey("");
-                          setClearStoredApiKeyOnSave(true);
-                          setLocalModel(CODEX_IMAGE_MODEL);
-                        }
-                        markDirty();
-                      }}
-                      className={cn(
-                        "flex flex-col gap-0.5 rounded-lg px-2.5 py-2 text-left text-[0.6875rem] transition-all",
-                        isActive
-                          ? "bg-sky-400/15 text-sky-400 ring-1 ring-sky-400/30"
-                          : "bg-[var(--secondary)] text-[var(--muted-foreground)] ring-1 ring-[var(--border)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
-                      )}
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span className="font-medium">{sourceName}</span>
-                        {isActive && <Check size="0.625rem" />}
-                      </div>
-                      <span className="text-[0.5625rem] opacity-70">{sourceDescription}</span>
-                    </button>
-                  );
-                })}
+                                ? t("connections.mediaSources.codexChatgpt.name")
+                                : src.name;
+                    const sourceDescription =
+                      src.id === "fal"
+                        ? t("connections.mediaSources.fal.imageDescription")
+                        : src.id === "atlas"
+                          ? t("connections.mediaSources.atlas.imageDescription")
+                          : src.id === "swarmui"
+                            ? t("connections.mediaSources.swarmui.imageDescription")
+                            : src.id === "zai"
+                              ? t("connections.mediaSources.zai.imageDescription")
+                              : src.id === "arli"
+                                ? t("connections.mediaSources.arli.imageDescription")
+                                : src.id === "codex_chatgpt"
+                                  ? t("connections.mediaSources.codexChatgpt.imageDescription")
+                                  : src.id === "spicyapi"
+                                    ? t("connections.mediaSources.spicyapi.imageDescription")
+                                    : src.description;
+                    return (
+                      <button
+                        key={src.id}
+                        onClick={() => {
+                          const previousSource = IMAGE_GENERATION_SOURCES.find(
+                            (candidate) => candidate.id === selectedImageService,
+                          );
+                          const shouldSeedBaseUrl = !localBaseUrl || localBaseUrl === previousSource?.defaultBaseUrl;
+                          setLocalImageGenerationSource(src.id);
+                          setLocalImageService(src.id);
+                          if (shouldSeedBaseUrl) {
+                            setLocalBaseUrl(src.defaultBaseUrl);
+                          }
+                          if (src.id === "zai" && !ZAI_IMAGE_MODELS.some((model) => model.id === localModel.trim())) {
+                            setLocalModel("glm-image");
+                          }
+                          if (src.id === "fal" && selectedImageService !== "fal") {
+                            setLocalModel("fal-ai/flux/schnell");
+                          }
+                          if (src.id === "spicyapi" && selectedImageService !== "spicyapi") {
+                            setLocalModel(SPICYAPI_IMAGE_MODELS[0]!.id);
+                          }
+                          if (src.id === "codex_chatgpt" && selectedImageService !== "codex_chatgpt") {
+                            // The hidden Base URL and API key fields must not keep another service's values.
+                            setLocalBaseUrl(src.defaultBaseUrl);
+                            setLocalApiKey("");
+                            setClearStoredApiKeyOnSave(true);
+                            setLocalModel(CODEX_IMAGE_MODEL);
+                          }
+                          markDirty();
+                        }}
+                        className={cn(
+                          "flex flex-col gap-0.5 rounded-lg px-2.5 py-2 text-left text-[0.6875rem] transition-all",
+                          isActive
+                            ? "bg-sky-400/15 text-sky-400 ring-1 ring-sky-400/30"
+                            : "bg-[var(--secondary)] text-[var(--muted-foreground)] ring-1 ring-[var(--border)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
+                        )}
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-medium">{sourceName}</span>
+                          {isActive && <Check size="0.625rem" />}
+                        </div>
+                        <span className="text-[0.5625rem] opacity-70">{sourceDescription}</span>
+                      </button>
+                    );
+                  },
+                )}
               </div>
               <p className="text-[0.625rem] text-[var(--muted-foreground)]">
                 {isCodexImageService

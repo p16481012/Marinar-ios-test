@@ -17,7 +17,11 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
             do {
                 let (configuration, configURL) = try Runtime.prepare()
                 let thread = Thread {
-                    let code = NodeBridge.run(withArguments: ["node", configuration.runtimeRoot + "/bootstrap.cjs", configURL.path], workingDirectory: configuration.dataDir)
+                    // An interrupted restore can temporarily move dataDir aside.
+                    // Start outside the replaced directory so bootstrap can
+                    // recover its journal before entering the restored data.
+                    let workingDirectory = URL(fileURLWithPath: configuration.envFile).deletingLastPathComponent().path
+                    let code = NodeBridge.run(withArguments: ["node", configuration.runtimeRoot + "/bootstrap.cjs", configURL.path], workingDirectory: workingDirectory)
                     DispatchQueue.main.async {
                         controller.fail("내장 서버가 종료되었습니다 (\(code)). 앱을 완전히 종료한 뒤 다시 실행해 주세요.")
                     }

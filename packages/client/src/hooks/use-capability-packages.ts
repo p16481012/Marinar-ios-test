@@ -13,6 +13,7 @@ import {
   type RulesetCatalogPayload,
 } from "@marinara-engine/shared";
 import { api, ApiError } from "../lib/api-client";
+import { isNativeIosApp } from "../lib/ios-runtime";
 import {
   beginCapabilityClientImport,
   capabilityClientNeedsRefresh,
@@ -36,7 +37,10 @@ export const capabilityPackageKeys = {
 export function useInstalledRulesets(enabled = true) {
   return useQuery({
     queryKey: capabilityPackageKeys.rulesets(),
-    queryFn: () => api.get<InstalledRuleset[]>("/capability-packages/rulesets"),
+    queryFn: () =>
+      isNativeIosApp()
+        ? Promise.resolve<InstalledRuleset[]>([])
+        : api.get<InstalledRuleset[]>("/capability-packages/rulesets"),
     enabled,
   });
 }
@@ -66,7 +70,7 @@ export function rulesetCatalogQuery(rulesetId: string, catalogId: string, versio
 export function useRulesetCatalog(rulesetId: string, catalogId: string, version: number | undefined, enabled: boolean) {
   return useQuery({
     ...rulesetCatalogQuery(rulesetId, catalogId, version),
-    enabled: enabled && !!rulesetId && !!catalogId,
+    enabled: enabled && !isNativeIosApp() && !!rulesetId && !!catalogId,
   });
 }
 
@@ -125,7 +129,10 @@ export function useRemoveRuleset() {
 export function useCapabilityCatalog(enabled = true) {
   return useQuery({
     queryKey: capabilityPackageKeys.catalog(),
-    queryFn: () => api.get<CapabilityCatalog>("/capability-packages/catalog"),
+    queryFn: () =>
+      isNativeIosApp()
+        ? Promise.resolve<CapabilityCatalog>({ schemaVersion: 1, generatedAt: new Date(0).toISOString(), packages: [] })
+        : api.get<CapabilityCatalog>("/capability-packages/catalog"),
     enabled,
     staleTime: 5 * 60_000,
     retry: 1,
@@ -137,7 +144,10 @@ export function useCapabilityCatalog(enabled = true) {
 export function useCapabilityPackageReleaseNotes(packageId: string | null, enabled = true) {
   return useQuery({
     queryKey: capabilityPackageKeys.releaseNotes(packageId ?? ""),
-    queryFn: () => api.get<CapabilityPackageVersionNote[]>(`/capability-packages/${packageId}/release-notes`),
+    queryFn: () =>
+      isNativeIosApp()
+        ? Promise.resolve<CapabilityPackageVersionNote[]>([])
+        : api.get<CapabilityPackageVersionNote[]>(`/capability-packages/${packageId}/release-notes`),
     enabled: enabled && !!packageId,
     staleTime: 5 * 60_000,
     retry: 1,
@@ -148,7 +158,9 @@ export function useCapabilityAgentRegistry(enabled = true) {
   const query = useQuery({
     queryKey: capabilityPackageKeys.agents(),
     queryFn: async () => {
-      const agents = await api.get<BuiltInAgentManifest[]>("/capability-packages/agents");
+      const agents: BuiltInAgentManifest[] = isNativeIosApp()
+        ? []
+        : await api.get<BuiltInAgentManifest[]>("/capability-packages/agents");
       // Keep the shared registry current before React Query publishes the new
       // result. Updating it in an effect leaves mounted consumers one render
       // behind because the registry itself is mutable, non-React state.
@@ -300,7 +312,10 @@ export function selectHomeWidgetPackages(
 export function useInstalledCapabilityPackages(enabled = true) {
   return useQuery({
     queryKey: capabilityPackageKeys.installed(),
-    queryFn: () => api.get<InstalledCapabilityPackage[]>("/capability-packages/installed"),
+    queryFn: () =>
+      isNativeIosApp()
+        ? Promise.resolve<InstalledCapabilityPackage[]>([])
+        : api.get<InstalledCapabilityPackage[]>("/capability-packages/installed"),
     enabled,
   });
 }
@@ -308,7 +323,12 @@ export function useInstalledCapabilityPackages(enabled = true) {
 export function usePendingCapabilityPackageUpdates(enabled = true) {
   return useQuery({
     queryKey: capabilityPackageKeys.pendingUpdates(),
-    queryFn: () => api.get<CapabilityPackageUpdate[]>("/capability-packages/updates/pending"),
+    // A disabled query stays pending/unfetched. The startup prompter waits for
+    // isFetched before allowing onboarding, so native iOS resolves an empty list.
+    queryFn: () =>
+      isNativeIosApp()
+        ? Promise.resolve<CapabilityPackageUpdate[]>([])
+        : api.get<CapabilityPackageUpdate[]>("/capability-packages/updates/pending"),
     enabled,
     staleTime: 5 * 60_000,
     retry: 1,

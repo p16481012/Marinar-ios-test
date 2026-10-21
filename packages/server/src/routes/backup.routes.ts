@@ -66,6 +66,7 @@ import { requirePrivilegedAccess } from "../middleware/privileged-gate.js";
 import { BACKUP_RATE_LIMIT } from "../middleware/rate-limit.js";
 import { assertInsideDir, safeCompareString } from "../utils/security.js";
 import { logger } from "../lib/logger.js";
+import { isIosRuntime } from "../config/ios-runtime.js";
 import { crc32Buffer, finishCrc32, updateCrc32State } from "../utils/crc32.js";
 import { ENCRYPTED_WEBHOOK_PREFIX, encryptCustomToolWebhookUrl } from "../utils/custom-tool-webhook.js";
 import {
@@ -2292,7 +2293,7 @@ async function finishZipStream(stream: WriteStream) {
   });
 }
 
-async function writeStoredZipArchive(
+export async function writeStoredZipArchive(
   outputPath: string,
   sources: StoredZipEntrySource[],
   options: {
@@ -3537,6 +3538,9 @@ export async function backupRoutes(app: FastifyInstance) {
     backupExists: await automaticBackupExists(getBackupsRoot()),
   });
   const runAutomaticBackupIfDue = async (force = false) => {
+    // iOS exposes an explicit full-backup workflow; suspended apps cannot
+    // promise scheduled backups or race a staged restore from this timer.
+    if (isIosRuntime) return;
     if (automaticBackupRunning) return;
     automaticBackupRunning = true;
     try {

@@ -110,6 +110,7 @@ import { useLocalizedUiText } from "../../localization/use-localized-ui-text";
 import { useTranslation as useUiTranslation } from "react-i18next";
 import { clearActiveChatResourceDrag, writeChatResourceDragPayload } from "../../lib/chat-resource-drag";
 import { createLocalSidecarConnectionOption, isLanguageGenerationConnection } from "../../lib/connection-filters";
+import { isNativeIosApp } from "../../lib/ios-runtime";
 import { ChatResourceActionButton } from "../chat/ChatResourceActionButton";
 
 const CONNECTION_ICON_COLORS = {
@@ -2181,7 +2182,7 @@ export function ConnectionsPanel() {
       <ConnectionDefaultsSection connectionsList={connectionsList} />
 
       {/* ── Local Model (Sidecar) ── */}
-      {import.meta.env.VITE_MARINARA_LITE !== "true" && <SidecarCard />}
+      {!isNativeIosApp() && import.meta.env.VITE_MARINARA_LITE !== "true" && <SidecarCard />}
 
       {/* ── Text to Speech ── */}
       <TTSConfigCard />

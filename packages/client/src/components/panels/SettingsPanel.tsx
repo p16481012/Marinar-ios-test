@@ -196,6 +196,8 @@ import { TrackerCardColorSettings } from "./settings/TrackerCardColorSettings";
 import { PromptOverridesEditor } from "./settings/PromptOverridesEditor";
 import { BackgroundPicker } from "./settings/BackgroundPicker";
 import { RequestTimeoutSettings } from "./settings/RequestTimeoutSettings";
+import { IosBackupSettings } from "./settings/IosBackupSettings";
+import { isNativeIosApp } from "../../lib/ios-runtime";
 import { FEATURE_SWITCHES_CONTROL_ID, FeatureSwitchesSettings } from "./settings/FeatureSwitchesSettings";
 import { CustomGenerationParametersSettings } from "./settings/CustomGenerationParametersSettings";
 import { ExternalExtensionsSettings, PersonalExtensionsSettings } from "./settings/PersonalExtensionsSettings";
@@ -5303,6 +5305,8 @@ function GenerationsSettings() {
     openAgentCatalog("illustrator");
   }, [openAgentCatalog, openRightPanel]);
 
+  if (isNativeIosApp()) return <SettingsIntro>{localizeUi("ios.runtime.generations")}</SettingsIntro>;
+
   return (
     <div className="flex flex-col gap-3">
       <SettingsIntro>
@@ -5369,7 +5373,10 @@ function AddonsSettings() {
       <SettingsIntro>
         {localizeUi("ui.panels.addonssettings.privateCustomBehaviorAndAppearanceSyncedByThisMarinara")}
       </SettingsIntro>
-      <PersonalExtensionsSettings showIntro={false} />
+      {!isNativeIosApp() && <PersonalExtensionsSettings showIntro={false} />}
+      {isNativeIosApp() && (
+        <p className="text-xs leading-relaxed text-[var(--muted-foreground)]">{localizeUi("ios.runtime.extensions")}</p>
+      )}
       {extensionPolicy?.externalExtensionsEnabled && <ExternalExtensionsSettings />}
       <ThemesSettings showIntro={false} />
     </div>
@@ -6524,6 +6531,11 @@ function ImportSettings() {
       <SettingsIntro>
         {localizeUi("ui.panels.importsettings.importDataFromMarinaraExportsSillytavernOrAssetFolders")}
       </SettingsIntro>
+      {isNativeIosApp() && (
+        <p className="text-xs leading-relaxed text-[var(--muted-foreground)]">
+          {localizeUi("ios.runtime.profileImport")}
+        </p>
+      )}
 
       <SettingsSection
         title={localizeUi("settings.sections.profileMarinara.title")}
@@ -7092,6 +7104,7 @@ function AdvancedSettings() {
   const { data: backups } = useQuery<{ name: string; createdAt: string; path: string }[]>({
     queryKey: ["backups"],
     queryFn: () => api.get("/backup"),
+    enabled: !isNativeIosApp(),
   });
   type AutomaticBackupFrequency = "daily" | "weekly" | "monthly";
   type AutomaticBackupSettings = {
@@ -7106,6 +7119,7 @@ function AdvancedSettings() {
   const automaticBackupQuery = useQuery<AutomaticBackupSettings>({
     queryKey: ["backups", "automatic"],
     queryFn: () => api.get("/backup/automatic"),
+    enabled: !isNativeIosApp(),
     refetchInterval: (query) => (query.state.data?.enabled ? 30_000 : false),
   });
   const automaticBackupMutation = useMutation({
@@ -7279,6 +7293,7 @@ function AdvancedSettings() {
   const installedChannel = useQuery<{ channel: UpdateChannelId }>({
     queryKey: ["update-channel"],
     queryFn: () => api.get("/updates/channel"),
+    enabled: !isNativeIosApp(),
     staleTime: 30_000,
   });
   const updateCheck = useQuery<{
@@ -7433,52 +7448,67 @@ function AdvancedSettings() {
       <SettingsIntro>
         {localizeUi("ui.panels.advancedsettings.serverMaintenanceMessageUtilitiesBackupsAndDataRemoval")}
       </SettingsIntro>
-      <MultiplayerSettings />
-
-      <SettingsSection
-        title={localizeUi("settings.sections.adminAccess.title")}
-        description={localizeUi("settings.sections.adminAccess.componentDescription")}
-        icon={<Power size="0.875rem" />}
-        {...getSettingsSectionAnchorProps("admin-access")}
-      >
-        <div className="flex min-w-0 flex-col gap-2">
-          <input
-            type="password"
-            value={adminSecret}
-            onChange={(e) => setAdminSecret(e.target.value)}
-            placeholder={localizeUi("ui.panels.advancedsettings.adminSecret")}
-            className="w-full min-w-0 rounded-lg bg-[var(--background)] px-3 py-2 text-xs outline-none ring-1 ring-[var(--border)] placeholder:text-[var(--muted-foreground)]/50 focus:ring-[var(--primary)]"
-          />
-          <button
-            type="button"
-            onClick={saveAdminSecret}
-            className={cn(SETTINGS_PRIMARY_FULL_BUTTON_CLASS, "whitespace-nowrap")}
+      {!isNativeIosApp() && <MultiplayerSettings />}
+      {isNativeIosApp() && (
+        <div className="flex flex-col gap-2 rounded-lg border border-[var(--border)] p-3 text-xs leading-relaxed">
+          <p>{localizeUi("ios.runtime.description")}</p>
+          <a
+            className="text-[var(--primary)] underline"
+            href="https://github.com/p16481012/Marinar-ios-test/releases"
+            target="_blank"
+            rel="noopener noreferrer"
           >
-            <Save size="0.8125rem" />
-            {localizeUi("ui.noodle.noodlehome.save")}
-          </button>
-          <SearchableSettingTarget controlId="restart-server" className="flex flex-col gap-1.5">
+            {localizeUi("ios.runtime.updates")}
+          </a>
+        </div>
+      )}
+
+      {!isNativeIosApp() && (
+        <SettingsSection
+          title={localizeUi("settings.sections.adminAccess.title")}
+          description={localizeUi("settings.sections.adminAccess.componentDescription")}
+          icon={<Power size="0.875rem" />}
+          {...getSettingsSectionAnchorProps("admin-access")}
+        >
+          <div className="flex min-w-0 flex-col gap-2">
+            <input
+              type="password"
+              value={adminSecret}
+              onChange={(e) => setAdminSecret(e.target.value)}
+              placeholder={localizeUi("ui.panels.advancedsettings.adminSecret")}
+              className="w-full min-w-0 rounded-lg bg-[var(--background)] px-3 py-2 text-xs outline-none ring-1 ring-[var(--border)] placeholder:text-[var(--muted-foreground)]/50 focus:ring-[var(--primary)]"
+            />
             <button
               type="button"
-              onClick={() => void handleRestartServer()}
-              disabled={restartServer.isPending}
-              className={SETTINGS_PRIMARY_FULL_BUTTON_CLASS}
+              onClick={saveAdminSecret}
+              className={cn(SETTINGS_PRIMARY_FULL_BUTTON_CLASS, "whitespace-nowrap")}
             >
-              {restartServer.isPending ? (
-                <Loader2 size="0.8125rem" className="animate-spin" />
-              ) : (
-                <Power size="0.8125rem" />
-              )}
-              {restartServer.isPending
-                ? localizeUi("settings.serverRestart.restarting")
-                : localizeUi("settings.serverRestart.action")}
+              <Save size="0.8125rem" />
+              {localizeUi("ui.noodle.noodlehome.save")}
             </button>
-            <p className="text-[0.625rem] leading-relaxed text-[var(--muted-foreground)]">
-              {localizeUi("settings.serverRestart.description")}
-            </p>
-          </SearchableSettingTarget>
-        </div>
-      </SettingsSection>
+            <SearchableSettingTarget controlId="restart-server" className="flex flex-col gap-1.5">
+              <button
+                type="button"
+                onClick={() => void handleRestartServer()}
+                disabled={restartServer.isPending}
+                className={SETTINGS_PRIMARY_FULL_BUTTON_CLASS}
+              >
+                {restartServer.isPending ? (
+                  <Loader2 size="0.8125rem" className="animate-spin" />
+                ) : (
+                  <Power size="0.8125rem" />
+                )}
+                {restartServer.isPending
+                  ? localizeUi("settings.serverRestart.restarting")
+                  : localizeUi("settings.serverRestart.action")}
+              </button>
+              <p className="text-[0.625rem] leading-relaxed text-[var(--muted-foreground)]">
+                {localizeUi("settings.serverRestart.description")}
+              </p>
+            </SearchableSettingTarget>
+          </div>
+        </SettingsSection>
+      )}
 
       <SettingsSection
         title={localizeUi("settings.sections.features.title")}
@@ -7489,241 +7519,243 @@ function AdvancedSettings() {
         <FeatureSwitchesSettings anchorId={getSettingsControlAnchorId(FEATURE_SWITCHES_CONTROL_ID)} />
       </SettingsSection>
 
-      <SettingsSection
-        title={localizeUi("settings.sections.updates.title")}
-        description={localizeUi("settings.sections.updates.componentDescription")}
-        icon={<RefreshCw size="0.875rem" />}
-        {...getSettingsSectionAnchorProps("updates")}
-      >
-        <div className="flex flex-col gap-2">
+      {!isNativeIosApp() && (
+        <SettingsSection
+          title={localizeUi("settings.sections.updates.title")}
+          description={localizeUi("settings.sections.updates.componentDescription")}
+          icon={<RefreshCw size="0.875rem" />}
+          {...getSettingsSectionAnchorProps("updates")}
+        >
           <div className="flex flex-col gap-2">
-            <label
-              id={getSettingsControlAnchorId("release-channel")}
-              className="flex scroll-mt-3 min-w-0 flex-col gap-1 text-[0.625rem] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]"
-            >
-              {localizeUi("ui.panels.advancedsettings.releaseChannel")}
-              <select
-                value={selectedUpdateChannelId ?? ""}
-                onChange={(event) => setUpdateChannel(event.target.value as UpdateChannelId)}
-                className="w-full rounded-lg bg-[var(--background)] px-3 py-2 text-xs font-medium normal-case tracking-normal text-[var(--foreground)] outline-none ring-1 ring-[var(--border)] focus:ring-[var(--primary)]"
+            <div className="flex flex-col gap-2">
+              <label
+                id={getSettingsControlAnchorId("release-channel")}
+                className="flex scroll-mt-3 min-w-0 flex-col gap-1 text-[0.625rem] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]"
               >
-                {!selectedUpdateChannelId && (
-                  <option value="" disabled>
-                    {localizeUi("settings.updates.channelPending")}
-                  </option>
-                )}
-                {updateChannelOptions.map((channel) => (
-                  <option key={channel.id} value={channel.id}>
-                    {channel.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button
-              type="button"
-              onClick={() => updateCheck.refetch()}
-              disabled={updateCheck.isFetching}
-              className={SETTINGS_PRIMARY_FULL_BUTTON_CLASS}
-            >
-              {updateCheck.isFetching ? (
-                <>
-                  <Loader2 size="0.8125rem" className="animate-spin" />
-                  {localizeUi("settings.notifications.customSound.status.loading")}
-                </>
-              ) : (
-                <>
-                  <RefreshCw size="0.8125rem" />
-                  {localizeUi("ui.panels.advancedsettings.checkForUpdates")}
-                </>
-              )}
-            </button>
-            <div className="flex flex-col px-1 text-[0.6875rem] text-[var(--muted-foreground)]">
-              <span>
-                {localizeUi("ui.panels.advancedsettings.release")} {currentReleaseLabel}
-              </span>
-              <span>{currentBuildLabel}</span>
-              {updateCheck.data?.currentBranch && (
-                <span>
-                  {localizeUi("ui.panels.advancedsettings.branch")} {updateCheck.data.currentBranch}
-                </span>
-              )}
-            </div>
-          </div>
-
-          {selectedUpdateChannel?.warning && (
-            <div className="flex items-start gap-1.5 rounded-lg bg-[var(--primary)]/10 px-2.5 py-2 text-[0.6875rem] text-[var(--primary)] ring-1 ring-[var(--primary)]/30">
-              <AlertTriangle size="0.8125rem" className="mt-0.5 shrink-0" />
-              <span>{selectedUpdateChannel.warning}</span>
-            </div>
-          )}
-
-          {updateCheck.data && !updateCheck.data.updateAvailable && (
-            <div className="flex items-center gap-1.5 rounded-lg bg-[var(--secondary)] px-2.5 py-2 ring-1 ring-[var(--border)]">
-              <Check size="0.8125rem" className="text-green-500 shrink-0" />
-              <div className="flex flex-col gap-0.5">
-                <span className="text-xs">
-                  {localizeUi("ui.panels.advancedsettings.youReOnTheLatest")}{" "}
-                  {updateCheck.data.channelLabel ?? "release"} {localizeUi("ui.panels.advancedsettings.target")}
-                  {currentReleaseLabel})
-                </span>
-                <span className="text-[0.6875rem] text-[var(--muted-foreground)]">{currentBuildLabel}</span>
-              </div>
-            </div>
-          )}
-
-          {updateCheck.data?.updateAvailable && (
-            <div className="flex flex-col gap-2 rounded-lg bg-[var(--secondary)] p-2.5 ring-1 ring-[var(--border)]">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-medium">
-                  {updateCheck.data.channelSwitch
-                    ? localizeUi("ui.panels.advancedsettings.switchToValue1", {
-                        value1: updateCheck.data.channelLabel,
-                      })
-                    : updateCheck.data.versionUpdate
-                      ? localizeUi("ui.panels.advancedsettings.vValue1Available", {
-                          value1: updateCheck.data.latestVersion,
-                        })
-                      : localizeUi("ui.panels.advancedsettings.value1CommitValue2BehindValue3", {
-                          value1: commitsBehind,
-                          value2: commitsBehind !== 1 ? localizeUi("ui.noodle.stageprofileview.s") : "",
-                          value3: updateCheck.data.targetRef ?? localizeUi("ui.panels.advancedsettings.originMain"),
-                        })}
-                </span>
-                {updateCheck.data.versionUpdate && (
-                  <a
-                    href={updateCheck.data.releaseUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center gap-1 text-[0.625rem] text-[var(--primary)] hover:underline"
-                  >
-                    {localizeUi("ui.panels.advancedsettings.releaseNotes")} <ExternalLink size="0.625rem" />
-                  </a>
-                )}
-              </div>
-              {updateCheck.data.versionUpdate && updateCheck.data.releaseNotes && (
-                <p className="text-[0.625rem] text-[var(--muted-foreground)] line-clamp-4 whitespace-pre-wrap">
-                  {updateCheck.data.releaseNotes}
-                </p>
-              )}
-              {commitsBehind > 0 && (
-                <p className="text-[0.625rem] text-[var(--muted-foreground)]">
-                  {localizeUi("ui.panels.advancedsettings.commitCountsCompareThisBuildWith")}{" "}
-                  {updateCheck.data.targetRef ?? "origin/main"}{" "}
-                  {localizeUi("ui.panels.advancedsettings.andMayIncludeUnreleasedDevelopmentCommitsNotJustTagged")}
-                </p>
-              )}
-              {isIosClient && (
-                <p className="text-[0.625rem] text-[var(--muted-foreground)]">
-                  {localizeUi("ui.panels.advancedsettings.onIphoneOrIpadThisUpdatesTheMarinaraServer")}
-                </p>
-              )}
-              {updateCheck.data.applyAvailable ? (
-                <button
-                  type="button"
-                  onClick={() => applyUpdate.mutate()}
-                  disabled={applyUpdate.isPending}
-                  className={SETTINGS_PRIMARY_FULL_BUTTON_CLASS}
+                {localizeUi("ui.panels.advancedsettings.releaseChannel")}
+                <select
+                  value={selectedUpdateChannelId ?? ""}
+                  onChange={(event) => setUpdateChannel(event.target.value as UpdateChannelId)}
+                  className="w-full rounded-lg bg-[var(--background)] px-3 py-2 text-xs font-medium normal-case tracking-normal text-[var(--foreground)] outline-none ring-1 ring-[var(--border)] focus:ring-[var(--primary)]"
                 >
-                  {applyUpdate.isPending ? (
-                    <>
-                      <Loader2 size="0.8125rem" className="animate-spin" />
-                      {updateCheck.data.channelSwitch
-                        ? localizeUi("ui.panels.advancedsettings.switching")
-                        : localizeUi("ui.panels.advancedsettings.updating")}
-                    </>
-                  ) : (
-                    <>
-                      <Download size="0.8125rem" />
-                      {updateCheck.data.channelSwitch
-                        ? localizeUi("ui.panels.advancedsettings.switchToValue1", {
-                            value1: updateCheck.data.channelLabel,
-                          })
-                        : localizeUi("ui.panels.advancedsettings.applyUpdate")}
-                    </>
+                  {!selectedUpdateChannelId && (
+                    <option value="" disabled>
+                      {localizeUi("settings.updates.channelPending")}
+                    </option>
                   )}
-                </button>
-              ) : (
-                <div className="flex flex-col gap-1.5 rounded-lg bg-[var(--background)]/60 p-2 ring-1 ring-[var(--border)]">
-                  <div className="flex items-start gap-1.5">
-                    <AlertTriangle size="0.8125rem" className="mt-0.5 shrink-0 text-amber-500" />
-                    <span className="text-[0.6875rem] text-[var(--muted-foreground)]">{applyUnavailableCopy}</span>
-                  </div>
+                  {updateChannelOptions.map((channel) => (
+                    <option key={channel.id} value={channel.id}>
+                      {channel.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                onClick={() => updateCheck.refetch()}
+                disabled={updateCheck.isFetching}
+                className={SETTINGS_PRIMARY_FULL_BUTTON_CLASS}
+              >
+                {updateCheck.isFetching ? (
+                  <>
+                    <Loader2 size="0.8125rem" className="animate-spin" />
+                    {localizeUi("settings.notifications.customSound.status.loading")}
+                  </>
+                ) : (
+                  <>
+                    <RefreshCw size="0.8125rem" />
+                    {localizeUi("ui.panels.advancedsettings.checkForUpdates")}
+                  </>
+                )}
+              </button>
+              <div className="flex flex-col px-1 text-[0.6875rem] text-[var(--muted-foreground)]">
+                <span>
+                  {localizeUi("ui.panels.advancedsettings.release")} {currentReleaseLabel}
+                </span>
+                <span>{currentBuildLabel}</span>
+                {updateCheck.data?.currentBranch && (
+                  <span>
+                    {localizeUi("ui.panels.advancedsettings.branch")} {updateCheck.data.currentBranch}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {selectedUpdateChannel?.warning && (
+              <div className="flex items-start gap-1.5 rounded-lg bg-[var(--primary)]/10 px-2.5 py-2 text-[0.6875rem] text-[var(--primary)] ring-1 ring-[var(--primary)]/30">
+                <AlertTriangle size="0.8125rem" className="mt-0.5 shrink-0" />
+                <span>{selectedUpdateChannel.warning}</span>
+              </div>
+            )}
+
+            {updateCheck.data && !updateCheck.data.updateAvailable && (
+              <div className="flex items-center gap-1.5 rounded-lg bg-[var(--secondary)] px-2.5 py-2 ring-1 ring-[var(--border)]">
+                <Check size="0.8125rem" className="text-green-500 shrink-0" />
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-xs">
+                    {localizeUi("ui.panels.advancedsettings.youReOnTheLatest")}{" "}
+                    {updateCheck.data.channelLabel ?? "release"} {localizeUi("ui.panels.advancedsettings.target")}
+                    {currentReleaseLabel})
+                  </span>
+                  <span className="text-[0.6875rem] text-[var(--muted-foreground)]">{currentBuildLabel}</span>
+                </div>
+              </div>
+            )}
+
+            {updateCheck.data?.updateAvailable && (
+              <div className="flex flex-col gap-2 rounded-lg bg-[var(--secondary)] p-2.5 ring-1 ring-[var(--border)]">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-medium">
+                    {updateCheck.data.channelSwitch
+                      ? localizeUi("ui.panels.advancedsettings.switchToValue1", {
+                          value1: updateCheck.data.channelLabel,
+                        })
+                      : updateCheck.data.versionUpdate
+                        ? localizeUi("ui.panels.advancedsettings.vValue1Available", {
+                            value1: updateCheck.data.latestVersion,
+                          })
+                        : localizeUi("ui.panels.advancedsettings.value1CommitValue2BehindValue3", {
+                            value1: commitsBehind,
+                            value2: commitsBehind !== 1 ? localizeUi("ui.noodle.stageprofileview.s") : "",
+                            value3: updateCheck.data.targetRef ?? localizeUi("ui.panels.advancedsettings.originMain"),
+                          })}
+                  </span>
                   {updateCheck.data.versionUpdate && (
                     <a
                       href={updateCheck.data.releaseUrl}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className={SETTINGS_PRIMARY_FULL_BUTTON_CLASS}
+                      className="flex items-center gap-1 text-[0.625rem] text-[var(--primary)] hover:underline"
                     >
-                      <Download size="0.8125rem" />
-                      {localizeUi("ui.panels.advancedsettings.downloadV")}
-                      {updateCheck.data.latestVersion}
+                      {localizeUi("ui.panels.advancedsettings.releaseNotes")} <ExternalLink size="0.625rem" />
                     </a>
                   )}
-                  {updateCheck.data.versionUpdate && (
-                    <span className="text-[0.625rem] text-[var(--muted-foreground)]">
-                      {localizeUi("ui.panels.advancedsettings.androidApkAssetsAreWebviewShellsNotStandaloneApps")}
-                    </span>
-                  )}
-                  {manualUpdateHint && (
-                    <span className="text-[0.625rem] text-[var(--muted-foreground)]">{manualUpdateHint}</span>
-                  )}
-                  {installType === "docker" && updateCheck.data.dockerImageTag && (
-                    <span className="text-[0.625rem] text-[var(--muted-foreground)]">
-                      {localizeUi("ui.panels.advancedsettings.containerTag")}{" "}
-                      <code className="break-all rounded bg-[var(--background)] px-1 py-0.5">
-                        {updateCheck.data.dockerImageTag}
-                      </code>
-                      {updateCheck.data.dockerLiteImageTag ? (
-                        <>
-                          {" "}
-                          {localizeUi("ui.panels.advancedsettings.lite")}{" "}
-                          <code className="break-all rounded bg-[var(--background)] px-1 py-0.5">
-                            {updateCheck.data.dockerLiteImageTag}
-                          </code>
-                        </>
-                      ) : null}
-                    </span>
-                  )}
-                  {manualUpdateCommand && <ManualUpdateCommand command={manualUpdateCommand} />}
                 </div>
-              )}
-            </div>
-          )}
+                {updateCheck.data.versionUpdate && updateCheck.data.releaseNotes && (
+                  <p className="text-[0.625rem] text-[var(--muted-foreground)] line-clamp-4 whitespace-pre-wrap">
+                    {updateCheck.data.releaseNotes}
+                  </p>
+                )}
+                {commitsBehind > 0 && (
+                  <p className="text-[0.625rem] text-[var(--muted-foreground)]">
+                    {localizeUi("ui.panels.advancedsettings.commitCountsCompareThisBuildWith")}{" "}
+                    {updateCheck.data.targetRef ?? "origin/main"}{" "}
+                    {localizeUi("ui.panels.advancedsettings.andMayIncludeUnreleasedDevelopmentCommitsNotJustTagged")}
+                  </p>
+                )}
+                {isIosClient && (
+                  <p className="text-[0.625rem] text-[var(--muted-foreground)]">
+                    {localizeUi("ui.panels.advancedsettings.onIphoneOrIpadThisUpdatesTheMarinaraServer")}
+                  </p>
+                )}
+                {updateCheck.data.applyAvailable ? (
+                  <button
+                    type="button"
+                    onClick={() => applyUpdate.mutate()}
+                    disabled={applyUpdate.isPending}
+                    className={SETTINGS_PRIMARY_FULL_BUTTON_CLASS}
+                  >
+                    {applyUpdate.isPending ? (
+                      <>
+                        <Loader2 size="0.8125rem" className="animate-spin" />
+                        {updateCheck.data.channelSwitch
+                          ? localizeUi("ui.panels.advancedsettings.switching")
+                          : localizeUi("ui.panels.advancedsettings.updating")}
+                      </>
+                    ) : (
+                      <>
+                        <Download size="0.8125rem" />
+                        {updateCheck.data.channelSwitch
+                          ? localizeUi("ui.panels.advancedsettings.switchToValue1", {
+                              value1: updateCheck.data.channelLabel,
+                            })
+                          : localizeUi("ui.panels.advancedsettings.applyUpdate")}
+                      </>
+                    )}
+                  </button>
+                ) : (
+                  <div className="flex flex-col gap-1.5 rounded-lg bg-[var(--background)]/60 p-2 ring-1 ring-[var(--border)]">
+                    <div className="flex items-start gap-1.5">
+                      <AlertTriangle size="0.8125rem" className="mt-0.5 shrink-0 text-amber-500" />
+                      <span className="text-[0.6875rem] text-[var(--muted-foreground)]">{applyUnavailableCopy}</span>
+                    </div>
+                    {updateCheck.data.versionUpdate && (
+                      <a
+                        href={updateCheck.data.releaseUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className={SETTINGS_PRIMARY_FULL_BUTTON_CLASS}
+                      >
+                        <Download size="0.8125rem" />
+                        {localizeUi("ui.panels.advancedsettings.downloadV")}
+                        {updateCheck.data.latestVersion}
+                      </a>
+                    )}
+                    {updateCheck.data.versionUpdate && (
+                      <span className="text-[0.625rem] text-[var(--muted-foreground)]">
+                        {localizeUi("ui.panels.advancedsettings.androidApkAssetsAreWebviewShellsNotStandaloneApps")}
+                      </span>
+                    )}
+                    {manualUpdateHint && (
+                      <span className="text-[0.625rem] text-[var(--muted-foreground)]">{manualUpdateHint}</span>
+                    )}
+                    {installType === "docker" && updateCheck.data.dockerImageTag && (
+                      <span className="text-[0.625rem] text-[var(--muted-foreground)]">
+                        {localizeUi("ui.panels.advancedsettings.containerTag")}{" "}
+                        <code className="break-all rounded bg-[var(--background)] px-1 py-0.5">
+                          {updateCheck.data.dockerImageTag}
+                        </code>
+                        {updateCheck.data.dockerLiteImageTag ? (
+                          <>
+                            {" "}
+                            {localizeUi("ui.panels.advancedsettings.lite")}{" "}
+                            <code className="break-all rounded bg-[var(--background)] px-1 py-0.5">
+                              {updateCheck.data.dockerLiteImageTag}
+                            </code>
+                          </>
+                        ) : null}
+                      </span>
+                    )}
+                    {manualUpdateCommand && <ManualUpdateCommand command={manualUpdateCommand} />}
+                  </div>
+                )}
+              </div>
+            )}
 
-          {updateCheck.isError && (
-            <div className="flex items-center gap-1.5 rounded-lg bg-[var(--destructive)]/10 px-2.5 py-2 text-xs text-[var(--destructive)]">
-              <AlertTriangle size="0.8125rem" className="shrink-0" />
-              {localizeUi("ui.panels.advancedsettings.couldNotCheckForUpdatesTryAgainLater")}
-            </div>
-          )}
+            {updateCheck.isError && (
+              <div className="flex items-center gap-1.5 rounded-lg bg-[var(--destructive)]/10 px-2.5 py-2 text-xs text-[var(--destructive)]">
+                <AlertTriangle size="0.8125rem" className="shrink-0" />
+                {localizeUi("ui.panels.advancedsettings.couldNotCheckForUpdatesTryAgainLater")}
+              </div>
+            )}
 
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => void handleForceRefreshSpa()}
-              disabled={refreshingSpa}
-              className={cn(SETTINGS_PRIMARY_BUTTON_CLASS, "flex-1")}
-            >
-              {refreshingSpa ? (
-                <>
-                  <Loader2 size="0.8125rem" className="animate-spin" />
-                  {localizeUi("ui.panels.advancedsettings.refreshing")}
-                </>
-              ) : (
-                <>
-                  <RefreshCw size="0.8125rem" />
-                  {localizeUi("ui.panels.advancedsettings.refreshApp")}
-                </>
-              )}
-            </button>
-            <HelpTooltip
-              side="bottom"
-              text={localizeUi("ui.panels.advancedsettings.manualRefreshUnregistersTheActiveServiceWorkerAndClears")}
-            />
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleForceRefreshSpa()}
+                disabled={refreshingSpa}
+                className={cn(SETTINGS_PRIMARY_BUTTON_CLASS, "flex-1")}
+              >
+                {refreshingSpa ? (
+                  <>
+                    <Loader2 size="0.8125rem" className="animate-spin" />
+                    {localizeUi("ui.panels.advancedsettings.refreshing")}
+                  </>
+                ) : (
+                  <>
+                    <RefreshCw size="0.8125rem" />
+                    {localizeUi("ui.panels.advancedsettings.refreshApp")}
+                  </>
+                )}
+              </button>
+              <HelpTooltip
+                side="bottom"
+                text={localizeUi("ui.panels.advancedsettings.manualRefreshUnregistersTheActiveServiceWorkerAndClears")}
+              />
+            </div>
           </div>
-        </div>
-      </SettingsSection>
+        </SettingsSection>
+      )}
 
       <SettingsSection
         title={localizeUi("ui.panels.advancedsettings.supportDiagnostics")}
@@ -7848,20 +7880,22 @@ function AdvancedSettings() {
             onChange={setDebugMode}
             help={localizeUi("settings.controls.debugMode.help")}
           />
-          <div className="flex items-center gap-2">
-            <div className="min-w-0 flex-1" title={nativeConsoleHelp}>
-              <button
-                type="button"
-                onClick={handleOpenNativeConsole}
-                disabled={!canOpenNativeConsole}
-                className={SETTINGS_PRIMARY_FULL_BUTTON_CLASS}
-              >
-                <Terminal size="0.8125rem" className="shrink-0" />
-                <span>{localizeUi("ui.panels.advancedsettings.openConsole")}</span>
-              </button>
+          {!isNativeIosApp() && (
+            <div className="flex items-center gap-2">
+              <div className="min-w-0 flex-1" title={nativeConsoleHelp}>
+                <button
+                  type="button"
+                  onClick={handleOpenNativeConsole}
+                  disabled={!canOpenNativeConsole}
+                  className={SETTINGS_PRIMARY_FULL_BUTTON_CLASS}
+                >
+                  <Terminal size="0.8125rem" className="shrink-0" />
+                  <span>{localizeUi("ui.panels.advancedsettings.openConsole")}</span>
+                </button>
+              </div>
+              <HelpTooltip side="bottom" text={nativeConsoleHelp} />
             </div>
-            <HelpTooltip side="bottom" text={nativeConsoleHelp} />
-          </div>
+          )}
         </div>
       </SettingsSection>
 
@@ -7873,6 +7907,7 @@ function AdvancedSettings() {
         {...getSettingsSectionAnchorProps("backup-export")}
       >
         <div className="flex flex-col gap-2">
+          {isNativeIosApp() && <IosBackupSettings />}
           {automaticBackupQuery.data && (
             <div className="rounded-lg border border-[var(--border)]/70 bg-[var(--secondary)]/35 p-2.5">
               <ToggleSetting
@@ -7943,24 +7978,26 @@ function AdvancedSettings() {
               </div>
             </div>
           )}
-          <button
-            type="button"
-            onClick={handleCreateBackup}
-            disabled={creatingBackup}
-            className={SETTINGS_PRIMARY_FULL_BUTTON_CLASS}
-          >
-            {creatingBackup ? (
-              <>
-                <Loader2 size="0.8125rem" className="animate-spin" />
-                {localizeUi("ui.panels.advancedsettings.creatingBackup")}
-              </>
-            ) : (
-              <>
-                <Download size="0.8125rem" />
-                {localizeUi("ui.panels.advancedsettings.downloadBackup")}
-              </>
-            )}
-          </button>
+          {!isNativeIosApp() && (
+            <button
+              type="button"
+              onClick={handleCreateBackup}
+              disabled={creatingBackup}
+              className={SETTINGS_PRIMARY_FULL_BUTTON_CLASS}
+            >
+              {creatingBackup ? (
+                <>
+                  <Loader2 size="0.8125rem" className="animate-spin" />
+                  {localizeUi("ui.panels.advancedsettings.creatingBackup")}
+                </>
+              ) : (
+                <>
+                  <Download size="0.8125rem" />
+                  {localizeUi("ui.panels.advancedsettings.downloadBackup")}
+                </>
+              )}
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setExportProfileDialogOpen(true)}
@@ -8170,39 +8207,41 @@ function AdvancedSettings() {
               </div>
             </div>
           )}
-          <div className="mt-2 flex flex-col gap-2 rounded-lg border border-[var(--border)] bg-[var(--background)]/45 p-2.5">
-            <ToggleSetting
-              label={t("settings.agentImports.toggle.label")}
-              checked={agentImportPolicy?.enabled ?? false}
-              onChange={(enabled) => void handleAgentImportsToggle(enabled)}
-              disabled={agentImportPolicyLoading || setAgentImportsEnabled.isPending}
-              help={t("settings.agentImports.toggle.help")}
-            />
-            <div className="flex items-start gap-2 text-[0.6875rem] leading-relaxed text-[var(--primary)]">
-              <ShieldAlert size="0.875rem" className="mt-0.5 shrink-0" />
-              <p>{t("settings.agentImports.warning")}</p>
+          {!isNativeIosApp() && (
+            <div className="mt-2 flex flex-col gap-2 rounded-lg border border-[var(--border)] bg-[var(--background)]/45 p-2.5">
+              <ToggleSetting
+                label={t("settings.agentImports.toggle.label")}
+                checked={agentImportPolicy?.enabled ?? false}
+                onChange={(enabled) => void handleAgentImportsToggle(enabled)}
+                disabled={agentImportPolicyLoading || setAgentImportsEnabled.isPending}
+                help={t("settings.agentImports.toggle.help")}
+              />
+              <div className="flex items-start gap-2 text-[0.6875rem] leading-relaxed text-[var(--primary)]">
+                <ShieldAlert size="0.875rem" className="mt-0.5 shrink-0" />
+                <p>{t("settings.agentImports.warning")}</p>
+              </div>
+              <div className="my-1 border-t border-[var(--border)]" />
+              <ToggleSetting
+                label={t("settings.externalExtensions.toggle.label")}
+                checked={extensionPolicy?.externalExtensionsEnabled ?? false}
+                onChange={(enabled) => void handleExternalExtensionsToggle(enabled)}
+                disabled={
+                  extensionPolicyLoading ||
+                  setExternalExtensionsEnabled.isPending ||
+                  !extensionPolicy?.externalExtensionsEnvEnabled
+                }
+                help={
+                  extensionPolicy?.externalExtensionsEnvEnabled
+                    ? t("settings.externalExtensions.toggle.help")
+                    : t("settings.externalExtensions.toggle.locked")
+                }
+              />
+              <div className="flex items-start gap-2 text-[0.6875rem] leading-relaxed text-[var(--primary)]">
+                <ShieldAlert size="0.875rem" className="mt-0.5 shrink-0" />
+                <p>{t("settings.externalExtensions.warning")}</p>
+              </div>
             </div>
-            <div className="my-1 border-t border-[var(--border)]" />
-            <ToggleSetting
-              label={t("settings.externalExtensions.toggle.label")}
-              checked={extensionPolicy?.externalExtensionsEnabled ?? false}
-              onChange={(enabled) => void handleExternalExtensionsToggle(enabled)}
-              disabled={
-                extensionPolicyLoading ||
-                setExternalExtensionsEnabled.isPending ||
-                !extensionPolicy?.externalExtensionsEnvEnabled
-              }
-              help={
-                extensionPolicy?.externalExtensionsEnvEnabled
-                  ? t("settings.externalExtensions.toggle.help")
-                  : t("settings.externalExtensions.toggle.locked")
-              }
-            />
-            <div className="flex items-start gap-2 text-[0.6875rem] leading-relaxed text-[var(--primary)]">
-              <ShieldAlert size="0.875rem" className="mt-0.5 shrink-0" />
-              <p>{t("settings.externalExtensions.warning")}</p>
-            </div>
-          </div>
+          )}
         </div>
       </SettingsSection>
     </div>

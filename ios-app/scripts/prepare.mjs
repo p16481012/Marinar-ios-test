@@ -29,6 +29,7 @@ const result = await build({
   } }],
 });
 await cp(path.join(root, 'scripts/bootstrap.cjs'), path.join(runtime, 'bootstrap.cjs'));
+await cp(path.join(root, 'scripts/restore-core.cjs'), path.join(runtime, 'restore-core.cjs'));
 await cp(path.join(repo, 'packages/server/src/db/default-preset.json'), path.join(runtime, 'default-preset.json'));
 // Assets are generated under this fixed runtime path; drop upstream removals too.
 const assetDestination = path.resolve(runtime, 'assets');

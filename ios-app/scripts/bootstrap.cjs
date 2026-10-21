@@ -24,10 +24,20 @@ Object.assign(process.env, {
 });
 if (config.bootId) process.env.MARINARA_IOS_BOOT_ID = config.bootId;
 else delete process.env.MARINARA_IOS_BOOT_ID;
-fs.mkdirSync(config.dataDir, { recursive: true });
-fs.mkdirSync(path.dirname(config.envFile), { recursive: true });
-process.chdir(config.dataDir);
-import(pathToFileURL(path.join(config.runtimeRoot, 'server.mjs')).href).catch(error => {
+const restore = require('./restore-core.cjs');
+(async () => {
+  fs.mkdirSync(path.dirname(config.envFile), { recursive: true });
+  // The native shell may start Node inside dataDir. Leave that directory
+  // before a restore renames it; Windows holds the current directory open.
+  process.chdir(path.dirname(config.envFile));
+  if (await restore.applyPendingRestore(config)) delete process.env.ENCRYPTION_KEY;
+  fs.mkdirSync(config.dataDir, { recursive: true });
+  process.chdir(config.dataDir);
+  await import(pathToFileURL(path.join(config.runtimeRoot, 'server.mjs')).href);
+  await restore.finishRestore(config);
+})().catch(error => {
   console.error('Embedded server startup failed:', error);
+  // An uncommitted restore is rolled back on the next cold launch, before
+  // any file-store instance or encryption-key cache is initialized.
   process.exitCode = 1;
 });

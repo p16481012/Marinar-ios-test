@@ -16,7 +16,11 @@ const option = (name) => { const i = args.indexOf(name); return i < 0 ? undefine
 const entry = resolve(root, option("--entry") ?? "packages/server/dist/ios.js");
 const output = resolve(root, option("--output") ?? ".tmp/ios-chat-lifecycle");
 await mkdir(output, { recursive: true });
-const dataDir = await mkdtemp(join(output, "profile-"));
+const profileRoot = await mkdtemp(join(output, "profile-"));
+const dataDir = join(profileRoot, "Documents/Marinar");
+const envFile = join(profileRoot, "Library/Application Support/marinar.env");
+await mkdir(dataDir, { recursive: true });
+await mkdir(dirname(envFile), { recursive: true });
 const installationId = randomUUID();
 const stateFile = join(output, "chat-state.json");
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
@@ -46,17 +50,17 @@ async function startServer() {
   const port = await freePort();
   const token = randomBytes(32).toString("hex");
   const baseUrl = `http://127.0.0.1:${port}`;
-  const configPath = join(dataDir, "launch-config.json");
+  const configPath = join(dirname(envFile), "launch-config.json");
   const runtimeRoot = dirname(entry);
   await writeFile(configPath, JSON.stringify({
-    dataDir, envFile: join(dataDir, ".env"), port, token,
+    dataDir, envFile, port, token,
     deploymentId: "development", installationId, runtimeRoot, clientRoot: join(runtimeRoot, "client"),
   }) + "\n", { mode: 0o600 });
   const env = {
     ...process.env, NODE_ENV: "production", MARINARA_IOS: "1", MARINARA_LITE: "1",
     MARINARA_IOS_TOKEN: token, MARINARA_IOS_INSTALLATION_ID: installationId,
     DATA_DIR: dataDir, FILE_STORAGE_DIR: join(dataDir, "storage"),
-    MARINARA_ENV_FILE: join(dataDir, ".env"), HOST: "127.0.0.1", PORT: String(port),
+    MARINARA_ENV_FILE: envFile, HOST: "127.0.0.1", PORT: String(port),
     LOG_LEVEL: "warn", AUTO_CREATE_DEFAULT_CONNECTION: "false", NO_COLOR: "1",
   };
   const childArgs = basename(entry) === "bootstrap.cjs" ? [entry, configPath] : [entry];

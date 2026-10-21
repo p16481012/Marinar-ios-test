@@ -290,3 +290,4 @@ export * from "./utils/message-marks.js";
 
 export * from "./utils/game-tag-parser.js";
 export * from "./utils/game-widget-update.js";
+export type { IosBackupStatus, IosRestoreStatus } from "./types/ios.js";

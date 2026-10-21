@@ -9,6 +9,7 @@ import { pipeline } from "stream/promises";
 import { nanoid } from "nanoid";
 import { DATA_DIR } from "../utils/data-dir.js";
 import { assertInsideDir } from "../utils/security.js";
+import { isIosRuntime } from "../config/ios-runtime.js";
 
 const SOURCES_DIR = join(DATA_DIR, "knowledge-sources");
 const META_FILE = join(SOURCES_DIR, "meta.json");
@@ -18,6 +19,16 @@ const TEXT_EXTS = new Set([".txt", ".md", ".csv", ".json", ".xml", ".html", ".ht
 // PDF support via pdf-parse
 const PDF_EXTS = new Set([".pdf"]);
 const ALLOWED_EXTS = new Set([...TEXT_EXTS, ...PDF_EXTS]);
+const iosPdfUnavailable = () =>
+  Object.assign(
+    new Error(
+      "Local PDF text extraction is unavailable in the iOS app. Add a TXT or Markdown knowledge source instead.",
+    ),
+    {
+      code: "IOS_FEATURE_UNAVAILABLE",
+      statusCode: 501,
+    },
+  );
 
 interface SourceMeta {
   id: string;
@@ -172,6 +183,7 @@ export async function extractFileText(
   if (TEXT_EXTS.has(ext)) {
     text = await readFile(filePath, "utf-8");
   } else if (PDF_EXTS.has(ext)) {
+    if (isIosRuntime) throw iosPdfUnavailable();
     let pdf: { getText: () => Promise<{ text: string }>; destroy: () => Promise<void> | void } | undefined;
     try {
       const { PDFParse } = await import("pdf-parse");
@@ -221,6 +233,11 @@ export async function knowledgeSourcesRoutes(app: FastifyInstance) {
     }
 
     const ext = extname(data.filename).toLowerCase();
+    if (isIosRuntime && PDF_EXTS.has(ext)) {
+      data.file.resume();
+      const error = iosPdfUnavailable();
+      return reply.code(501).send({ code: error.code, error: error.message });
+    }
     if (!ALLOWED_EXTS.has(ext)) {
       return reply.status(400).send({
         error: `Unsupported file type: ${ext}. Supported: ${[...ALLOWED_EXTS].join(", ")}`,

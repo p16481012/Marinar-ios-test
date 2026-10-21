@@ -3,7 +3,7 @@ import "./config/ios-runtime.js";
 import "./lib/compromised-certificate-authorities.js";
 import { buildApp } from "./app.js";
 import { getIosRuntimeConfig } from "./config/ios-runtime.js";
-import { flushDB } from "./db/connection.js";
+import { closeDB, flushDB } from "./db/connection.js";
 import { logger } from "./lib/logger.js";
 
 async function main() {
@@ -28,7 +28,11 @@ async function main() {
   process.once("SIGINT", close);
 }
 
-main().catch((error) => {
+try {
+  await main();
+} catch (error) {
   logger.error(error, "Marinara iOS startup failed");
+  await closeDB();
   process.exitCode = 1;
-});
+  throw error;
+}

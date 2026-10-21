@@ -1,6 +1,7 @@
 import { toast } from "sonner";
 import { getAndroidBridgeToken } from "./android-bridge";
 import { isIosWebKitBrowser } from "./generation-stream-policy";
+import { isNativeIosApp } from "./ios-runtime";
 
 type MarinaraAndroidFileBridge = {
   saveFile?: {
@@ -208,6 +209,12 @@ export async function saveExportFile(
   options: { savePicker?: boolean } = {},
 ): Promise<ExportSaveStatus> {
   try {
+    if (isNativeIosApp()) {
+      // WKDownload writes the Blob to a file and opens the native share sheet.
+      // It does not need a second tap after an asynchronous export request.
+      triggerBrowserDownload(blob, filename);
+      return "saved";
+    }
     if (typeof getAndroidFileBridge()?.saveFile === "function") {
       await saveBlobToDevice(blob, filename);
       return "saved";
@@ -241,6 +248,23 @@ export async function saveExportFile(
 
 /** Fetch a same-origin file and save it like an export. Call it straight from the tap; it never rejects. */
 export async function saveExportUrl(url: string, filename: string): Promise<ExportSaveStatus> {
+  if (isNativeIosApp()) {
+    try {
+      const target = new URL(url, window.location.href);
+      if (target.origin !== window.location.origin) throw new Error("Only app downloads can use native file export");
+      // Stream large archives straight to WKDownload instead of duplicating them in JS memory.
+      const anchor = document.createElement("a");
+      anchor.href = target.href;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      return "saved";
+    } catch (error) {
+      await showExportError(error);
+      return "failed";
+    }
+  }
   let blob: Blob;
   try {
     const response = await fetch(url);

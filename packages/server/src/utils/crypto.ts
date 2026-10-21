@@ -83,6 +83,11 @@ export function deriveServerKey(purpose: string): Buffer {
   return createHmac("sha256", getEncryptionKey()).update(purpose, "utf8").digest();
 }
 
+/** Only the authenticated full-backup writer may persist this secret. */
+export function getEncryptionKeyForBackup(): string {
+  return getEncryptionKey().toString("hex");
+}
+
 /** Encrypt a plaintext API key. Returns "iv:encrypted:authTag" in hex. */
 export function encryptApiKey(plaintext: string): string {
   if (!plaintext) return "";

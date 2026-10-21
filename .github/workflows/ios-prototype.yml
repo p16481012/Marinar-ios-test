@@ -30,6 +30,8 @@ jobs:
       - run: pnpm --filter @marinara-engine/client build
       - run: node ios-app/scripts/prepare.mjs
       - run: node scripts/ios/run-chat-lifecycle.mjs --entry ios-app/Resources/runtime/bootstrap.cjs
+      - run: node scripts/ios/run-provider-lifecycle.mjs --entry ios-app/Resources/runtime/bootstrap.cjs
+      - run: node scripts/ios/run-transfer-lifecycle.mjs --entry ios-app/Resources/runtime/bootstrap.cjs
       - name: Archive runtime without changing file permissions
         run: tar -czf ios-app/build/runtime.tar.gz -C ios-app/Resources runtime
       - uses: actions/upload-artifact@v4
@@ -44,6 +46,10 @@ jobs:
           path: |
             .tmp/ios-chat-lifecycle/report.json
             .tmp/ios-chat-lifecycle/server-*.log
+            .tmp/ios-provider-lifecycle/report.json
+            .tmp/ios-provider-lifecycle/transfer-server-*.log
+            .tmp/ios-transfer-lifecycle/report.json
+            .tmp/ios-transfer-lifecycle/transfer-server-*.log
           include-hidden-files: true
           retention-days: 7
   ios:

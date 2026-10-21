@@ -7,6 +7,7 @@ import type {
   UpdatePersonalExtensionInput,
 } from "@marinara-engine/shared";
 import { api } from "../lib/api-client";
+import { isNativeIosApp } from "../lib/ios-runtime";
 
 export const personalExtensionKeys = {
   all: ["personal-extensions"] as const,
@@ -18,7 +19,10 @@ export const personalExtensionKeys = {
 export function usePersonalExtensions() {
   return useQuery({
     queryKey: personalExtensionKeys.list(),
-    queryFn: () => api.get<PersonalExtension[]>("/personal-extensions"),
+    queryFn: () =>
+      isNativeIosApp()
+        ? Promise.resolve<PersonalExtension[]>([])
+        : api.get<PersonalExtension[]>("/personal-extensions"),
     staleTime: 30_000,
   });
 }
@@ -26,7 +30,10 @@ export function usePersonalExtensions() {
 export function usePersonalExtensionRuntime() {
   return useQuery({
     queryKey: personalExtensionKeys.runtime(),
-    queryFn: () => api.get<PersonalClientExtensionRuntime[]>("/personal-extensions/runtime/client"),
+    queryFn: () =>
+      isNativeIosApp()
+        ? Promise.resolve<PersonalClientExtensionRuntime[]>([])
+        : api.get<PersonalClientExtensionRuntime[]>("/personal-extensions/runtime/client"),
     staleTime: 30_000,
   });
 }
@@ -34,7 +41,16 @@ export function usePersonalExtensionRuntime() {
 export function usePersonalExtensionPolicy() {
   return useQuery({
     queryKey: personalExtensionKeys.policy(),
-    queryFn: () => api.get<PersonalExtensionPolicy>("/personal-extensions/policy"),
+    queryFn: () =>
+      isNativeIosApp()
+        ? Promise.resolve<PersonalExtensionPolicy>({
+            externalExtensionsEnvEnabled: false,
+            externalExtensionsEnabled: false,
+            serverSandboxAvailable: false,
+            serverSandboxBackend: null,
+            serverSandboxReason: null,
+          })
+        : api.get<PersonalExtensionPolicy>("/personal-extensions/policy"),
     staleTime: 30_000,
   });
 }

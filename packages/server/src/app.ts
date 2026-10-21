@@ -3,6 +3,7 @@
 // ──────────────────────────────────────────────
 import Fastify, { type FastifyBaseLogger } from "fastify";
 import { getIosRuntimeConfig, isIosRuntime } from "./config/ios-runtime.js";
+import { iosMaintenanceHook, iosMaintenanceRequestFinished } from "./services/ios/maintenance.js";
 import { iosRuntimeHook } from "./middleware/ios-runtime.js";
 import { iosRoutes } from "./routes/ios.routes.js";
 import { holdInjectUntilRegistered } from "./lib/fastify-inject-gate.js";
@@ -136,7 +137,12 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
   // Reject attacker-controlled DNS names before CORS or loopback trust can
   // treat a rebound browser request as same-origin local traffic.
   app.addHook("onRequest", hostValidationHook);
-  if (isIosRuntime) app.addHook("onRequest", iosRuntimeHook);
+  if (isIosRuntime) {
+    app.addHook("onRequest", iosRuntimeHook);
+    app.addHook("onRequest", iosMaintenanceHook);
+    app.addHook("onResponse", async (request) => iosMaintenanceRequestFinished(request));
+    app.addHook("onRequestAbort", async (request) => iosMaintenanceRequestFinished(request));
+  }
 
   // ── Plugins ──
   // CORS uses a per-request delegator so the trusted set is re-read each

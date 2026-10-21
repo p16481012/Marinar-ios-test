@@ -6383,12 +6383,14 @@ export async function generateRoutes(app: FastifyInstance, options: GenerateRout
                   if (text.trim()) {
                     materialParts.push(`## File: ${originalName}\n${text}`);
                   }
-                } catch {
+                } catch (error) {
+                  if ((error as { code?: string })?.code === "IOS_FEATURE_UNAVAILABLE") throw error;
                   /* skip unreadable or missing files */
                 }
               }
             }
-          } catch {
+          } catch (error) {
+            if ((error as { code?: string })?.code === "IOS_FEATURE_UNAVAILABLE") throw error;
             /* non-critical */
           }
 

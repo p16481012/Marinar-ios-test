@@ -516,8 +516,9 @@ export const api = {
   },
 
   /** Upload a file via multipart/form-data */
-  upload: async <T>(path: string, formData: FormData): Promise<T> => {
+  upload: async <T>(path: string, formData: FormData, init?: Omit<RequestInit, "method" | "body">): Promise<T> => {
     const res = await apiFetch(path, {
+      ...init,
       method: "POST",
       body: formData,
     });

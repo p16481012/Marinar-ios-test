@@ -39,6 +39,8 @@ import {
   useUIStore,
 } from "./stores/ui.store";
 import { useSidecarStore } from "./stores/sidecar.store";
+import { isNativeIosApp } from "./lib/ios-runtime";
+import { IosRestoreBanner } from "./components/diagnostics/IosRestoreBanner";
 import { useDialogStore } from "./stores/dialog.store";
 import { api, requestTimeoutSignal } from "./lib/api-client";
 import { forceRefreshSpa, reloadBrowser } from "./lib/browser-runtime";
@@ -486,7 +488,7 @@ export function App() {
   const notificationPosition = useUIStore((s) => s.notificationPosition);
   const omnibarOpen = useUIStore((s) => s.omnibarOpen);
   const [isMobileShell, setIsMobileShell] = useState(isMobileShellViewport);
-  const isLite = import.meta.env.VITE_MARINARA_LITE === "true";
+  const isLite = import.meta.env.VITE_MARINARA_LITE === "true" || isNativeIosApp();
   const fontSize = useUIStore((s) => s.fontSize);
   const language = useUIStore((s) => s.language);
   const visualTheme = useUIStore((s) => s.visualTheme);
@@ -1281,6 +1283,7 @@ export function App() {
       )}
       <AppDialogRenderer />
       <CsrfOriginWarningBanner />
+      {isNativeIosApp() && <IosRestoreBanner />}
       <div
         ref={toasterHostRef}
         // Sonner slides top toasts upward and extends their hover area above the visible box.

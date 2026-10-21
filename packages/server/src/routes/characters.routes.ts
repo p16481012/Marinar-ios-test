@@ -92,6 +92,7 @@ import {
 } from "../utils/media-file-security.js";
 import { logger, logDebugOverride } from "../lib/logger.js";
 import { isDebugAgentsEnabled } from "../config/runtime-config.js";
+import { isIosRuntime } from "../config/ios-runtime.js";
 import { parseLibraryPageQuery } from "../utils/list-pagination.js";
 import {
   resolveChatSummaryConnection,
@@ -2446,6 +2447,13 @@ export async function charactersRoutes(app: FastifyInstance) {
           if (imageInfo?.mimeType === "image/png") {
             pngBuffer = avatarBuffer;
           } else if (imageInfo) {
+            if (isIosRuntime) {
+              return reply.code(501).send({
+                code: "IOS_FEATURE_UNAVAILABLE",
+                error:
+                  "This avatar needs image conversion for PNG export. Use native character export to preserve the original image, or upload a PNG avatar first.",
+              });
+            }
             const sharp = (await import("sharp")).default;
             pngBuffer = await sharp(avatarBuffer).png().toBuffer();
           } else {

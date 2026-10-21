@@ -37,6 +37,7 @@ import { AgentArtwork } from "./AgentArtwork";
 import { AgentModeFilter, type AgentModeFilterValue } from "./AgentModeFilter";
 import { CustomAgentRepositoriesModal } from "./CustomAgentRepositoriesModal";
 import { useTranslation as useUiTranslation } from "react-i18next";
+import { isNativeIosApp } from "../../lib/ios-runtime";
 
 const CATEGORY_SECTIONS = [
   { id: "app", labelKey: "ui.agents.agentcatalogview.apps" },
@@ -150,6 +151,25 @@ function packageModes(packageId: string): readonly CatalogMode[] {
 }
 
 export function AgentCatalogView() {
+  const { t } = useUiTranslation();
+  const close = useUIStore((state) => state.closeAgentCatalog);
+  if (isNativeIosApp())
+    return (
+      <div className="flex h-full min-h-0 flex-col gap-4 bg-[var(--background)] p-4">
+        <button type="button" onClick={close} className="mari-chrome-control min-h-11 self-start px-3">
+          <ArrowLeft size="1rem" aria-hidden="true" />
+          {t("capabilities.actions.backToAgents")}
+        </button>
+        <h1 className="text-base font-semibold">{t("ios.runtime.agentCatalog")}</h1>
+        <p className="max-w-prose text-sm leading-relaxed text-[var(--muted-foreground)]">
+          {t("ios.runtime.extensions")}
+        </p>
+      </div>
+    );
+  return <DownloadableAgentCatalog />;
+}
+
+function DownloadableAgentCatalog() {
   const { t: localizeUi } = useUiTranslation();
   const closeAgentCatalog = useUIStore((state) => state.closeAgentCatalog);
   const initialPackageId = useUIStore((state) => state.agentCatalogInitialPackageId);
