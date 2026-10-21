@@ -100,14 +100,14 @@ final class MarinarUITests: XCTestCase {
         let export = app.webViews.buttons["Export test JSON"].firstMatch
         XCTAssertTrue(export.waitForExistence(timeout: 30))
         export.tap()
-        dismissExportShare("blob-export-share")
+        dismissExportShare("blob-export-share", expectedFilename: "marinar-ios-export")
         XCTAssertTrue(export.waitForExistence(timeout: 15))
         let streamed = app.webViews.buttons["Export streamed archive"].firstMatch
         let preparing = app.webViews.buttons["Preparing streamed archive"].firstMatch
         if streamed.exists || preparing.exists {
             XCTAssertTrue(streamed.waitForExistence(timeout: 180), "The real full backup did not become ready")
             streamed.tap()
-            dismissExportShare("streamed-backup-share")
+            dismissExportShare("streamed-backup-share", expectedFilename: "Marinar-iOS-full")
         }
         app.webViews.buttons["Test failed export"].firstMatch.tap()
         let failedExport = app.alerts["내보내기 실패"]
@@ -166,11 +166,19 @@ final class MarinarUITests: XCTestCase {
         return cancel
     }
 
-    private func dismissExportShare(_ screenshotName: String) {
-        let share = app.otherElements["marinar-export-share"].firstMatch
+    private func dismissExportShare(_ screenshotName: String, expectedFilename: String) {
+        // iOS can replace UIActivityViewController's original view with its
+        // remote share UI, which does not inherit our custom identifier.
+        // These system identifiers were observed in the exported hierarchy.
+        let share = app.otherElements.matching(NSPredicate(format:
+            "identifier IN %@", ["marinar-export-share", "ActivityListView", "ShareSheet.RemoteContainerView"])).firstMatch
         XCTAssertTrue(share.waitForExistence(timeout: 60), "Download did not open the native share sheet")
+        let filename = app.descendants(matching: .any).matching(NSPredicate(format:
+            "label CONTAINS %@", expectedFilename)).firstMatch
+        XCTAssertTrue(filename.waitForExistence(timeout: 30), "The share sheet does not contain the expected exported file")
         attachScreen(screenshotName)
-        let close = app.buttons.matching(NSPredicate(format: "label == 'Close' OR label == 'Cancel'")).firstMatch
+        let close = app.buttons.matching(NSPredicate(format:
+            "identifier == 'header.closeButton' OR label == 'Close' OR label == 'Cancel'")).firstMatch
         if close.waitForExistence(timeout: 5) { close.tap() }
         else { app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.98)).tap() } // iPad popover
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: share)

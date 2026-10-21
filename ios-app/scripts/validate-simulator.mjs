@@ -48,6 +48,14 @@ async function run(command, commandArgs, { log, allowFailure = false, env } = {}
   });
   if (stream) await new Promise((resolve) => stream.end(resolve));
   const text = Buffer.concat(output).toString('utf8').trim();
+  if (code !== 0 && log && command === 'xcodebuild') {
+    // Show only compiler/XCTest diagnostics here. Native runtime stdout and
+    // launch configuration are deliberately excluded from console output.
+    const lines = (await readFile(path.join(reportDir, log), 'utf8').catch(() => '')).trim().split('\n');
+    const failures = lines.filter((line) => /error:|Test Case .*failed|Testing failed:/.test(line)).slice(-20);
+    const summary = [...new Set([...failures, ...lines.slice(-60)])].slice(-80);
+    console.error(`xcodebuild failure details (${log}):\n${summary.join('\n')}`);
+  }
   if (code !== 0 && !allowFailure) throw new Error(`${command} exited ${code}${log ? `; see ${log}` : `: ${text.slice(-2000)}`}`);
   return text;
 }
