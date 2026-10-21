@@ -77,6 +77,9 @@ final class MarinarUITests: XCTestCase {
         hierarchy.name = "startup-recovered-accessibility-hierarchy"
         hierarchy.lifetime = .keepAlways
         add(hierarchy)
+        // The ready screen and real controls above are the success verdict.
+        // Termination is intentional cleanup after that evidence was captured.
+        app.terminate()
     }
 
     private func attachScreen(_ name: String) {

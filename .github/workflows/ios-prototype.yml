@@ -98,6 +98,7 @@ jobs:
             ios-app/build/validation/**/simulator-validation.json
             ios-app/build/validation/**/*export-events*.json
             ios-app/build/validation/**/*startup-state*.json
+            ios-app/build/validation/**/*startup-ready-state*.json
             ios-app/build/validation/**/*settings-restore-fixture.json
             ios-app/build/validation/**/*startup-live.log
             ios-app/build/validation/**/*ui-tests.log

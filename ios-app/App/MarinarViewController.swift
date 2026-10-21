@@ -336,6 +336,12 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
             "pid": ProcessInfo.processInfo.processIdentifier]
         if let data = try? JSONSerialization.data(withJSONObject: record) {
             try? data.write(to: Self.diagnosticsDirectory.appendingPathComponent("startup-state.json"), options: .atomic)
+            // XCTest can intentionally terminate the app after proving the UI
+            // is ready. Preserve that real success separately from exit-time
+            // callbacks, while keeping the ordinary final-state log intact.
+            if startupPhase == .ready, startup.status == .ready, !terminalFailure {
+                try? data.write(to: Self.diagnosticsDirectory.appendingPathComponent("startup-ready-state.json"), options: .atomic)
+            }
         }
         #endif
     }

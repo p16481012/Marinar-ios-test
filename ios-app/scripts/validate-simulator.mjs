@@ -393,7 +393,7 @@ async function preserveLaunchLogs() {
   for (const file of launchLogs) await copyFile(file, path.join(reportDir, path.basename(file))).catch(() => {});
   if (deviceId) {
     const current = await run('xcrun', ['simctl', 'get_app_container', deviceId, bundleId, 'data']).catch(() => undefined);
-    if (current) for (const name of ['ios-export-events.json', 'startup-state.json', 'ios-settings-restore-fixture.json']) {
+    if (current) for (const name of ['ios-export-events.json', 'startup-state.json', 'startup-ready-state.json', 'ios-settings-restore-fixture.json']) {
       await copyFile(diagnosticFile(name, current), path.join(reportDir, `${deviceId}-${name}`)).catch(() => {});
     }
   }
@@ -915,13 +915,18 @@ try {
         });
         if (tests.has('testStartupTimeoutCanRetryBeforeSessionReady')) {
           container = await run('xcrun', ['simctl', 'get_app_container', deviceId, bundleId, 'data']);
-          const finalState = JSON.parse(await readFile(diagnosticFile('startup-state.json'), 'utf8'));
+          // XCTest terminates its app after success. The Node exit callback
+          // can legitimately write a later terminal state during shutdown;
+          // keep that diagnostic, but verify the actual ready checkpoint.
+          const finalState = JSON.parse(await readFile(diagnosticFile('startup-ready-state.json'), 'utf8'));
           assert.equal(finalState.state, 'ready');
           assert.equal(finalState.phase, 'ready');
           assert.equal(finalState.budget, 300);
           assert.equal(finalState.terminalFailure, false);
           assert.equal(finalState.injectedStall, true, 'Expected the fault/retry process, not the earlier normal launch');
           assert.ok(finalState.generation >= 2, 'Manual retry did not start a new attempt');
+          report.startupRecovery = { ready: finalState,
+            afterTest: JSON.parse(await readFile(diagnosticFile('startup-state.json'), 'utf8')) };
           Object.assign(report.coverage, { actualWKWebView: true, startupTimeoutRecovery: true });
           result.checks.push('startup-timeout-before-cookie-shows-retry', 'manual-retry-reaches-real-webview',
             'recovered-native-state-restores-normal-budget');
