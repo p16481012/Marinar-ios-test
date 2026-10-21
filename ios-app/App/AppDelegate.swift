@@ -79,7 +79,7 @@ private final class MarinarDiagnosticWindow: UIWindow {
             pendingTouchEvents.append([
                 "phase": phase, "x": Double(location.x), "y": Double(location.y),
                 "timestamp": event.timestamp, "windowIsKey": isKeyWindow,
-                "windowBounds": NSStringFromCGRect(bounds),
+                "windowBounds": NSCoder.string(for: bounds),
                 "viewClass": touch.view.map { NSStringFromClass(type(of: $0)) } ?? "none",
                 "recognizers": recognizers,
             ])
