@@ -82,7 +82,7 @@ jobs:
           uname -m
           xcodebuild -version
       - run: node ios-app/scripts/download-node.mjs
-      - run: node ios-app/scripts/validate-simulator.mjs --profile ${{ matrix.profile }} --report-dir ios-app/build/validation/${{ matrix.profile }} --derived-data ios-app/build/DerivedData-${{ matrix.profile }}
+      - run: node ios-app/scripts/validate-simulator.mjs --simulator-ui --profile ${{ matrix.profile }} --report-dir ios-app/build/validation/${{ matrix.profile }} --derived-data ios-app/build/DerivedData-${{ matrix.profile }}
         timeout-minutes: 28
       - uses: actions/upload-artifact@v4
         if: always()
