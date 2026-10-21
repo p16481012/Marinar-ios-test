@@ -1,10 +1,12 @@
 # iOS / iPadOS PWA Guide
 
-This guide shows how to use Marinara Engine on an iPhone or iPad. iOS and iPadOS cannot run the Marinara server themselves. Instead, you connect to a server on another device and save it to your Home Screen as a web app.
+> 이 문서는 원본 Marinara의 Safari/PWA 접속 안내입니다. 이 저장소의 기기 내 실행형 iOS 앱 설치는 [한국어 README](../../README.md#설치)를 따르세요.
 
-## iOS runs the server on another device
+This guide covers the Safari/PWA option: connect to a Marinara server on another device and save it to your Home Screen as a web app.
 
-Marinara Engine has two parts: a server that does the real work, and a web app that you view in a browser. On iPhone and iPad, Apple does not let the server run on the device. So you run the server somewhere else, then open it from Safari on your iPhone or iPad.
+## The PWA connects to a server on another device
+
+Marinara Engine has two parts: a server that does the real work, and a web app that you view in a browser. With the Safari/PWA setup described here, you run the server on another device and open it from Safari on your iPhone or iPad.
 
 The server can run on any of these:
 

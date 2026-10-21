@@ -1,5 +1,7 @@
 # Marinara Engine Installation
 
+> 이 문서는 원본 Marinara의 PC·서버·PWA 설치 안내입니다. 이 저장소의 기기 내 실행형 iOS 앱은 [한국어 README의 설치 안내](../README.md#설치)를 따르세요.
+
 This guide helps you pick the right way to install Marinara Engine for your device. Marinara runs on your own machine, so your chats and data stay local. Each platform below has its own step by step guide, linked from the table.
 
 ## Choose your platform
@@ -16,7 +18,7 @@ Pick the guide that matches the device you want to run Marinara on.
 
 A few things to know before you pick:
 
-- On **iPhone or iPad**, Marinara does not run the server itself. You run the server on a computer, a home server, or an Android device. Then you open it in Safari on your iPhone or iPad. The iOS guide explains this.
+- With the **Safari/PWA option on iPhone or iPad**, you run the server on a computer, a home server, or an Android device, then open it in Safari. The linked iOS guide covers that option; this repository's native iOS app follows the README above.
 - On **Android**, Marinara runs inside **Termux**. Termux is a free app that gives Android a small Linux environment. Tap the direct APK download, approve Android's required install and Termux permission prompts, and let the app handle its private localhost credential automatically. Installers never provide Android signing credentials or that local secret.
 
 ## Which should I pick
