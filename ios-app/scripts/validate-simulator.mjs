@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startMockProvider, STREAM_PROMPT, STREAM_REPLY, RESTORE_PROMPT, RESTORE_REPLY } from '../../scripts/ios/mock-openai-provider.mjs';
@@ -102,24 +102,29 @@ function commandTimeout(command, commandArgs) {
   return 2 * 60_000;
 }
 
-async function run(command, commandArgs, { log, allowFailure = false, env, timeoutMs = commandTimeout(command, commandArgs) } = {}) {
+async function run(command, commandArgs, { log, directLog = false, allowFailure = false, env, timeoutMs = commandTimeout(command, commandArgs) } = {}) {
   assert.ok(Number.isFinite(timeoutMs) && timeoutMs > 0, 'Command timeout must be positive milliseconds');
+  assert.ok(!directLog || log, 'Direct command output requires a log file');
   // These arguments are tool names, simulator IDs and paths. Runtime tokens
   // are passed separately through env and must never enter the report.
   const commandLabel = [command, ...commandArgs.slice(0, 3)].join(' ');
-  const commandRecord = { name: command, arguments: [...commandArgs], ...(log ? { log } : {}), startedAt: new Date().toISOString(), timeoutMs, status: 'running' };
+  const commandRecord = { name: command, arguments: [...commandArgs], ...(log ? { log } : {}), outputMode: directLog ? 'file' : 'pipe', startedAt: new Date().toISOString(), timeoutMs, status: 'running' };
   report.command = commandRecord;
   report.commandHistory ??= [];
   report.commandHistory.push(commandRecord);
   await checkpoint();
   const output = [];
-  const stream = log ? createWriteStream(path.join(reportDir, log)) : null;
+  const stream = log && !directLog ? createWriteStream(path.join(reportDir, log)) : null;
+  const logFile = directLog ? await open(path.join(reportDir, log), 'w') : null;
   // A separate POSIX group lets a timeout stop xcodebuild and its descendants,
   // without touching the validator, mock provider or another simulator task.
   const processGroup = process.platform !== 'win32';
-  const child = spawn(command, commandArgs, { cwd: root, detached: processGroup,
-    stdio: ['ignore', 'pipe', 'pipe'], ...(env ? { env: { ...process.env, ...env } } : {}) });
-  for (const pipe of [child.stdout, child.stderr]) pipe.on('data', (data) => {
+  let child;
+  try {
+    child = spawn(command, commandArgs, { cwd: root, detached: processGroup,
+      stdio: ['ignore', logFile?.fd ?? 'pipe', logFile?.fd ?? 'pipe'], ...(env ? { env: { ...process.env, ...env } } : {}) });
+  } catch (error) { await logFile?.close(); throw error; }
+  for (const pipe of [child.stdout, child.stderr].filter(Boolean)) pipe.on('data', (data) => {
     if (stream) stream.write(data);
     else output.push(data);
   });
@@ -150,7 +155,7 @@ async function run(command, commandArgs, { log, allowFailure = false, env, timeo
       signalChild('SIGTERM');
       killTimer = setTimeout(() => signalChild('SIGKILL'), 10_000);
       drainTimer = setTimeout(() => {
-        child.stdout.destroy(); child.stderr.destroy();
+        child.stdout?.destroy(); child.stderr?.destroy();
         finish(null);
       }, 20_000);
     }, timeoutMs);
@@ -162,7 +167,7 @@ async function run(command, commandArgs, { log, allowFailure = false, env, timeo
       Object.assign(commandRecord, { pipesClosedAt: new Date().toISOString(), closeSignal: signal });
       finish(code);
     });
-  });
+  }).finally(async () => { await logFile?.close(); });
   if (stream) await new Promise((resolve) => stream.end(resolve));
   const failed = timedOut || spawnError || code !== 0;
   if (!failed && command === 'xcrun' && commandArgs[0] === 'simctl' && commandArgs[1] === 'shutdown') {
@@ -358,6 +363,10 @@ async function launch() {
   launchLogs.push(stdout, stderr);
   await run('xcrun', ['simctl', 'launch', `--stdout=${stdout}`, `--stderr=${stderr}`, deviceId, bundleId], {
     log: `app-${launchNumber}-launcher.log`,
+    // Unlike --console, simctl launch is complete when the launcher exits.
+    // Direct file output avoids waiting for an unrelated inherited pipe EOF.
+    // Actual app readiness still must pass the authenticated health check.
+    directLog: true,
     env: { SIMCTL_CHILD_MARINARA_TEST_DIAGNOSTICS: '1' },
   });
   return await waitForRuntime();
