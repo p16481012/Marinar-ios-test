@@ -7201,7 +7201,7 @@ function AdvancedSettings() {
     queryKey: ["professor-mari", "workspace-status"],
     queryFn: ({ signal }) =>
       api.get("/professor-mari/workspace/status", { signal: requestTimeoutSignal(5_000, signal) }),
-    enabled: settingsOpen,
+    enabled: settingsOpen && !isNativeIosApp(),
     staleTime: 0,
     retry: false,
   });
@@ -7212,11 +7212,15 @@ function AdvancedSettings() {
   // Health is included so a copy taken before the query settles cannot label
   // pending wake-lock/freeze telemetry as genuinely absent (#5656 review).
   const supportDiagnosticsPending =
-    isConnectionsLoading || (!!activeChatId && isActiveChatLoading) || health.isPending || mariStatus.isPending;
+    isConnectionsLoading ||
+    (!!activeChatId && isActiveChatLoading) ||
+    health.isPending ||
+    (!isNativeIosApp() && mariStatus.isPending);
 
   const handleCopySupportDiagnostics = useCallback(async () => {
     // Best-effort: a failed status request reads as unavailable, never blocks the copy.
-    const mariActingOn = mariStatus.isError ? undefined : (mariStatus.data?.latestUnderstoodRequest ?? null);
+    const mariActingOn =
+      isNativeIosApp() || mariStatus.isError ? undefined : (mariStatus.data?.latestUnderstoodRequest ?? null);
     const report = formatSupportDiagnostics({
       clientRuntime: getClientRuntimeDiagnostics(),
       mariActingOn,

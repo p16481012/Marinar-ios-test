@@ -12,6 +12,16 @@ final class MarinarUITests: XCTestCase {
         app.launchEnvironment["MARINARA_TEST_DIAGNOSTICS"] = "1"
     }
 
+    override func tearDownWithError() throws {
+        if (testRun?.failureCount ?? 0) > 0 {
+            attachScreen("failure-\(name)")
+            let hierarchy = XCTAttachment(string: app.debugDescription)
+            hierarchy.name = "failure-accessibility-hierarchy"
+            hierarchy.lifetime = .keepAlways
+            add(hierarchy)
+        }
+    }
+
     private func launchReady() {
         app.launch()
         let webView = app.webViews["marinar-webview"]
@@ -119,16 +129,11 @@ final class MarinarUITests: XCTestCase {
         // places only this public fixture in Documents before launching tests.
         let file = app.webViews.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'Choose File' OR label CONTAINS[c] 'Choose test file'")).firstMatch
         XCTAssertTrue(file.waitForExistence(timeout: 15), "HTML file input is missing")
-        file.tap()
-        let browse = app.buttons["Browse"].firstMatch
-        if browse.waitForExistence(timeout: 3) { browse.tap() }
-        let cancel = app.buttons["Cancel"].firstMatch
-        XCTAssertTrue(cancel.waitForExistence(timeout: 15), "System document picker did not open")
+        let cancel = openDocumentPicker(file)
         attachScreen("system-file-picker")
         cancel.tap()
         XCTAssertTrue(export.waitForExistence(timeout: 15), "Cancelling file selection did not return to the page")
-        file.tap()
-        if browse.waitForExistence(timeout: 3) { browse.tap() }
+        _ = openDocumentPicker(file)
         let fixture = app.staticTexts.matching(NSPredicate(format: "label == 'marinar-ios-import' OR label == 'marinar-ios-import.json'")).firstMatch
         if !fixture.waitForExistence(timeout: 3) {
             // The initial picker can be Recents or the last visited directory.
@@ -147,6 +152,18 @@ final class MarinarUITests: XCTestCase {
         let imported = app.webViews.staticTexts.matching(NSPredicate(format: "label CONTAINS 'restored-file-fixture'")).firstMatch
         XCTAssertTrue(imported.waitForExistence(timeout: 15), "WKWebView did not receive the selected file bytes")
         attachScreen("system-file-imported")
+    }
+
+    private func openDocumentPicker(_ input: XCUIElement) -> XCUIElement {
+        input.tap()
+        let browse = app.buttons["Browse"].firstMatch
+        if browse.waitForExistence(timeout: 3) { browse.tap() }
+        let cancel = app.buttons["Cancel"].firstMatch
+        // On a clean simulator, the first DocumentManager service boot took
+        // 41 seconds in the unified log. Wait for the real picker rather than
+        // failing while its remote view controller is still starting.
+        XCTAssertTrue(cancel.waitForExistence(timeout: 90), "System document picker did not become ready")
+        return cancel
     }
 
     private func dismissExportShare(_ screenshotName: String) {

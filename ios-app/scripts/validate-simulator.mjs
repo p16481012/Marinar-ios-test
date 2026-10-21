@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startMockProvider, STREAM_PROMPT, STREAM_REPLY, RESTORE_PROMPT, RESTORE_REPLY } from '../../scripts/ios/mock-openai-provider.mjs';
@@ -97,6 +97,20 @@ async function preserveLaunchLogs() {
   // Copy before XCTest can migrate the data container, and again after the
   // final launch. A missing old path must not remove an already copied log.
   for (const file of launchLogs) await copyFile(file, path.join(reportDir, path.basename(file))).catch(() => {});
+}
+
+async function exportTestAttachments() {
+  // Keep ordinary PNG/text attachments beside xcresult so failure evidence
+  // can be inspected from Windows without Apple's xcresulttool.
+  const help = await run('xcrun', ['xcresulttool', 'export', 'attachments', '--help'], { allowFailure: true });
+  await writeFile(path.join(reportDir, 'xcresult-attachments-help.txt'), help + '\n');
+  if (!help.includes('--path') || !help.includes('--output-path')) return;
+  for (const entry of await readdir(reportDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.endsWith('.xcresult')) continue;
+    const key = path.basename(entry.name, '.xcresult');
+    await run('xcrun', ['xcresulttool', 'export', 'attachments', '--path', path.join(reportDir, entry.name),
+      '--output-path', path.join(reportDir, 'attachments', key)], { log: `${key}-attachments.log`, allowFailure: true });
+  }
 }
 
 async function prepareUI(config, stateFile) {
@@ -413,6 +427,9 @@ try {
   process.exitCode = 1;
   console.error(error.message);
 } finally {
+  if (process.platform === 'darwin') await exportTestAttachments().catch((error) => {
+    console.warn(`Could not export XCTest attachments: ${error.message}`);
+  });
   if (deviceId && process.platform === 'darwin') {
     await run('xcrun', ['simctl', 'io', deviceId, 'screenshot', path.join(reportDir, `${report.status}-screen.png`)], { allowFailure: true }).catch(() => {});
   }

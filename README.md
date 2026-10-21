@@ -107,6 +107,9 @@ node scripts/ios/run-provider-lifecycle.mjs --entry ios-app/Resources/runtime/bo
 # 자료 이전, 전체 백업, 복원 취소·손상·중단 후 복구 검사
 node scripts/ios/run-transfer-lifecycle.mjs --entry ios-app/Resources/runtime/bootstrap.cjs
 
+# Chrome 설치 환경: 실제 백업 화면·복원 취소·설정 저장 재시도 검사
+node scripts/ios/run-backup-ui.mjs --browser-channel chrome
+
 # Apple Silicon Mac: 내장 Node와 WKWebView를 실제 iOS 시뮬레이터에서 검사
 node ios-app/scripts/validate-simulator.mjs
 ```

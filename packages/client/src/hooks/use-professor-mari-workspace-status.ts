@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import type { MariWorkspaceStatus } from "@marinara-engine/shared";
 import { api, ApiError } from "../lib/api-client";
+import { isNativeIosApp } from "../lib/ios-runtime";
 
 export const professorMariWorkspaceStatusKeys = {
   all: ["professor-mari", "workspace", "status"] as const,
@@ -19,6 +20,7 @@ export function useProfessorMariWorkspaceStatus(options?: { intervalMs?: number 
   return useQuery({
     queryKey: professorMariWorkspaceStatusKeys.all,
     queryFn: () => api.get<MariWorkspaceStatus>("/professor-mari/workspace/status"),
+    enabled: !isNativeIosApp(),
     staleTime: 2_000,
     // Stop for a disabled workspace or a client that cannot access the route.
     // Transient network/server failures must keep the heartbeat alive or a

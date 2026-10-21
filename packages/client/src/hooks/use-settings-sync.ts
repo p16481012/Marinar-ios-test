@@ -20,8 +20,10 @@ import {
   normalizeImageStyleProfileSettings,
   normalizeQuoteFormat,
   type AppSettingsResponse,
+  type IosRestoreStatus,
 } from "@marinara-engine/shared";
-import { api } from "../lib/api-client";
+import { ApiError, api } from "../lib/api-client";
+import { isNativeIosApp } from "../lib/ios-runtime";
 import { translate } from "../localization/i18n";
 import { normalizeConversationTimeZone } from "../lib/conversation-time-zone";
 import { normalizeApprovedRemoteImageUrls } from "../lib/remote-images";
@@ -164,12 +166,102 @@ export function useSettingsSync() {
     let pushTimer: ReturnType<typeof setTimeout> | null = null;
     let lastPushed = "";
     let pendingUpdatedAt: number | null = null;
+    const nativeIos = isNativeIosApp();
+    let iosPushInFlight = false;
+    let iosMaintenanceDeferred = false;
+    let iosRestoreWasPending = false;
+    let iosRestoreApplied = false;
+    let iosRetryDelay = DEBOUNCE_MS;
 
     const serialize = () => serializeSettings(pickSyncedSettings(useUIStore.getState()));
+
+    function scheduleIosRetry() {
+      if (disposed || iosRestoreApplied) return;
+      if (pushTimer) clearTimeout(pushTimer);
+      pushTimer = setTimeout(pushNow, iosRetryDelay);
+      iosRetryDelay = Math.min(iosRetryDelay * 2, 15_000);
+    }
+
+    function deferIosMaintenance(error: unknown, updatedAt: number): boolean {
+      if (!nativeIos || !(error instanceof ApiError)) return false;
+      const code = (error.payload as { code?: unknown } | undefined)?.code;
+      const restoring = error.status === 409 && code === "IOS_RESTORE_PENDING";
+      if (!restoring && !(error.status === 503 && code === "IOS_MAINTENANCE_BUSY")) return false;
+      iosMaintenanceDeferred = true;
+      iosRestoreWasPending ||= restoring;
+      pendingUpdatedAt ??= updatedAt;
+      // Failed writes, including startup normalization, are not an acknowledged
+      // server snapshot. Retain only the latest local state for the next attempt.
+      lastPushed = "";
+      scheduleIosRetry();
+      return true;
+    }
+
+    async function pushIosNow() {
+      if (disposed || iosPushInFlight || iosRestoreApplied) return;
+      iosPushInFlight = true;
+      let saved = false;
+      let attemptedFingerprint: string | null = null;
+      let attemptedAt = pendingUpdatedAt ?? readLocalUpdatedAt() ?? Date.now();
+      try {
+        if (iosMaintenanceDeferred) {
+          const restore = await api.get<IosRestoreStatus>("/ios/restore/status");
+          if (disposed) return;
+          if (restore.status === "staged" || restore.status === "applying") {
+            iosRestoreWasPending = true;
+            scheduleIosRetry();
+            return;
+          }
+          if (iosRestoreWasPending && restore.status === "applied") {
+            // A cold restore initializes a new page from the restored server.
+            // Never let an old page replay its queued preferences over that data.
+            iosRestoreApplied = true;
+            pendingUpdatedAt = null;
+            if (pushTimer) clearTimeout(pushTimer);
+            pushTimer = null;
+            return;
+          }
+          iosMaintenanceDeferred = false;
+          iosRestoreWasPending = false;
+        }
+        if (disposed) return;
+        const settings = pickSyncedSettings(useUIStore.getState());
+        const fingerprint = serializeSettings(settings);
+        if (fingerprint === lastPushed) return;
+        attemptedFingerprint = fingerprint;
+        attemptedAt = pendingUpdatedAt ?? readLocalUpdatedAt() ?? Date.now();
+        pendingUpdatedAt = null;
+        writeLocalUpdatedAt(attemptedAt);
+        await putServerSettingsValue(buildServerSettingsValue(settings, attemptedAt));
+        lastPushed = fingerprint;
+        iosRetryDelay = DEBOUNCE_MS;
+        saved = true;
+      } catch (error) {
+        if (!deferIosMaintenance(error, attemptedAt) && iosMaintenanceDeferred) {
+          // A failed status lookup cannot authorize writing through a pending
+          // restore. Keep waiting; cancellation will make the latest edit safe.
+          scheduleIosRetry();
+        }
+      } finally {
+        iosPushInFlight = false;
+        if (
+          !disposed &&
+          !iosMaintenanceDeferred &&
+          !iosRestoreApplied &&
+          ((saved && serialize() !== lastPushed) ||
+            (attemptedFingerprint !== null && serialize() !== attemptedFingerprint))
+        )
+          schedulePush();
+      }
+    }
 
     const pushNow = () => {
       pushTimer = null;
       if (disposed) return;
+      if (nativeIos) {
+        void pushIosNow();
+        return;
+      }
       const settings = pickSyncedSettings(useUIStore.getState());
       const settingsFingerprint = serializeSettings(settings);
       if (settingsFingerprint === lastPushed) return;
@@ -394,7 +486,8 @@ export function useSettingsSync() {
                     buildServerSettingsValue(pickSyncedSettings(useUIStore.getState()), rewriteUpdatedAt),
                   );
                   writeLocalUpdatedAt(rewriteUpdatedAt);
-                } catch {
+                } catch (error) {
+                  deferIosMaintenance(error, rewriteUpdatedAt);
                   // Best-effort recovery. The in-memory merge still protects
                   // server-present preferences for this session.
                 }
@@ -406,14 +499,15 @@ export function useSettingsSync() {
                 lastPushed = serialize();
                 if (serverUpdatedAt !== null) writeLocalUpdatedAt(serverUpdatedAt);
                 if (hadLocalOnlySettings || hadMissingSyncedSettings || staleSyncedShape) {
+                  const rewriteUpdatedAt =
+                    hadMissingSyncedSettings || staleSyncedShape ? Date.now() : (serverUpdatedAt ?? Date.now());
                   try {
-                    const rewriteUpdatedAt =
-                      hadMissingSyncedSettings || staleSyncedShape ? Date.now() : (serverUpdatedAt ?? Date.now());
                     await putServerSettingsValue(
                       buildServerSettingsValue(pickSyncedSettings(useUIStore.getState()), rewriteUpdatedAt),
                     );
                     writeLocalUpdatedAt(rewriteUpdatedAt);
-                  } catch {
+                  } catch (error) {
+                    deferIosMaintenance(error, rewriteUpdatedAt);
                     // Rewriting legacy/incomplete blobs is best-effort. This
                     // browser still ignores removed keys and retains local
                     // values for newly synced preferences.
@@ -435,7 +529,8 @@ export function useSettingsSync() {
           lastPushed = payload;
           try {
             await putServerSettingsValue(buildServerSettingsValue(settings, updatedAt));
-          } catch {
+          } catch (error) {
+            deferIosMaintenance(error, updatedAt);
             // Seed failed; leave `lastPushed` set so the next change triggers a retry.
           }
         }
