@@ -117,13 +117,19 @@ final class MarinarUITests: XCTestCase {
                         let tutorialNodes = snapshotTree(introduction)
                         if tutorialNodes.contains(where: { $0.label.contains("Speed up your typing") }),
                            let button = tutorialNodes.first(where: { $0.elementType == .button && $0.label == "Continue" }),
-                           button.frame.width > 0, button.frame.height > 0,
-                           introduction.frame.contains(button.frame), keyboardFrame.contains(button.frame),
-                           !webFrame.intersects(button.frame) {
+                           button.frame.width > 0, button.frame.height > 0 {
                             let nativeContinue = app.otherElements["UIContinuousPathIntroductionView"].buttons["Continue"].firstMatch
                             if nativeContinue.exists && nativeContinue.isEnabled && nativeContinue.isHittable {
-                                nativeContinue.tap()
-                                dismissedTutorial = true
+                                let buttonFrame = nativeContinue.frame
+                                let introductionFrame = app.otherElements["UIContinuousPathIntroductionView"].frame
+                                // On the large iPhone, Continue extends below
+                                // the key grid. It must belong to the native
+                                // introduction, inside the screen, outside WebKit.
+                                if introductionFrame.contains(buttonFrame), app.frame.contains(buttonFrame),
+                                   !webFrame.intersects(buttonFrame) {
+                                    nativeContinue.tap()
+                                    dismissedTutorial = true
+                                }
                             }
                         }
                     }
@@ -161,33 +167,36 @@ final class MarinarUITests: XCTestCase {
         // the initial focus. A zero-size Padding-Left key is not readiness.
         prepareSoftwareKeyboard()
         let deadline = Date().addingTimeInterval(45)
+        let web = app.webViews["marinar-webview"]
+        let composer = web.textViews.firstMatch
+        let keyboard = app.keyboards.firstMatch
         var previousFrames: [CGRect]?
-        var lastObservation = "No complete layout snapshot"
+        var lastObservation = "No complete layout observation"
         while Date() < deadline {
-            // Separate XCUIElement.frame calls previously mixed an old WebKit
-            // frame with a keyboard frame retrieved 13 seconds later. Read
-            // the whole geometry from one snapshot, then require it twice.
+            // Snapshot frames can retain the keyboard window's unrotated
+            // coordinate system. XCUIElement.frame converts to screen space.
+            // Require two complete, identical observations so a delayed AX
+            // response cannot mix pre-resize and post-resize geometry.
             if let snapshot = try? app.snapshot() {
                 let nodes = snapshotTree(snapshot)
-                if let web = nodes.first(where: { $0.identifier == "marinar-webview" }),
-                   let composer = snapshotTree(web).first(where: { $0.elementType == .textView }),
-                   let keyboard = nodes.first(where: { $0.elementType == .keyboard }) {
-                    let frames = [web.frame, composer.frame, keyboard.frame]
-                    lastObservation = "webView=\(web.frame), input=\(composer.frame), keyboard=\(keyboard.frame)"
-                    let tutorialVisible = nodes.contains { $0.identifier == "UIContinuousPathIntroductionView"
-                        || $0.label.contains("Speed up your typing") }
-                    let valid = frames.allSatisfy { $0.width > 0 && $0.height > 0 }
-                        && !tutorialVisible
-                        && composer.frame.maxY <= keyboard.frame.minY + 2
-                        && composer.frame.minY >= web.frame.minY - 2
-                        && composer.frame.maxY <= web.frame.maxY + 2
-                        && composer.frame.minX >= web.frame.minX - 2
-                        && composer.frame.maxX <= web.frame.maxX + 2
-                    if valid && previousFrames == frames { return }
-                    previousFrames = valid ? frames : nil
-                } else {
-                    previousFrames = nil
-                }
+                let appFrame = app.frame
+                let webFrame = web.frame
+                let composerFrame = composer.frame
+                let keyboardFrame = keyboard.frame
+                let frames = [appFrame, webFrame, composerFrame, keyboardFrame]
+                lastObservation = "app=\(appFrame), webView=\(webFrame), input=\(composerFrame), keyboard=\(keyboardFrame)"
+                let tutorialVisible = nodes.contains { $0.identifier == "UIContinuousPathIntroductionView"
+                    || $0.label.contains("Speed up your typing") }
+                let valid = frames.allSatisfy { $0.width > 0 && $0.height > 0 }
+                    && !tutorialVisible
+                    && appFrame.contains(webFrame) && appFrame.contains(composerFrame) && appFrame.contains(keyboardFrame)
+                    && composerFrame.maxY <= keyboardFrame.minY + 2
+                    && composerFrame.minY >= webFrame.minY - 2
+                    && composerFrame.maxY <= webFrame.maxY + 2
+                    && composerFrame.minX >= webFrame.minX - 2
+                    && composerFrame.maxX <= webFrame.maxX + 2
+                if valid && previousFrames == frames { return }
+                previousFrames = valid ? frames : nil
             } else {
                 previousFrames = nil
             }
@@ -231,14 +240,39 @@ final class MarinarUITests: XCTestCase {
         attachScreen("blob-export-before-tap")
         attachGeometry("blob-export-before-tap-geometry", elements: [("app", app),
             ("webView", app.webViews["marinar-webview"]), ("export", export)])
-        // Deliver one real touch at the observed button center. The automatic
+        // Deliver the first real touch at the observed button center. The automatic
         // WebKit accessibility hit point previously delivered no DOM events.
         export.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         let handler = app.webViews.staticTexts["Export handler started"].firstMatch
         let exportedFilename = app.descendants(matching: .any).matching(NSPredicate(format:
             "label CONTAINS 'marinar-ios-export'")).firstMatch
-        expectation(for: NSPredicate { _, _ in handler.exists || exportedFilename.exists }, evaluatedWith: app)
-        waitForExpectations(timeout: 15)
+        let exportStarted = NSPredicate { _, _ in handler.exists || exportedFilename.exists }
+        let firstResult = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: exportStarted, object: app)], timeout: 15)
+        if firstResult != .completed {
+            let idle = app.webViews.staticTexts["Export handler idle"].firstMatch
+            let cancelled = app.webViews.staticTexts.matching(NSPredicate(format:
+                "label CONTAINS 'pointercancel:ios-test-export@' AND label CONTAINS 'touchcancel:ios-test-export@'")).firstMatch
+            // The recorded first touch can be cancelled before WebKit emits
+            // click. Retry exactly once only with that evidence and an idle
+            // handler; never duplicate a started or unknown export operation.
+            if firstResult == .timedOut && idle.exists && !handler.exists && !exportedFilename.exists && cancelled.exists
+                && !cancelled.label.contains("click:ios-test-export@") && export.exists && export.isEnabled && export.isHittable {
+                attachScreen("blob-export-cancelled-before-retry")
+                let trace = XCTAttachment(string: cancelled.label)
+                trace.name = "blob-export-cancelled-touch-trace"
+                trace.lifetime = .keepAlways
+                add(trace)
+                // Recheck after collecting evidence in case a delayed click
+                // started the original export while the attachment was made.
+                if idle.exists && !handler.exists && !exportedFilename.exists {
+                    export.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+                }
+                expectation(for: exportStarted, evaluatedWith: app)
+                waitForExpectations(timeout: 15)
+            } else {
+                XCTFail("Export did not start, and no safely retryable cancelled touch was observed")
+            }
+        }
         dismissExportShare("blob-export-share", expectedFilename: "marinar-ios-export")
         XCTAssertTrue(export.waitForExistence(timeout: 15))
         let streamed = app.webViews.buttons["Export streamed archive"].firstMatch
@@ -306,7 +340,14 @@ final class MarinarUITests: XCTestCase {
             attachScreen("system-file-before-selection")
             attachGeometry("system-file-before-selection-geometry", elements: [("app", app), ("fileView", fileView),
                 ("fixtureCell", fixtureCell), ("thumbnail", thumbnail)])
-            thumbnail.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            let coordinate = thumbnail.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            let point = coordinate.screenPoint
+            let coordinateEvidence = XCTAttachment(string: "expectedCenter=(\(thumbnailFrame.midX), \(thumbnailFrame.midY)), screenPoint=\(point)")
+            coordinateEvidence.name = "system-file-selection-coordinate"
+            coordinateEvidence.lifetime = .keepAlways
+            add(coordinateEvidence)
+            XCTAssertTrue(thumbnailFrame.contains(point), "The calculated touch is outside the observed thumbnail")
+            coordinate.tap()
         } else {
             // Files list presentations may omit the thumbnail.
             XCTAssertTrue(fixtureCell.isHittable, "The fixture file row is not available")

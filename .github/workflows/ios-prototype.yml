@@ -92,6 +92,7 @@ jobs:
             ios-app/build/validation/**/simulator-validation.json
             ios-app/build/validation/**/*export-events*.json
             ios-app/build/validation/**/*ui-tests.log
+            ios-app/build/validation/**/*file-picker.log
             ios-app/build/validation/**/*build.log
             ios-app/build/validation/**/*.png
             ios-app/build/validation/**/attachments/**/*.txt

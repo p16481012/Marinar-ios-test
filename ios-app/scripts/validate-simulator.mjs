@@ -185,6 +185,15 @@ async function runUITests(commandArgs, { phase, log, expectedTests }) {
     if (status !== 'passed') recordFailure(`${phase}/${name}`, new Error(`XCTest ${status}; see ${log}`));
   }
   await checkpoint();
+  if (tests.testBlobDownloadShareAndFilePicker && tests.testBlobDownloadShareAndFilePicker !== 'passed') {
+    // The picker is hosted by a system service. App-only logs cannot explain
+    // a visible file that never reaches WebKit's file-input callback.
+    await run('xcrun', ['simctl', 'spawn', deviceId, 'log', 'show', '--last', '10m', '--style', 'compact',
+      '--predicate', 'process == "fileproviderd" OR process CONTAINS[c] "DocumentManager" OR subsystem CONTAINS[c] "FileProvider" OR subsystem CONTAINS[c] "DocumentManager"'],
+    { log: `${phase}-file-picker.log`, allowFailure: true }).catch((error) => {
+      console.warn(`Could not collect file picker diagnostics: ${error.message}`);
+    });
+  }
   // Preserve each completed suite's PNG/text evidence now. Later device
   // startup or cancellation must not hide an earlier test's failure screen.
   const bundleIndex = commandArgs.indexOf('-resultBundlePath');

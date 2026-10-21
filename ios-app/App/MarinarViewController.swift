@@ -450,11 +450,17 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         presentNextShare()
     }
 
+    #if DEBUG
+    func recordNativeTouchIfNeeded(_ fields: [String: Any]) {
+        recordExportEventIfNeeded("native-touch", fields: fields)
+    }
+    #endif
+
     private func recordExportEventIfNeeded(_ name: String, fields: [String: Any] = [:]) {
         #if DEBUG
         guard ProcessInfo.processInfo.environment["MARINARA_TEST_FILE_PANEL"] == "1" else { return }
         // Keep URLs, credentials, filenames and server response bodies out of
-        // this small diagnostic artifact. Only navigation/download stages are recorded.
+        // this small diagnostic artifact. Record only stages and native touch metadata.
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let file = documents.appendingPathComponent("ios-export-events.json")
         var events = (try? Data(contentsOf: file)).flatMap {
