@@ -258,7 +258,7 @@ async function runUITests(commandArgs, { phase, log, expectedTests }) {
     if (status !== 'passed') recordFailure(`${phase}/${name}`, new Error(`XCTest ${status}; see ${log}`));
   }
   await checkpoint();
-  if (['testBlobDownloadShareAndFilePicker', 'testSystemFilesProviderCanOpenFixture']
+  if (['testBlobDownloadShareAndFilePicker', 'testHTMLFilePickerRoundTrip', 'testSystemFilesProviderCanOpenFixture']
     .some((name) => tests[name] && tests[name] !== 'passed')) {
     // The picker is hosted by a system service. App-only logs cannot explain
     // a visible file that never reaches WebKit's file-input callback.
@@ -603,16 +603,18 @@ async function runPrimaryChecks(buildArgs) {
     }
     await stop();
     await preserveLaunchLogs();
-    console.log('Checking native file download, sharing and the independent system Files control.');
+    console.log('Checking same-process export/import, independent HTML file selection and the system Files control.');
     const fileTests = await runUITests(['test-without-building', ...buildArgs,
       '-parallel-testing-enabled', 'NO', '-maximum-concurrent-test-simulator-destinations', '1',
       '-only-testing:MarinarUITests/MarinarUITests/testBlobDownloadShareAndFilePicker',
+      '-only-testing:MarinarUITests/MarinarUITests/testHTMLFilePickerRoundTrip',
       '-only-testing:MarinarUITests/MarinarUITests/testSystemFilesProviderCanOpenFixture',
       '-resultBundlePath', path.join(reportDir, 'primary-files.xcresult')], {
       phase: 'primary-file-ui', log: 'primary-file-ui-tests.log',
-      expectedTests: ['testBlobDownloadShareAndFilePicker', 'testSystemFilesProviderCanOpenFixture'],
+      expectedTests: ['testBlobDownloadShareAndFilePicker', 'testHTMLFilePickerRoundTrip', 'testSystemFilesProviderCanOpenFixture'],
     });
     await preserveLaunchLogs();
+    if (fileTests.has('testHTMLFilePickerRoundTrip')) report.checks.push('independent-html-file-picker-exact-bytes');
     if (fileTests.has('testBlobDownloadShareAndFilePicker')) await collectCheck('primary-file-integrity', async () => {
       report.download = await verifyBlobDownload(true);
       Object.assign(report.coverage, { nativeBlobDownload: true, nativeShareSheet: true, systemFilePicker: true, nativeDialogs: true });
@@ -725,16 +727,18 @@ try {
         '-parallel-testing-enabled', 'NO', '-maximum-concurrent-test-simulator-destinations', '1',
         '-only-testing:MarinarUITests/MarinarUITests/testComposerAcrossOrientations',
         ...(variant.files ? ['-only-testing:MarinarUITests/MarinarUITests/testBlobDownloadShareAndFilePicker',
+          '-only-testing:MarinarUITests/MarinarUITests/testHTMLFilePickerRoundTrip',
           '-only-testing:MarinarUITests/MarinarUITests/testSystemFilesProviderCanOpenFixture'] : []),
         '-resultBundlePath', path.join(reportDir, `${variant.key}.xcresult`)], {
         phase: variant.key, log: `${variant.key}-ui-tests.log`,
         expectedTests: ['testComposerAcrossOrientations', ...(variant.files ? ['testBlobDownloadShareAndFilePicker',
-          'testSystemFilesProviderCanOpenFixture'] : [])],
+          'testHTMLFilePickerRoundTrip', 'testSystemFilesProviderCanOpenFixture'] : [])],
       });
       if (tests.has('testComposerAcrossOrientations')) {
         report.coverage.actualWKWebView = true;
         result.checks.push('portrait-and-landscape-composer-keyboard');
       }
+      if (variant.files && tests.has('testHTMLFilePickerRoundTrip')) result.checks.push('independent-html-file-picker-exact-bytes');
       if (variant.files && tests.has('testBlobDownloadShareAndFilePicker')) await collectCheck(`${variant.key}-file-integrity`, async () => {
         result.download = await verifyBlobDownload();
         Object.assign(report.coverage, { actualWKWebView: true, nativeBlobDownload: true, nativeShareSheet: true,

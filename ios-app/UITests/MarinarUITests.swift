@@ -276,6 +276,7 @@ final class MarinarUITests: XCTestCase {
     }
 
     func testBlobDownloadShareAndFilePicker() throws {
+        app.terminate()
         app.launchEnvironment["MARINARA_TEST_FILE_PANEL"] = "1"
         launchReady()
         let export = app.webViews.buttons["Export test JSON"].firstMatch
@@ -343,6 +344,21 @@ final class MarinarUITests: XCTestCase {
         confirmation.buttons["확인"].tap()
         XCTAssertTrue(app.webViews.staticTexts["Confirmation accepted"].waitForExistence(timeout: 10))
 
+        // Preserve the same-process export -> dialog -> import regression gate.
+        assertActualFilePickerRoundTrip()
+    }
+
+    func testHTMLFilePickerRoundTrip() throws {
+        // Keep real file selection independent of export/share/dialog failures.
+        // This launch creates the latest fixture marker used by the Files control.
+        app.terminate()
+        app.launchEnvironment["MARINARA_TEST_FILE_PANEL"] = "1"
+        launchReady()
+        attachScreen("html-picker-before-input")
+        assertActualFilePickerRoundTrip()
+    }
+
+    private func assertActualFilePickerRoundTrip() {
         // Read the exact file created and verified by this installed app.
         // Using its displayed unique filename avoids a stale provider item
         // from an earlier app installation or another test launch.
@@ -352,13 +368,25 @@ final class MarinarUITests: XCTestCase {
         let fixtureFilename = String(fixtureDescription.label.dropFirst(fixturePrefix.count))
         XCTAssertNotNil(fixtureFilename.range(of: "^marinar-ios-import-[0-9a-f]{8}\\.json$", options: .regularExpression),
                         "The import fixture filename is invalid")
+        let filenameEvidence = XCTAttachment(string: fixtureFilename)
+        filenameEvidence.name = "html-picker-expected-fixture"
+        filenameEvidence.lifetime = .keepAlways
+        add(filenameEvidence)
         let fixtureStem = (fixtureFilename as NSString).deletingPathExtension
         let file = app.webViews.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'Choose File' OR label CONTAINS[c] 'Choose test file'")).firstMatch
         XCTAssertTrue(file.waitForExistence(timeout: 15), "HTML file input is missing")
+        let picker = app.otherElements["Browse View (Picker)"].firstMatch
         let cancel = openDocumentPicker(file)
         attachScreen("system-file-picker")
         cancel.tap()
-        XCTAssertTrue(export.waitForExistence(timeout: 15), "Cancelling file selection did not return to the page")
+        expectation(for: NSPredicate { _, _ in
+            !cancel.exists && !picker.exists && file.exists && file.isEnabled && file.isHittable
+        }, evaluatedWith: file)
+        waitForExpectations(timeout: 15)
+        let cancelled = XCTAttachment(string: "Native Cancel dismissed the picker; the original HTML file input is enabled and hittable.")
+        cancelled.name = "html-picker-cancelled"
+        cancelled.lifetime = .keepAlways
+        add(cancelled)
         _ = openDocumentPicker(file)
         let fixture = app.staticTexts.matching(NSPredicate(format: "label == %@ OR label == %@", fixtureFilename, fixtureStem)).firstMatch
         if !fixture.waitForExistence(timeout: 3) {
@@ -417,12 +445,17 @@ final class MarinarUITests: XCTestCase {
         // the page must still receive and read the real fixture bytes below.
         let open = app.buttons["Open"].firstMatch
         if open.waitForExistence(timeout: 5) && open.isEnabled { open.tap() }
-        let picker = app.otherElements["Browse View (Picker)"].firstMatch
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: picker)
         waitForExpectations(timeout: 15)
-        let imported = app.webViews.staticTexts.matching(NSPredicate(format:
-            "label CONTAINS %@ AND label CONTAINS 'restored-file-fixture'", fixtureFilename)).firstMatch
+        let expectedJSON = #"{"fixture":"restored-file-fixture","text":"실제 파일 선택 확인"}"#
+        let expectedImport = "Imported: \(fixtureFilename) \(expectedJSON)"
+        let imported = app.webViews.staticTexts[expectedImport].firstMatch
         XCTAssertTrue(imported.waitForExistence(timeout: 15), "WKWebView did not receive the selected file bytes")
+        XCTAssertEqual(imported.label, expectedImport, "File.text() did not return the exact selected filename and JSON")
+        let importedEvidence = XCTAttachment(string: imported.label)
+        importedEvidence.name = "html-file-reader-verified-content"
+        importedEvidence.lifetime = .keepAlways
+        add(importedEvidence)
         attachScreen("system-file-imported")
     }
 
@@ -497,6 +530,7 @@ final class MarinarUITests: XCTestCase {
     }
 
     func testSystemFilesProviderCanOpenFixture() throws {
+        app.terminate()
         // Exercise the same installed app's Documents provider without
         // WebKit or UIDocumentPicker. Merely listing its filename is not a pass.
         app.launchEnvironment["MARINARA_TEST_FILE_PANEL"] = "1"
@@ -609,9 +643,47 @@ final class MarinarUITests: XCTestCase {
             // family. Use its observed native dismissal region, not a guessed
             // point on the underlying page or an iPad-only assumption.
             XCTAssertTrue(dismissPopup.isHittable, "The popover dismissal region is not available")
-            attachGeometry("\(screenshotName)-dismiss-geometry", elements: [("dismissPopup", dismissPopup),
-                ("popover", app.popovers.firstMatch)])
-            dismissPopup.tap()
+            let popover = app.popovers.firstMatch
+            let webView = app.webViews["marinar-webview"]
+            XCTAssertTrue(popover.exists && webView.exists, "The visible popover and WebView geometry are required")
+            let regionFrame = dismissPopup.frame
+            let visible = regionFrame.intersection(app.frame).intersection(webView.frame)
+            XCTAssertFalse(visible.isNull || visible.isEmpty, "The dismissal region has no visible area inside the app")
+            // The automatic hit point reached the extreme left edge and was
+            // cancelled. Choose one observed exposed rectangle, with margins
+            // from both the popover and the region bounds; do not retry a tap.
+            let excluded = popover.frame.insetBy(dx: -12, dy: -12)
+            let overlap = visible.intersection(excluded)
+            let candidates: [CGRect]
+            if overlap.isNull || overlap.isEmpty {
+                candidates = [visible]
+            } else {
+                candidates = [
+                    CGRect(x: visible.minX, y: visible.minY, width: visible.width, height: overlap.minY - visible.minY),
+                    CGRect(x: visible.minX, y: overlap.maxY, width: visible.width, height: visible.maxY - overlap.maxY),
+                    CGRect(x: visible.minX, y: visible.minY, width: overlap.minX - visible.minX, height: visible.height),
+                    CGRect(x: overlap.maxX, y: visible.minY, width: visible.maxX - overlap.maxX, height: visible.height),
+                ]
+            }
+            guard let exposed = candidates.filter({ $0.width > 16 && $0.height > 16 })
+                .max(by: { $0.width * $0.height < $1.width * $1.height }) else {
+                XCTFail("The popover leaves no visible dismissal rectangle with a safe boundary margin")
+                return
+            }
+            let target = exposed.insetBy(dx: 8, dy: 8)
+            let coordinate = dismissPopup.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+                .withOffset(CGVector(dx: target.midX - regionFrame.minX, dy: target.midY - regionFrame.minY))
+            let point = coordinate.screenPoint
+            attachGeometry("\(screenshotName)-dismiss-geometry", elements: [("app", app), ("webView", webView),
+                ("dismissPopup", dismissPopup), ("popover", popover)])
+            let evidence = XCTAttachment(string: "visible=\(visible), excludedPopover=\(excluded), exposed=\(exposed), target=\(target), screenPoint=\(point)")
+            evidence.name = "\(screenshotName)-dismiss-coordinate"
+            evidence.lifetime = .keepAlways
+            add(evidence)
+            XCTAssertTrue(target.contains(point) && regionFrame.contains(point) && app.frame.contains(point)
+                && webView.frame.contains(point) && visible.contains(point), "The dismissal touch is outside the observed visible region")
+            XCTAssertFalse(excluded.contains(point), "The dismissal touch overlaps the popover or its margin")
+            coordinate.tap()
         } else { XCTFail("The native share UI has no available dismissal action") }
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: filename)
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: save)
