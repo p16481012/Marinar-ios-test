@@ -79,7 +79,7 @@ final class MarinarUITests: XCTestCase {
         XCTAssertTrue(send.waitForExistence(timeout: 15))
         XCTAssertTrue(send.isEnabled)
         XCTAssertTrue(send.isHittable, "Send is covered by the keyboard or outside the safe area")
-        assertComposerAboveKeyboard(input)
+        assertComposerAboveKeyboard()
         send.tap()
         let response = app.webViews.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", reply)).firstMatch
         XCTAssertTrue(response.waitForExistence(timeout: 90), "Real UI send did not display the mock provider response")
@@ -97,31 +97,55 @@ final class MarinarUITests: XCTestCase {
 
     private func prepareSoftwareKeyboard() {
         let keyboard = app.keyboards.firstMatch
-        XCTAssertTrue(keyboard.waitForExistence(timeout: 15), "The software keyboard is not visible")
-        // A fresh simulator can show Apple's QuickPath introduction instead
-        // of keys. Its AX subtree varies, so require the observed tutorial
-        // text and a Continue button entirely in the keyboard, outside WebKit.
-        let tutorial = app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'Speed up your typing'")).firstMatch
-        let continueButton = app.buttons["Continue"].firstMatch
-        if tutorial.waitForExistence(timeout: 3) && continueButton.exists {
-            let buttonFrame = continueButton.frame
-            let webFrame = app.webViews["marinar-webview"].frame
-            let nativeButton = buttonFrame.width > 0 && buttonFrame.height > 0
-                && keyboard.frame.contains(buttonFrame) && !webFrame.intersects(buttonFrame)
-            if !nativeButton {
-                attachKeyboardDiagnostics("keyboard-tutorial-unexpected-placement")
-                XCTFail("Keyboard tutorial Continue is not inside the native keyboard")
-                return
+        let letterKey = keyboard.keys.matching(NSPredicate(format: "label == 'Q' OR label == 'q'")).firstMatch
+        let deadline = Date().addingTimeInterval(60)
+        var readySince: Date?
+        var dismissedTutorial = false
+        while Date() < deadline {
+            if let snapshot = try? app.snapshot() {
+                let nodes = snapshotTree(snapshot)
+                let keyboardFrame = nodes.first { $0.elementType == .keyboard }?.frame ?? .zero
+                let webFrame = nodes.first { $0.identifier == "marinar-webview" }?.frame ?? .zero
+                // The observed QuickPath introduction can arrive after the
+                // keyboard's preview keys, including after typeText(). Its
+                // actual native subtree is distinct from any page Continue.
+                let introduction = nodes.first { $0.identifier == "UIContinuousPathIntroductionView" }
+                let tutorialVisible = nodes.contains { $0.label.contains("Speed up your typing") }
+                if introduction != nil || tutorialVisible {
+                    readySince = nil
+                    if let introduction, !dismissedTutorial {
+                        let tutorialNodes = snapshotTree(introduction)
+                        if tutorialNodes.contains(where: { $0.label.contains("Speed up your typing") }),
+                           let button = tutorialNodes.first(where: { $0.elementType == .button && $0.label == "Continue" }),
+                           button.frame.width > 0, button.frame.height > 0,
+                           introduction.frame.contains(button.frame), keyboardFrame.contains(button.frame),
+                           !webFrame.intersects(button.frame) {
+                            let nativeContinue = app.otherElements["UIContinuousPathIntroductionView"].buttons["Continue"].firstMatch
+                            if nativeContinue.exists && nativeContinue.isEnabled && nativeContinue.isHittable {
+                                nativeContinue.tap()
+                                dismissedTutorial = true
+                            }
+                        }
+                    }
+                } else if keyboardFrame.width > 0, keyboardFrame.height > 0,
+                          letterKey.exists, letterKey.frame.width > 0, letterKey.frame.height > 0,
+                          letterKey.isHittable {
+                    if let readySince, Date().timeIntervalSince(readySince) >= 1 { return }
+                    if readySince == nil { readySince = Date() }
+                } else {
+                    readySince = nil
+                }
+            } else {
+                readySince = nil
             }
-            XCTAssertTrue(continueButton.isEnabled)
-            XCTAssertTrue(continueButton.isHittable)
-            continueButton.tap()
-            expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: continueButton)
-            waitForExpectations(timeout: 15)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
         }
-        let hasKeys = keyboard.keys.firstMatch.waitForExistence(timeout: 15)
-        if !hasKeys { attachKeyboardDiagnostics("keyboard-keys-missing-before-input") }
-        XCTAssertTrue(hasKeys, "The keyboard has no usable keys")
+        attachKeyboardDiagnostics("keyboard-not-ready")
+        XCTFail("The software keyboard did not expose a usable letter key with its tutorial dismissed")
+    }
+
+    private func snapshotTree(_ snapshot: any XCUIElementSnapshot) -> [any XCUIElementSnapshot] {
+        [snapshot] + snapshot.children.flatMap { snapshotTree($0) }
     }
 
     private func attachKeyboardDiagnostics(_ name: String) {
@@ -132,17 +156,45 @@ final class MarinarUITests: XCTestCase {
         add(hierarchy)
     }
 
-    private func assertComposerAboveKeyboard(_ input: XCUIElement) {
-        let keyboard = app.keyboards.firstMatch
-        XCTAssertTrue(keyboard.waitForExistence(timeout: 15), "The software keyboard is not visible")
-        XCTAssertTrue(keyboard.keys.firstMatch.waitForExistence(timeout: 15), "The keyboard has no usable keys")
-        if keyboard.exists {
-            XCTAssertLessThanOrEqual(input.frame.maxY, keyboard.frame.minY + 2,
-                                     "The software keyboard covers the chat composer")
+    private func assertComposerAboveKeyboard() {
+        // Recheck after typing/rotation: first-use UI may appear later than
+        // the initial focus. A zero-size Padding-Left key is not readiness.
+        prepareSoftwareKeyboard()
+        let deadline = Date().addingTimeInterval(45)
+        var previousFrames: [CGRect]?
+        var lastObservation = "No complete layout snapshot"
+        while Date() < deadline {
+            // Separate XCUIElement.frame calls previously mixed an old WebKit
+            // frame with a keyboard frame retrieved 13 seconds later. Read
+            // the whole geometry from one snapshot, then require it twice.
+            if let snapshot = try? app.snapshot() {
+                let nodes = snapshotTree(snapshot)
+                if let web = nodes.first(where: { $0.identifier == "marinar-webview" }),
+                   let composer = snapshotTree(web).first(where: { $0.elementType == .textView }),
+                   let keyboard = nodes.first(where: { $0.elementType == .keyboard }) {
+                    let frames = [web.frame, composer.frame, keyboard.frame]
+                    lastObservation = "webView=\(web.frame), input=\(composer.frame), keyboard=\(keyboard.frame)"
+                    let tutorialVisible = nodes.contains { $0.identifier == "UIContinuousPathIntroductionView"
+                        || $0.label.contains("Speed up your typing") }
+                    let valid = frames.allSatisfy { $0.width > 0 && $0.height > 0 }
+                        && !tutorialVisible
+                        && composer.frame.maxY <= keyboard.frame.minY + 2
+                        && composer.frame.minY >= web.frame.minY - 2
+                        && composer.frame.maxY <= web.frame.maxY + 2
+                        && composer.frame.minX >= web.frame.minX - 2
+                        && composer.frame.maxX <= web.frame.maxX + 2
+                    if valid && previousFrames == frames { return }
+                    previousFrames = valid ? frames : nil
+                } else {
+                    previousFrames = nil
+                }
+            } else {
+                previousFrames = nil
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
         }
-        let web = app.webViews["marinar-webview"]
-        XCTAssertGreaterThanOrEqual(input.frame.minX, web.frame.minX - 2)
-        XCTAssertLessThanOrEqual(input.frame.maxX, web.frame.maxX + 2)
+        attachKeyboardDiagnostics("composer-keyboard-layout-not-ready")
+        XCTFail("The composer did not settle fully inside the WebView above the keyboard: \(lastObservation)")
     }
 
     func testComposerAcrossOrientations() throws {
@@ -153,7 +205,7 @@ final class MarinarUITests: XCTestCase {
         input.tap()
         prepareSoftwareKeyboard()
         input.typeText("Layout check")
-        assertComposerAboveKeyboard(input)
+        assertComposerAboveKeyboard()
         XCTAssertTrue(app.webViews.buttons["Send"].firstMatch.isHittable)
         attachComposerGeometry("composer-portrait-geometry", input: input)
         attachScreen("composer-portrait-keyboard")
@@ -162,7 +214,7 @@ final class MarinarUITests: XCTestCase {
         let send = app.webViews.buttons["Send"].firstMatch
         expectation(for: NSPredicate(format: "hittable == true"), evaluatedWith: send)
         waitForExpectations(timeout: 20)
-        assertComposerAboveKeyboard(input)
+        assertComposerAboveKeyboard()
         attachComposerGeometry("composer-landscape-geometry", input: input)
         attachScreen("composer-landscape-keyboard")
         XCUIDevice.shared.orientation = .portrait
@@ -235,15 +287,31 @@ final class MarinarUITests: XCTestCase {
             if folder.waitForExistence(timeout: 10) { folder.tap() }
         }
         XCTAssertTrue(fixture.waitForExistence(timeout: 20), "Fixture not found in the app's Files folder")
-        // The Files grid exposes its filename as a separate StaticText. In
-        // the simulator that label tap left the file unselected. Activate the
-        // visible file thumbnail inside its actual collection cell instead.
+        // The Files grid exposes its filename separately. Both its label and
+        // automatic cell hit point left the file unselected. The thumbnail's
+        // AX isHittable is false even when visibly inside the enabled cell;
+        // deliver one real touch at its observed, validated frame center.
         let fixtureCell = app.cells.containing(.staticText, identifier: fixture.label).firstMatch
         XCTAssertTrue(fixtureCell.waitForExistence(timeout: 10), "Fixture file cell is missing")
         XCTAssertTrue(fixtureCell.isEnabled, "Fixture file cannot be selected")
         let thumbnail = fixtureCell.images.firstMatch
-        if thumbnail.exists && thumbnail.isHittable { thumbnail.tap() }
-        else { fixtureCell.tap() } // Files list presentations may omit the thumbnail.
+        if thumbnail.exists {
+            let fileView = app.collectionViews["File View"].firstMatch
+            XCTAssertTrue(fileView.exists, "The visible Files collection is missing")
+            let thumbnailFrame = thumbnail.frame
+            XCTAssertTrue(thumbnailFrame.width > 0 && thumbnailFrame.height > 0, "The file thumbnail has no visible area")
+            XCTAssertTrue(fixtureCell.frame.contains(thumbnailFrame), "The thumbnail is outside the expected file cell")
+            XCTAssertTrue(fileView.frame.contains(thumbnailFrame) && app.frame.contains(thumbnailFrame),
+                          "The file thumbnail is outside the visible picker")
+            attachScreen("system-file-before-selection")
+            attachGeometry("system-file-before-selection-geometry", elements: [("app", app), ("fileView", fileView),
+                ("fixtureCell", fixtureCell), ("thumbnail", thumbnail)])
+            thumbnail.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        } else {
+            // Files list presentations may omit the thumbnail.
+            XCTAssertTrue(fixtureCell.isHittable, "The fixture file row is not available")
+            fixtureCell.tap()
+        }
         attachScreen("system-file-selected")
         let selection = XCTAttachment(string: app.debugDescription)
         selection.name = "system-file-selected-accessibility-hierarchy"
@@ -254,6 +322,9 @@ final class MarinarUITests: XCTestCase {
         // the page must still receive and read the real fixture bytes below.
         let open = app.buttons["Open"].firstMatch
         if open.waitForExistence(timeout: 5) && open.isEnabled { open.tap() }
+        let picker = app.otherElements["Browse View (Picker)"].firstMatch
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: picker)
+        waitForExpectations(timeout: 15)
         let imported = app.webViews.staticTexts.matching(NSPredicate(format: "label CONTAINS 'restored-file-fixture'")).firstMatch
         XCTAssertTrue(imported.waitForExistence(timeout: 15), "WKWebView did not receive the selected file bytes")
         attachScreen("system-file-imported")
