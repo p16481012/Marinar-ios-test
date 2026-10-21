@@ -178,7 +178,7 @@ final class MarinarUITests: XCTestCase {
         _ = openDocumentPicker(restore)
         selectSystemDocument(named: filename)
         let confirmationText = "Restore \(filename)? This replaces current data at the next complete app restart. Save a backup of your current data first. The file will be validated before anything is replaced, and you can cancel the pending restore before restarting."
-        let confirmation = app.webViews.staticTexts[confirmationText].firstMatch
+        let confirmation = app.webViews.staticTexts.matching(NSPredicate(format: "label == %@", confirmationText)).firstMatch
         XCTAssertTrue(confirmation.waitForExistence(timeout: 30), "The real restore confirmation did not name the selected ZIP")
         XCTAssertEqual(confirmation.label, confirmationText)
         attachScreen("settings-restore-confirmation")
@@ -192,7 +192,7 @@ final class MarinarUITests: XCTestCase {
         XCTAssertTrue(pending.waitForExistence(timeout: 180), "The selected ZIP was not uploaded, validated and staged by Settings")
         _ = hittableWebElement(named: "Cancel restore and keep current data")
         let restartText = "Fully close Marinar from the app switcher, then reopen it. The validated backup will replace current data before the server starts. Editing is paused until you restart or cancel this restore. Reloading the page or briefly going to the Home Screen is not enough."
-        XCTAssertTrue(app.webViews.staticTexts[restartText].firstMatch.exists, "The product did not explain that a full process restart is required")
+        XCTAssertTrue(app.webViews.staticTexts.matching(NSPredicate(format: "label == %@", restartText)).firstMatch.exists, "The product did not explain that a full process restart is required")
         attachScreen("settings-restore-pending-before-cold-launch")
         let pendingEvidence = XCTAttachment(string: app.debugDescription)
         pendingEvidence.name = "settings-restore-pending-accessibility-hierarchy"
