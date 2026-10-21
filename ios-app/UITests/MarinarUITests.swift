@@ -33,10 +33,39 @@ final class MarinarUITests: XCTestCase {
     }
 
     private func attachScreen(_ name: String) {
-        let attachment = XCTAttachment(screenshot: app.screenshot())
+        // Capture the whole display; an application's accessibility frame can
+        // retain portrait bounds while UIKit rotates, cropping the evidence.
+        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+
+    private func attachGeometry(_ name: String, elements: [(String, XCUIElement)]) {
+        let text = elements.map { label, element in
+            let frame = element.frame
+            return "\(label): frame=\(frame), center=(\(frame.midX), \(frame.midY))"
+        }.joined(separator: "\n")
+        let attachment = XCTAttachment(string: text)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func waitForAppOrientation(landscape: Bool) {
+        // The WebView shrinks above the keyboard and can look wide even in
+        // portrait. Verify the actual application frame before layout checks.
+        expectation(for: NSPredicate { _, _ in
+            let frame = self.app.frame
+            return frame.width > 0 && frame.height > 0
+                && (landscape ? frame.width > frame.height : frame.height > frame.width)
+        }, evaluatedWith: app)
+        waitForExpectations(timeout: 30)
+    }
+
+    private func attachComposerGeometry(_ name: String, input: XCUIElement) {
+        attachGeometry(name, elements: [("app", app), ("webView", app.webViews["marinar-webview"]),
+            ("input", input), ("keyboard", app.keyboards.firstMatch), ("send", app.webViews.buttons["Send"].firstMatch)])
     }
 
     func testSendPersistsAfterProcessRelaunch() throws {
@@ -79,20 +108,25 @@ final class MarinarUITests: XCTestCase {
 
     func testComposerAcrossOrientations() throws {
         launchReady()
+        waitForAppOrientation(landscape: false)
         let input = app.webViews.textViews.firstMatch
         XCTAssertTrue(input.waitForExistence(timeout: 60))
         input.tap()
         input.typeText("Layout check")
         assertComposerAboveKeyboard(input)
         XCTAssertTrue(app.webViews.buttons["Send"].firstMatch.isHittable)
+        attachComposerGeometry("composer-portrait-geometry", input: input)
         attachScreen("composer-portrait-keyboard")
         XCUIDevice.shared.orientation = .landscapeLeft
+        waitForAppOrientation(landscape: true)
         let send = app.webViews.buttons["Send"].firstMatch
         expectation(for: NSPredicate(format: "hittable == true"), evaluatedWith: send)
         waitForExpectations(timeout: 20)
         assertComposerAboveKeyboard(input)
+        attachComposerGeometry("composer-landscape-geometry", input: input)
         attachScreen("composer-landscape-keyboard")
         XCUIDevice.shared.orientation = .portrait
+        waitForAppOrientation(landscape: false)
     }
 
     func testBlobDownloadShareAndFilePicker() throws {
@@ -100,7 +134,14 @@ final class MarinarUITests: XCTestCase {
         launchReady()
         let export = app.webViews.buttons["Export test JSON"].firstMatch
         XCTAssertTrue(export.waitForExistence(timeout: 30))
-        export.tap()
+        expectation(for: NSPredicate { _, _ in export.exists && export.isEnabled && export.isHittable }, evaluatedWith: export)
+        waitForExpectations(timeout: 30)
+        attachScreen("blob-export-before-tap")
+        attachGeometry("blob-export-before-tap-geometry", elements: [("app", app),
+            ("webView", app.webViews["marinar-webview"]), ("export", export)])
+        // Deliver one real touch at the observed button center. The automatic
+        // WebKit accessibility hit point previously delivered no DOM events.
+        export.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         let handler = app.webViews.staticTexts["Export handler started"].firstMatch
         let exportedFilename = app.descendants(matching: .any).matching(NSPredicate(format:
             "label CONTAINS 'marinar-ios-export'")).firstMatch
@@ -154,7 +195,15 @@ final class MarinarUITests: XCTestCase {
             if folder.waitForExistence(timeout: 10) { folder.tap() }
         }
         XCTAssertTrue(fixture.waitForExistence(timeout: 20), "Fixture not found in the app's Files folder")
-        fixture.tap()
+        // The Files grid exposes its filename as a separate StaticText. In
+        // the simulator that label tap left the file unselected. Activate the
+        // visible file thumbnail inside its actual collection cell instead.
+        let fixtureCell = app.cells.containing(.staticText, identifier: fixture.label).firstMatch
+        XCTAssertTrue(fixtureCell.waitForExistence(timeout: 10), "Fixture file cell is missing")
+        XCTAssertTrue(fixtureCell.isEnabled, "Fixture file cannot be selected")
+        let thumbnail = fixtureCell.images.firstMatch
+        if thumbnail.exists && thumbnail.isHittable { thumbnail.tap() }
+        else { fixtureCell.tap() } // Files list presentations may omit the thumbnail.
         attachScreen("system-file-selected")
         let selection = XCTAttachment(string: app.debugDescription)
         selection.name = "system-file-selected-accessibility-hierarchy"

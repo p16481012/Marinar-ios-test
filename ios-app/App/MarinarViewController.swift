@@ -546,15 +546,15 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
           panel.innerHTML = '<h1>iOS file diagnostics</h1><button id="ios-test-export">Export test JSON</button><button id="ios-test-error">Test failed export</button><hr><label>Choose test file<input id="ios-test-file" type="file" accept="application/json,.json"></label><hr><button id="ios-test-confirm">Test confirmation</button><p id="ios-file-result"></p><aside id="ios-event-result" style="position:fixed;bottom:16px;left:24px;right:24px;height:70px;font-size:12px;overflow:auto;pointer-events:none"></aside><p id="ios-export-result" style="position:fixed;bottom:90px;left:24px;right:24px;height:30px;font-size:14px;pointer-events:none">Export handler idle</p>';
           const events = [];
           let displayEvents;
-          for (const type of ['pointerdown', 'pointerup', 'touchstart', 'touchend', 'click']) {
-            panel.addEventListener(type, event => {
-              events.push(type + ':' + (event.target.id || event.target.tagName));
-              if (type === 'pointerup' || type === 'touchend' || type === 'click') {
-                clearTimeout(displayEvents);
-                displayEvents = setTimeout(() => {
-                  panel.querySelector('#ios-event-result').textContent = events.slice(-8).join(' > ');
-                }, 400);
-              }
+          for (const type of ['pointerdown', 'pointerup', 'pointercancel', 'touchstart', 'touchend', 'touchcancel', 'click']) {
+            document.addEventListener(type, event => {
+              const point = event.changedTouches?.[0] || event;
+              events.push(type + ':' + (event.target.id || event.target.tagName) + '@' + Math.round(point.clientX) + ',' + Math.round(point.clientY));
+              if (events.length > 32) events.shift();
+              clearTimeout(displayEvents);
+              displayEvents = setTimeout(() => {
+                panel.querySelector('#ios-event-result').textContent = events.slice(-8).join(' > ');
+              }, 400);
             }, {capture:true, passive:true});
           }
           const directDownload = (url, name) => {
@@ -583,7 +583,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
               throw new Error('Backup preparation timed out');
             })().catch(error => { button.textContent = 'Streamed archive failed: ' + error.message; });
           }
-          for (const button of panel.querySelectorAll('button,input')) button.style = 'font-size:18px;min-height:44px;margin:8px;display:block';
+          for (const button of panel.querySelectorAll('button,input')) button.style = 'font-size:18px;min-height:44px;margin:8px;display:block;max-width:calc(100% - 16px);box-sizing:border-box';
           document.body.append(panel);
           panel.querySelector('#ios-test-export').onclick = () => {
             const result = panel.querySelector('#ios-export-result');
