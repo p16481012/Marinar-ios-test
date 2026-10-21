@@ -185,11 +185,12 @@ async function runUITests(commandArgs, { phase, log, expectedTests }) {
     if (status !== 'passed') recordFailure(`${phase}/${name}`, new Error(`XCTest ${status}; see ${log}`));
   }
   await checkpoint();
-  if (tests.testBlobDownloadShareAndFilePicker && tests.testBlobDownloadShareAndFilePicker !== 'passed') {
+  if (['testBlobDownloadShareAndFilePicker', 'testSystemFilesProviderCanOpenFixture']
+    .some((name) => tests[name] && tests[name] !== 'passed')) {
     // The picker is hosted by a system service. App-only logs cannot explain
     // a visible file that never reaches WebKit's file-input callback.
     await run('xcrun', ['simctl', 'spawn', deviceId, 'log', 'show', '--last', '10m', '--style', 'compact',
-      '--predicate', 'process == "fileproviderd" OR process CONTAINS[c] "DocumentManager" OR subsystem CONTAINS[c] "FileProvider" OR subsystem CONTAINS[c] "DocumentManager"'],
+      '--predicate', 'process == "fileproviderd" OR process CONTAINS[c] "DocumentManager" OR process CONTAINS[c] "Spotlight" OR subsystem CONTAINS[c] "FileProvider" OR subsystem CONTAINS[c] "DocumentManager" OR subsystem CONTAINS[c] "Spotlight"'],
     { log: `${phase}-file-picker.log`, allowFailure: true }).catch((error) => {
       console.warn(`Could not collect file picker diagnostics: ${error.message}`);
     });
@@ -486,9 +487,10 @@ async function runPrimaryChecks(buildArgs) {
     '-parallel-testing-enabled', 'NO', '-maximum-concurrent-test-simulator-destinations', '1',
     '-only-testing:MarinarUITests/MarinarUITests/testSendPersistsAfterProcessRelaunch',
     '-only-testing:MarinarUITests/MarinarUITests/testBlobDownloadShareAndFilePicker',
+    '-only-testing:MarinarUITests/MarinarUITests/testSystemFilesProviderCanOpenFixture',
     '-resultBundlePath', path.join(reportDir, 'MarinarUITests.xcresult')], {
     phase: 'primary-ui', log: 'simulator-ui-tests.log',
-    expectedTests: ['testSendPersistsAfterProcessRelaunch', 'testBlobDownloadShareAndFilePicker'],
+    expectedTests: ['testSendPersistsAfterProcessRelaunch', 'testBlobDownloadShareAndFilePicker', 'testSystemFilesProviderCanOpenFixture'],
   });
   await preserveLaunchLogs();
   // XCTest runs independent methods in one invocation. An export failure must
@@ -637,10 +639,12 @@ try {
       const tests = await runUITests(['test-without-building', ...argsForDevice,
         '-parallel-testing-enabled', 'NO', '-maximum-concurrent-test-simulator-destinations', '1',
         '-only-testing:MarinarUITests/MarinarUITests/testComposerAcrossOrientations',
-        ...(variant.files ? ['-only-testing:MarinarUITests/MarinarUITests/testBlobDownloadShareAndFilePicker'] : []),
+        ...(variant.files ? ['-only-testing:MarinarUITests/MarinarUITests/testBlobDownloadShareAndFilePicker',
+          '-only-testing:MarinarUITests/MarinarUITests/testSystemFilesProviderCanOpenFixture'] : []),
         '-resultBundlePath', path.join(reportDir, `${variant.key}.xcresult`)], {
         phase: variant.key, log: `${variant.key}-ui-tests.log`,
-        expectedTests: ['testComposerAcrossOrientations', ...(variant.files ? ['testBlobDownloadShareAndFilePicker'] : [])],
+        expectedTests: ['testComposerAcrossOrientations', ...(variant.files ? ['testBlobDownloadShareAndFilePicker',
+          'testSystemFilesProviderCanOpenFixture'] : [])],
       });
       if (tests.has('testComposerAcrossOrientations')) {
         report.coverage.actualWKWebView = true;

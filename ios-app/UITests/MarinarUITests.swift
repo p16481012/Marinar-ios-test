@@ -3,6 +3,7 @@ import UIKit
 
 final class MarinarUITests: XCTestCase {
     private let app = XCUIApplication()
+    private var systemFilesApp: XCUIApplication?
     private let prompt = "[IOS_STREAM_TEST] Hello. Please remember the blue lantern."
     private let reply = "The blue lantern is remembered."
 
@@ -14,6 +15,11 @@ final class MarinarUITests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        if let files = systemFilesApp {
+            attachSystemFilesEvidence("system-files-final")
+            files.terminate()
+            systemFilesApp = nil
+        }
         if (testRun?.failureCount ?? 0) > 0 {
             attachScreen("failure-\(name)")
             let hierarchy = XCTAttachment(string: app.debugDescription)
@@ -389,6 +395,96 @@ final class MarinarUITests: XCTestCase {
         // failing while its remote view controller is still starting.
         XCTAssertTrue(cancel.waitForExistence(timeout: 90), "System document picker did not become ready")
         return cancel
+    }
+
+    func testSystemFilesProviderCanOpenFixture() throws {
+        // Exercise the same installed app's Documents provider without
+        // WebKit or UIDocumentPicker. Merely listing its filename is not a pass.
+        app.launchEnvironment["MARINARA_TEST_FILE_PANEL"] = "1"
+        app.launchEnvironment["MARINARA_TEST_FILES_CONTROL"] = "1"
+        launchReady()
+        let prefix = "Import fixture: "
+        let description = app.webViews.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", prefix)).firstMatch
+        XCTAssertTrue(description.waitForExistence(timeout: 30), "The app did not create its import fixture")
+        let filename = String(description.label.dropFirst(prefix.count))
+        XCTAssertNotNil(filename.range(of: "^marinar-ios-import-[0-9a-f]{8}\\.json$", options: .regularExpression),
+                        "The app did not expose a valid unique fixture filename")
+        let stem = (filename as NSString).deletingPathExtension
+        let fixtureEvidence = XCTAttachment(string: "Expected installed-app fixture: \(filename)")
+        fixtureEvidence.name = "system-files-expected-fixture"
+        fixtureEvidence.lifetime = .keepAlways
+        add(fixtureEvidence)
+
+        let files = XCUIApplication(bundleIdentifier: "com.apple.DocumentsApp")
+        systemFilesApp = files
+        defer {
+            attachSystemFilesEvidence("system-files-final")
+            files.terminate()
+            systemFilesApp = nil
+        }
+        files.launchArguments = app.launchArguments
+        files.launch()
+        XCTAssertTrue(files.wait(for: .runningForeground, timeout: 30), "The system Files app did not launch")
+        attachSystemFilesEvidence("system-files-launched")
+
+        let location = files.staticTexts.matching(NSPredicate(format:
+            "label == 'On My iPhone' OR label == 'On My iPad'")).firstMatch
+        // Files may start in Recents or retain a browsed folder. Navigate
+        // only through native elements actually exposed by the current UI.
+        for _ in 0..<6 {
+            if location.exists && location.isHittable { break }
+            let back = files.navigationBars.buttons.matching(NSPredicate(format:
+                "label == 'Browse' OR label == 'Locations' OR label == 'Back' OR label == 'On My iPhone' OR label == 'On My iPad'")).firstMatch
+            let browseTab = files.tabBars.buttons["Browse"].firstMatch
+            let browse = files.buttons["Browse"].firstMatch
+            if back.exists && back.isHittable { back.tap() }
+            else if browseTab.exists && browseTab.isHittable { browseTab.tap() }
+            else if browse.exists && browse.isHittable { browse.tap() }
+            else { break }
+        }
+        attachSystemFilesEvidence("system-files-locations")
+        XCTAssertTrue(location.waitForExistence(timeout: 30), "Files did not expose the local device location")
+        XCTAssertTrue(location.isHittable, "The local device location is not available")
+        location.tap()
+
+        let folder = files.staticTexts["Marinar iOS Test"].firstMatch
+        XCTAssertTrue(folder.waitForExistence(timeout: 30), "Files did not expose this installed app's Documents folder")
+        XCTAssertTrue(folder.isHittable, "The installed app's Documents folder is not available")
+        folder.tap()
+        let fixture = files.staticTexts.matching(NSPredicate(format: "label == %@ OR label == %@", filename, stem)).firstMatch
+        XCTAssertTrue(fixture.waitForExistence(timeout: 30), "Files did not list the app-created unique fixture")
+        attachSystemFilesEvidence("system-files-before-open")
+        let cell = files.cells.containing(.staticText, identifier: fixture.label).firstMatch
+        if cell.exists {
+            XCTAssertTrue(cell.isHittable, "The exact fixture file row is not available")
+            cell.tap()
+        } else {
+            XCTAssertTrue(fixture.isHittable, "The exact fixture filename is not available")
+            fixture.tap()
+        }
+
+        // QuickLook can expose JSON through either labels or a text value.
+        // Require the bytes' distinctive content, not a filename or thumbnail.
+        let content = NSPredicate { _, _ in
+            guard let snapshot = try? files.snapshot() else { return false }
+            return self.snapshotTree(snapshot).contains { node in
+                node.label.contains("restored-file-fixture")
+                    || (node.value as? String)?.contains("restored-file-fixture") == true
+            }
+        }
+        let opened = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: content, object: files)], timeout: 60)
+        attachSystemFilesEvidence("system-files-after-open")
+        XCTAssertEqual(opened, .completed,
+                       "Files/QuickLook did not expose the fixture contents; inspect the attached system Files screen and accessibility tree")
+    }
+
+    private func attachSystemFilesEvidence(_ name: String) {
+        guard let files = systemFilesApp else { return }
+        attachScreen(name)
+        let hierarchy = XCTAttachment(string: files.debugDescription)
+        hierarchy.name = "\(name)-accessibility-hierarchy"
+        hierarchy.lifetime = .keepAlways
+        add(hierarchy)
     }
 
     private func dismissExportShare(_ screenshotName: String, expectedFilename: String) {

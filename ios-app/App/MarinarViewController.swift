@@ -2,7 +2,7 @@ import UIKit
 import WebKit
 import CryptoKit
 
-final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
+final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, UIPopoverPresentationControllerDelegate {
     private var configuration: RuntimeConfiguration?
     private var webView: WKWebView!
     private let overlay = UIStackView()
@@ -424,8 +424,12 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         let url = pendingShares.removeFirst()
         let share = UIActivityViewController(activityItems: [url], applicationActivities: nil)
         share.view.accessibilityIdentifier = "marinar-export-share"
-        share.popoverPresentationController?.sourceView = view
-        share.popoverPresentationController?.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
+        if let popover = share.popoverPresentationController {
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
+            popover.passthroughViews = []
+            popover.delegate = self
+        }
         share.completionWithItemsHandler = { [weak self] _, _, _, error in
             try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
@@ -434,7 +438,28 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
                 self?.presentNextShare()
             }
         }
-        present(share, animated: true)
+        present(share, animated: true) { [weak self, weak share] in
+            #if DEBUG
+            guard let share = share else { return }
+            let popover = share.popoverPresentationController
+            let passthroughViews = popover?.passthroughViews
+            let sourceView = popover?.sourceView
+            self?.recordExportEventIfNeeded("share-presented", fields: [
+                "hasPopoverPresentationController": popover != nil,
+                "passthroughViewsIsNil": passthroughViews == nil,
+                "passthroughCount": passthroughViews?.count ?? 0,
+                "passthroughClasses": passthroughViews?.map { NSStringFromClass(type(of: $0)) } ?? [],
+                "isModalInPresentation": share.isModalInPresentation,
+                "sourceViewBounds": sourceView.map { NSCoder.string(for: $0.bounds) } ?? ""
+            ])
+            #endif
+        }
+    }
+
+    func prepareForPopoverPresentation(_ popoverPresentationController: UIPopoverPresentationController) {
+        // Sharing is modal: a tap outside the popover must not activate a
+        // web control behind it. Apply this again at UIKit's preparation point.
+        popoverPresentationController.passthroughViews = []
     }
 
     func download(_ download: WKDownload, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, decisionHandler: @escaping (WKDownload.RedirectPolicy) -> Void) {
@@ -567,7 +592,9 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         let options = (try? Data(contentsOf: documents.appendingPathComponent("ios-file-test-config.json"))).flatMap {
             (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any]
         } ?? [:]
-        let panelValues: [Any] = [options["prepareBackup"] as? Bool == true, fixtureFilename]
+        let prepareBackup = options["prepareBackup"] as? Bool == true
+            && ProcessInfo.processInfo.environment["MARINARA_TEST_FILES_CONTROL"] != "1"
+        let panelValues: [Any] = [prepareBackup, fixtureFilename]
         guard let encoded = try? JSONSerialization.data(withJSONObject: panelValues),
               let values = String(data: encoded, encoding: .utf8) else { return }
         let script = """
