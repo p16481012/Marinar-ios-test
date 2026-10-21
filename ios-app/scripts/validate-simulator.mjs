@@ -13,20 +13,45 @@ import { createTestApi } from '../../scripts/ios/runtime-test-harness.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const args = process.argv.slice(2);
-const option = (name) => { const index = args.indexOf(name); return index < 0 ? undefined : args[index + 1]; };
+const valueOptions = new Set(['--profile', '--report-dir', '--derived-data', '--device-id']);
+const options = new Map();
+for (let index = 0; index < args.length; index += 1) {
+  const name = args[index];
+  if (name === '--help') { options.set(name, true); continue; }
+  assert.ok(valueOptions.has(name), `Unknown option: ${name}`);
+  assert.ok(!options.has(name), `Duplicate option: ${name}`);
+  const value = args[++index];
+  assert.ok(value && !value.startsWith('--'), `${name} requires a value`);
+  options.set(name, value);
+}
+const option = (name) => options.get(name);
+const profile = option('--profile') ?? 'all';
+assert.ok(['all', 'primary', 'compact-phone', 'ipad'].includes(profile),
+  '--profile must be all, primary, compact-phone or ipad');
+if (options.has('--help')) {
+  console.log('Usage: node ios-app/scripts/validate-simulator.mjs [--profile all|primary|compact-phone|ipad] [--report-dir PATH] [--derived-data PATH] [--device-id UUID]\n'
+    + 'Default profile: all. primary runs embedded API, chat, file transfer and full restore checks.\n'
+    + 'compact-phone and ipad run only their own seeded native UI checks; ipad also checks file transfer.\n'
+    + 'Use a separate --report-dir and --derived-data for each independent worker.');
+  process.exit(0);
+}
+const runsPrimary = profile === 'all' || profile === 'primary';
+const requestedVariants = profile === 'all' ? ['compact-phone', 'ipad'] : runsPrimary ? [] : [profile];
 const reportDir = path.resolve(option('--report-dir') ?? path.join(root, 'ios-app/build/validation'));
 const derived = path.resolve(option('--derived-data') ?? path.join(root, 'ios-app/build/DerivedData'));
 const bundleId = 'com.p16481012.marinar.ios.test';
 const project = path.join(root, 'ios-app/Marinar.xcodeproj');
 let deviceId = option('--device-id');
 const ownedDevices = new Set();
+const shutdownDevices = new Set();
 let mock;
 let container;
 let launchNumber = 0;
 const launchLogs = [];
 const exportedResultBundles = new Set();
 let attachmentExportSupported;
-const report = { formatVersion: 1, status: 'running', checks: [], errors: [], uiTests: [], coverage: {
+const report = { formatVersion: 1, profile, requestedSuites: [...(runsPrimary ? ['primary'] : []), ...requestedVariants],
+  status: 'running', checks: [], errors: [], uiTests: [], screenVariants: [], coverage: {
   actualEmbeddedNode: false, actualWKWebView: false, nativeSendInteraction: false,
   nativeBlobDownload: false, nativeShareSheet: false, systemFilePicker: false, nativeDialogs: false,
   nativeBackgroundFlush: false,
@@ -107,6 +132,9 @@ async function run(command, commandArgs, { log, allowFailure = false, env, timeo
   });
   if (stream) await new Promise((resolve) => stream.end(resolve));
   const failed = timedOut || spawnError || code !== 0;
+  if (!failed && command === 'xcrun' && commandArgs[0] === 'simctl' && commandArgs[1] === 'shutdown') {
+    shutdownDevices.add(commandArgs[2]);
+  }
   Object.assign(report.command, { status: timedOut ? 'timed-out' : failed ? 'failed' : 'passed', endedAt: new Date().toISOString(), exitCode: code });
   if (timedOut) recordFailure('command-timeout', new Error(`${command} timed out after ${timeoutMs} ms${log ? `; see ${log}` : ''}`));
   await checkpoint();
@@ -423,57 +451,12 @@ async function exerciseNativeFullRestore(config, uiState) {
   return config;
 }
 
-try {
-  await checkpoint('environment');
-  assert.equal(process.platform, 'darwin', 'This validation requires macOS and Xcode');
-  assert.equal(process.arch, 'arm64', 'The pinned Node framework has an ARM64 simulator slice only');
-  const xcodeVersion = await run('xcodebuild', ['-version']);
-  const simulatorSDK = await run('xcrun', ['--sdk', 'iphonesimulator', '--show-sdk-version']);
-  const sdkFamily = simulatorSDK.split('.').slice(0, 2).join('.');
-  report.toolchain = { xcodeVersion, simulatorSDK };
-  const launchHelp = await run('xcrun', ['simctl', 'help', 'launch']);
-  await writeFile(path.join(reportDir, 'simctl-launch-help.txt'), launchHelp + '\n');
-  assert.ok(launchHelp.includes('--stdout') && launchHelp.includes('--stderr'), 'Installed simctl lacks file output redirection');
-  const { runtimes } = JSON.parse(await run('xcrun', ['simctl', 'list', 'runtimes', '-j']));
-  const { devicetypes } = JSON.parse(await run('xcrun', ['simctl', 'list', 'devicetypes', '-j']));
-  if (!deviceId) {
-    const runtime = runtimes.filter((item) => item.isAvailable && item.identifier.includes('.iOS-')
-      && item.version.split('.').slice(0, 2).join('.') === sdkFamily)
-      .sort((a, b) => b.version.localeCompare(a.version, undefined, { numeric: true }))[0];
-    assert.ok(runtime, `No available iOS Simulator runtime matching SDK ${simulatorSDK}; select the matching Xcode or install its runtime`);
-    const type = devicetypes.find((item) => item.identifier.endsWith('.iPhone-16-Pro'))
-      ?? devicetypes.filter((item) => item.name.startsWith('iPhone')).at(-1);
-    assert.ok(type, 'No iPhone simulator device type');
-    deviceId = await run('xcrun', ['simctl', 'create', `Marinar-validation-${Date.now()}`, type.identifier, runtime.identifier]);
-    ownedDevices.add(deviceId);
-  }
-  report.deviceId = deviceId;
-  const { devices } = JSON.parse(await run('xcrun', ['simctl', 'list', 'devices', '-j']));
-  const selected = Object.entries(devices).flatMap(([runtimeIdentifier, items]) =>
-    items.map((device) => ({ ...device, runtimeIdentifier }))).find((device) => device.udid === deviceId);
-  assert.ok(selected, 'Selected simulator is not listed by simctl');
-  const selectedRuntime = runtimes.find((runtime) => runtime.identifier === selected.runtimeIdentifier);
-  assert.ok(selectedRuntime, 'Cannot identify selected simulator runtime');
-  assert.equal(selectedRuntime.version.split('.').slice(0, 2).join('.'), sdkFamily,
-    'Selected simulator runtime must match the current Xcode simulator SDK');
-  report.simulator = { name: selected.name, deviceTypeIdentifier: selected.deviceTypeIdentifier,
-    runtimeIdentifier: selected.runtimeIdentifier, runtimeVersion: selectedRuntime.version,
-    runtimeBuildVersion: selectedRuntime.buildversion };
-  await checkpoint('primary-simulator-boot');
-  await run('xcrun', ['simctl', 'boot', deviceId], { allowFailure: true });
-  await run('xcrun', ['simctl', 'bootstatus', deviceId, '-b'], { log: 'simulator-boot.log' });
-  console.log('Building the native app and UI test bundle.');
-  await checkpoint('native-build');
-  const buildArgs = ['-project', project, '-scheme', 'Marinar', '-configuration', 'Debug',
-    '-destination', `platform=iOS Simulator,id=${deviceId}`, '-derivedDataPath', derived,
-    'CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO', 'CODE_SIGN_IDENTITY='];
-  await run('xcodebuild', ['build-for-testing', ...buildArgs], { log: 'simulator-build.log' });
+async function runPrimaryChecks(buildArgs) {
   await run('xcrun', ['simctl', 'install', deviceId, path.join(derived, 'Build/Products/Debug-iphonesimulator/Marinar.app')]);
   await checkpoint('primary-native-lifecycle');
   let config = await launch();
   report.coverage.actualEmbeddedNode = true;
   report.checks.push('native-node-startup-and-authenticated-health');
-  mock = await startMockProvider();
   const baseUrl = 'http://127.0.0.1:7860';
   const stateFile = path.join(reportDir, 'chat-state.json');
   console.log('Exercising streaming, stop, provider errors and persistent storage in embedded Node.');
@@ -551,15 +534,69 @@ try {
     });
   }
 
-  // Reuse the already built app/test bundle. The extra devices only exercise
-  // viewport/keyboard and iPad popover behavior, not the entire API suite.
-  report.screenVariants = [];
+}
+
+try {
+  await checkpoint('environment');
+  assert.equal(process.platform, 'darwin', 'This validation requires macOS and Xcode');
+  assert.equal(process.arch, 'arm64', 'The pinned Node framework has an ARM64 simulator slice only');
+  const xcodeVersion = await run('xcodebuild', ['-version']);
+  const simulatorSDK = await run('xcrun', ['--sdk', 'iphonesimulator', '--show-sdk-version']);
+  const sdkFamily = simulatorSDK.split('.').slice(0, 2).join('.');
+  report.toolchain = { xcodeVersion, simulatorSDK };
+  const launchHelp = await run('xcrun', ['simctl', 'help', 'launch']);
+  await writeFile(path.join(reportDir, 'simctl-launch-help.txt'), launchHelp + '\n');
+  assert.ok(launchHelp.includes('--stdout') && launchHelp.includes('--stderr'), 'Installed simctl lacks file output redirection');
+  const { runtimes } = JSON.parse(await run('xcrun', ['simctl', 'list', 'runtimes', '-j']));
+  const { devicetypes } = JSON.parse(await run('xcrun', ['simctl', 'list', 'devicetypes', '-j']));
   const variants = [
     { key: 'compact-phone', type: devicetypes.find((item) => item.identifier.endsWith('.iPhone-SE-3rd-generation'))
       ?? devicetypes.find((item) => item.identifier.endsWith('.iPhone-13-mini')), files: false },
     { key: 'ipad', type: devicetypes.find((item) => item.identifier.endsWith('.iPad-mini-A17-Pro'))
       ?? devicetypes.find((item) => item.name.startsWith('iPad')), files: true },
-  ];
+  ].filter((variant) => requestedVariants.includes(variant.key));
+  const standaloneVariant = runsPrimary ? undefined : variants[0];
+  if (standaloneVariant) assert.ok(standaloneVariant.type, `Required ${profile} simulator type is unavailable`);
+  if (!deviceId) {
+    const runtime = runtimes.filter((item) => item.isAvailable && item.identifier.includes('.iOS-')
+      && item.version.split('.').slice(0, 2).join('.') === sdkFamily)
+      .sort((a, b) => b.version.localeCompare(a.version, undefined, { numeric: true }))[0];
+    assert.ok(runtime, `No available iOS Simulator runtime matching SDK ${simulatorSDK}; select the matching Xcode or install its runtime`);
+    const type = standaloneVariant?.type ?? devicetypes.find((item) => item.identifier.endsWith('.iPhone-16-Pro'))
+      ?? devicetypes.filter((item) => item.name.startsWith('iPhone')).at(-1);
+    assert.ok(type, `No simulator device type for ${profile}`);
+    deviceId = await run('xcrun', ['simctl', 'create', `Marinar-${profile}-${Date.now()}`, type.identifier, runtime.identifier]);
+    ownedDevices.add(deviceId);
+  }
+  report.deviceId = deviceId;
+  const { devices } = JSON.parse(await run('xcrun', ['simctl', 'list', 'devices', '-j']));
+  const selected = Object.entries(devices).flatMap(([runtimeIdentifier, items]) =>
+    items.map((device) => ({ ...device, runtimeIdentifier }))).find((device) => device.udid === deviceId);
+  assert.ok(selected, 'Selected simulator is not listed by simctl');
+  if (standaloneVariant) assert.equal(selected.deviceTypeIdentifier, standaloneVariant.type.identifier,
+    `--device-id must match the selected ${profile} simulator type (${standaloneVariant.type.name})`);
+  const selectedRuntime = runtimes.find((runtime) => runtime.identifier === selected.runtimeIdentifier);
+  assert.ok(selectedRuntime, 'Cannot identify selected simulator runtime');
+  assert.equal(selectedRuntime.version.split('.').slice(0, 2).join('.'), sdkFamily,
+    'Selected simulator runtime must match the current Xcode simulator SDK');
+  report.simulator = { name: selected.name, deviceTypeIdentifier: selected.deviceTypeIdentifier,
+    runtimeIdentifier: selected.runtimeIdentifier, runtimeVersion: selectedRuntime.version,
+    runtimeBuildVersion: selectedRuntime.buildversion };
+  await checkpoint(`${runsPrimary ? 'primary' : profile}-simulator-boot`);
+  await run('xcrun', ['simctl', 'boot', deviceId], { allowFailure: true });
+  await run('xcrun', ['simctl', 'bootstatus', deviceId, '-b'], { log: 'simulator-boot.log' });
+  console.log('Building the native app and UI test bundle.');
+  await checkpoint('native-build');
+  const buildArgs = ['-project', project, '-scheme', 'Marinar', '-configuration', 'Debug',
+    '-destination', `platform=iOS Simulator,id=${deviceId}`, '-derivedDataPath', derived,
+    'CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO', 'CODE_SIGN_IDENTITY='];
+  await run('xcodebuild', ['build-for-testing', ...buildArgs], { log: 'simulator-build.log' });
+  mock = await startMockProvider();
+  if (runsPrimary) await runPrimaryChecks(buildArgs);
+
+  // "all" reuses the built bundle on additional devices. Standalone variants
+  // reuse only their own already booted build destination and seed fresh data;
+  // they do not run or claim the primary API, send or full restore suite.
   for (const variant of variants) {
     const errorsBefore = report.errors.length;
     const result = { key: variant.key, name: variant.type?.name, runtimeVersion: selectedRuntime.version, checks: [], status: 'running' };
@@ -569,14 +606,19 @@ try {
       await checkpoint(`${variant.key}-setup`);
       assert.ok(variant.type, `Required ${variant.key} simulator type is unavailable`);
       console.log(`Checking ${variant.key} portrait/landscape keyboard${variant.files ? ', blob export and system picker' : ''} with the existing build.`);
-      variantDevice = await run('xcrun', ['simctl', 'create', `Marinar-${variant.key}-${Date.now()}`, variant.type.identifier, selectedRuntime.identifier]);
-      deviceId = variantDevice;
-      ownedDevices.add(deviceId);
+      if (standaloneVariant) variantDevice = deviceId;
+      else {
+        variantDevice = await run('xcrun', ['simctl', 'create', `Marinar-${variant.key}-${Date.now()}`, variant.type.identifier, selectedRuntime.identifier]);
+        deviceId = variantDevice;
+        ownedDevices.add(deviceId);
+        await run('xcrun', ['simctl', 'boot', deviceId]);
+        await run('xcrun', ['simctl', 'bootstatus', deviceId, '-b'], { log: `${variant.key}-boot.log` });
+      }
       result.deviceId = deviceId;
-      await run('xcrun', ['simctl', 'boot', deviceId]);
-      await run('xcrun', ['simctl', 'bootstatus', deviceId, '-b'], { log: `${variant.key}-boot.log` });
       await run('xcrun', ['simctl', 'install', deviceId, path.join(derived, 'Build/Products/Debug-iphonesimulator/Marinar.app')]);
-      config = await launch();
+      const config = await launch();
+      report.coverage.actualEmbeddedNode = true;
+      result.checks.push('native-node-startup-and-authenticated-health');
       await prepareUI(config, path.join(reportDir, `${variant.key}-seed.json`));
       await stop();
       await preserveLaunchLogs();
@@ -590,9 +632,14 @@ try {
         phase: variant.key, log: `${variant.key}-ui-tests.log`,
         expectedTests: ['testComposerAcrossOrientations', ...(variant.files ? ['testBlobDownloadShareAndFilePicker'] : [])],
       });
-      if (tests.has('testComposerAcrossOrientations')) result.checks.push('portrait-and-landscape-composer-keyboard');
+      if (tests.has('testComposerAcrossOrientations')) {
+        report.coverage.actualWKWebView = true;
+        result.checks.push('portrait-and-landscape-composer-keyboard');
+      }
       if (variant.files && tests.has('testBlobDownloadShareAndFilePicker')) await collectCheck(`${variant.key}-file-integrity`, async () => {
         result.download = await verifyBlobDownload();
+        Object.assign(report.coverage, { actualWKWebView: true, nativeBlobDownload: true, nativeShareSheet: true,
+          systemFilePicker: true, nativeDialogs: true });
         result.checks.push('blob-export-popover', 'system-file-picker-cancel', 'system-file-picker-read-bytes');
       });
     } catch (error) { recordFailure(variant.key, error); }
@@ -602,7 +649,7 @@ try {
         await run('xcrun', ['simctl', 'spawn', variantDevice, 'log', 'show', '--last', '15m', '--style', 'compact', '--predicate', 'process == "Marinar"'], { log: `${variant.key}-app.log`, allowFailure: true }).catch(() => {});
         await stop().catch(() => {});
         await preserveLaunchLogs();
-        await run('xcrun', ['simctl', 'shutdown', variantDevice], { allowFailure: true }).catch(() => {});
+        if (ownedDevices.has(variantDevice)) await run('xcrun', ['simctl', 'shutdown', variantDevice], { allowFailure: true }).catch(() => {});
       }
       result.status = report.errors.length === errorsBefore ? 'passed' : 'failed';
       await checkpoint(`${variant.key}-finished`);
@@ -622,10 +669,14 @@ try {
   if (process.platform === 'darwin') await exportTestAttachments().catch((error) => {
     console.warn(`Could not export XCTest attachments: ${error.message}`);
   });
-  if (deviceId && process.platform === 'darwin') {
+  // Per-suite cleanup already preserved diagnostics before shutting down.
+  // Only a confirmed successful shutdown suppresses these device commands;
+  // failed or timed-out shutdowns still retain their errors and final cleanup.
+  const deviceAlreadyShutdown = shutdownDevices.has(deviceId);
+  if (deviceId && !deviceAlreadyShutdown && process.platform === 'darwin') {
     await run('xcrun', ['simctl', 'io', deviceId, 'screenshot', path.join(reportDir, `${report.status}-screen.png`)], { allowFailure: true }).catch(() => {});
   }
-  if (container) {
+  if (container && !deviceAlreadyShutdown) {
     // Preserve only test diagnostics, not launch-config.json or its boot token.
     await run('xcrun', ['simctl', 'spawn', deviceId, 'log', 'show', '--last', '15m', '--style', 'compact', '--predicate', 'process == "Marinar"'], { log: 'simulator-app.log', allowFailure: true }).catch(() => {});
     await stop().catch(() => {});
@@ -633,7 +684,9 @@ try {
   }
   if (mock) await mock.close();
   for (const owned of ownedDevices) {
-    await run('xcrun', ['simctl', 'shutdown', owned], { allowFailure: true }).catch((error) => recordFailure('simulator-cleanup', error));
+    if (!shutdownDevices.has(owned)) {
+      await run('xcrun', ['simctl', 'shutdown', owned], { allowFailure: true }).catch((error) => recordFailure('simulator-cleanup', error));
+    }
     await run('xcrun', ['simctl', 'delete', owned], { allowFailure: true }).catch((error) => recordFailure('simulator-cleanup', error));
   }
   if (report.errors.length) { report.status = 'failed'; process.exitCode = 1; }

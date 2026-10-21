@@ -1,5 +1,7 @@
 # Backing Up and Restoring Marinara
 
+> 이 문서는 원본 Marinara의 백업 안내입니다. 이 저장소의 iOS 앱은 백업 형식과 복원 절차가 다르므로 [한국어 README의 자료 가져오기와 백업 안내](../../README.md#자료-가져오기와-백업)를 따르세요.
+
 This guide shows the two ways to save a copy of everything in Marinara Engine, and how to put that copy back later. Use it before you upgrade, move to a new device, or reset your data.
 
 ## Two ways to save your data

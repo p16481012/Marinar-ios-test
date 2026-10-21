@@ -73,6 +73,7 @@ final class MarinarUITests: XCTestCase {
         let input = app.webViews.textViews.firstMatch
         XCTAssertTrue(input.waitForExistence(timeout: 60), "Actual chat composer missing after fixture chat selection")
         input.tap()
+        prepareSoftwareKeyboard()
         input.typeText(prompt)
         let send = app.webViews.buttons["Send"].firstMatch
         XCTAssertTrue(send.waitForExistence(timeout: 15))
@@ -94,9 +95,47 @@ final class MarinarUITests: XCTestCase {
         attachScreen("chat-restored")
     }
 
+    private func prepareSoftwareKeyboard() {
+        let keyboard = app.keyboards.firstMatch
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 15), "The software keyboard is not visible")
+        // A fresh simulator can show Apple's QuickPath introduction instead
+        // of keys. Its AX subtree varies, so require the observed tutorial
+        // text and a Continue button entirely in the keyboard, outside WebKit.
+        let tutorial = app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'Speed up your typing'")).firstMatch
+        let continueButton = app.buttons["Continue"].firstMatch
+        if tutorial.waitForExistence(timeout: 3) && continueButton.exists {
+            let buttonFrame = continueButton.frame
+            let webFrame = app.webViews["marinar-webview"].frame
+            let nativeButton = buttonFrame.width > 0 && buttonFrame.height > 0
+                && keyboard.frame.contains(buttonFrame) && !webFrame.intersects(buttonFrame)
+            if !nativeButton {
+                attachKeyboardDiagnostics("keyboard-tutorial-unexpected-placement")
+                XCTFail("Keyboard tutorial Continue is not inside the native keyboard")
+                return
+            }
+            XCTAssertTrue(continueButton.isEnabled)
+            XCTAssertTrue(continueButton.isHittable)
+            continueButton.tap()
+            expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: continueButton)
+            waitForExpectations(timeout: 15)
+        }
+        let hasKeys = keyboard.keys.firstMatch.waitForExistence(timeout: 15)
+        if !hasKeys { attachKeyboardDiagnostics("keyboard-keys-missing-before-input") }
+        XCTAssertTrue(hasKeys, "The keyboard has no usable keys")
+    }
+
+    private func attachKeyboardDiagnostics(_ name: String) {
+        attachScreen(name)
+        let hierarchy = XCTAttachment(string: app.debugDescription)
+        hierarchy.name = "\(name)-accessibility-hierarchy"
+        hierarchy.lifetime = .keepAlways
+        add(hierarchy)
+    }
+
     private func assertComposerAboveKeyboard(_ input: XCUIElement) {
         let keyboard = app.keyboards.firstMatch
         XCTAssertTrue(keyboard.waitForExistence(timeout: 15), "The software keyboard is not visible")
+        XCTAssertTrue(keyboard.keys.firstMatch.waitForExistence(timeout: 15), "The keyboard has no usable keys")
         if keyboard.exists {
             XCTAssertLessThanOrEqual(input.frame.maxY, keyboard.frame.minY + 2,
                                      "The software keyboard covers the chat composer")
@@ -112,6 +151,7 @@ final class MarinarUITests: XCTestCase {
         let input = app.webViews.textViews.firstMatch
         XCTAssertTrue(input.waitForExistence(timeout: 60))
         input.tap()
+        prepareSoftwareKeyboard()
         input.typeText("Layout check")
         assertComposerAboveKeyboard(input)
         XCTAssertTrue(app.webViews.buttons["Send"].firstMatch.isHittable)
@@ -241,14 +281,21 @@ final class MarinarUITests: XCTestCase {
         XCTAssertTrue(save.waitForExistence(timeout: 30), "The exported file cannot be saved through the native share sheet")
         attachScreen(screenshotName)
         let close = app.buttons["Close"].firstMatch
+        let dismissPopup = app.otherElements["PopoverDismissRegion"].firstMatch
         if close.waitForExistence(timeout: 15) { close.tap() }
-        else if UIDevice.current.userInterfaceIdiom == .pad {
-            // A popover may use outside-tap dismissal instead of a Close button.
-            app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.98)).tap()
-        } else { XCTFail("The native share sheet has no Close action") }
+        else if dismissPopup.waitForExistence(timeout: 5) {
+            // iOS can present this share UI as a popover on either device
+            // family. Use its observed native dismissal region, not a guessed
+            // point on the underlying page or an iPad-only assumption.
+            XCTAssertTrue(dismissPopup.isHittable, "The popover dismissal region is not available")
+            attachGeometry("\(screenshotName)-dismiss-geometry", elements: [("dismissPopup", dismissPopup),
+                ("popover", app.popovers.firstMatch)])
+            dismissPopup.tap()
+        } else { XCTFail("The native share UI has no available dismissal action") }
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: filename)
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: save)
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: close)
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: dismissPopup)
         waitForExpectations(timeout: 15)
     }
 }

@@ -57,10 +57,14 @@ jobs:
           include-hidden-files: true
           retention-days: 7
   ios:
-    name: iOS Simulator and unsigned IPA
+    name: iOS Simulator (${{ matrix.profile }})
     needs: runtime
     runs-on: macos-15
-    timeout-minutes: 50
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [primary, compact-phone, ipad]
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
     steps:
@@ -78,8 +82,47 @@ jobs:
           uname -m
           xcodebuild -version
       - run: node ios-app/scripts/download-node.mjs
-      - run: node ios-app/scripts/validate-simulator.mjs
-        timeout-minutes: 40
+      - run: node ios-app/scripts/validate-simulator.mjs --profile ${{ matrix.profile }} --report-dir ios-app/build/validation/${{ matrix.profile }} --derived-data ios-app/build/DerivedData-${{ matrix.profile }}
+        timeout-minutes: 28
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-validation-summary-${{ matrix.profile }}
+          path: |
+            ios-app/build/validation/**/simulator-validation.json
+            ios-app/build/validation/**/*export-events*.json
+            ios-app/build/validation/**/*ui-tests.log
+            ios-app/build/validation/**/*build.log
+            ios-app/build/validation/**/*.png
+            ios-app/build/validation/**/attachments/**/*.txt
+            ios-app/build/validation/**/attachments/**/manifest.json
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-validation-${{ matrix.profile }}
+          path: ios-app/build/validation
+          retention-days: 14
+  ipa:
+    name: Package validated device IPA
+    needs: [runtime, ios]
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: embedded-runtime
+          path: ios-app/build
+      - run: |
+          mkdir -p ios-app/Resources
+          tar -xzf ios-app/build/runtime.tar.gz -C ios-app/Resources
+      - run: node ios-app/scripts/download-node.mjs
       - name: Build device app
         run: >-
           xcodebuild -project ios-app/Marinar.xcodeproj -scheme Marinar
@@ -97,22 +140,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ios-validation-summary
-          path: |
-            ios-app/build/validation/simulator-validation.json
-            ios-app/build/validation/*export-events*.json
-            ios-app/build/validation/*ui-tests.log
-            ios-app/build/validation/*build.log
-            ios-app/build/validation/*.png
-            ios-app/build/validation/attachments/**/*.txt
-            ios-app/build/validation/attachments/**/*.png
-            ios-app/build/validation/attachments/**/manifest.json
-          retention-days: 14
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ios-validation
-          path: |
-            ios-app/build/validation
-            ios-app/build/device-build.log
+          name: ios-device-build
+          path: ios-app/build/device-build.log
           retention-days: 14
