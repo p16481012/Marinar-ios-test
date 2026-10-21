@@ -377,7 +377,7 @@ final class MarinarUITests: XCTestCase {
         // Deliver one real touch at the observed thumbnail center. This path
         // has been confirmed to reach Files' selection handler; keep the
         // URL delivery and actual byte-reading assertions below as well.
-        let fixtureCell = app.cells.containing(.staticText, identifier: fixture.label).firstMatch
+        let fixtureCell = revealFixtureCell(named: fixture.label)
         XCTAssertTrue(fixtureCell.waitForExistence(timeout: 10), "Fixture file cell is missing")
         XCTAssertTrue(fixtureCell.isEnabled, "Fixture file cannot be selected")
         let thumbnail = fixtureCell.images.firstMatch
@@ -389,6 +389,8 @@ final class MarinarUITests: XCTestCase {
             XCTAssertTrue(fixtureCell.frame.contains(thumbnailFrame), "The thumbnail is outside the expected file cell")
             XCTAssertTrue(fileView.frame.contains(thumbnailFrame) && app.frame.contains(thumbnailFrame),
                           "The file thumbnail is outside the visible picker")
+            XCTAssertTrue(filePickerViewport(fileView).contains(thumbnailFrame),
+                          "The file thumbnail is covered by the Files navigation or tab bar")
             attachScreen("system-file-before-selection")
             attachGeometry("system-file-before-selection-geometry", elements: [("app", app), ("fileView", fileView),
                 ("fixtureCell", fixtureCell), ("thumbnail", thumbnail)])
@@ -422,6 +424,64 @@ final class MarinarUITests: XCTestCase {
             "label CONTAINS %@ AND label CONTAINS 'restored-file-fixture'", fixtureFilename)).firstMatch
         XCTAssertTrue(imported.waitForExistence(timeout: 15), "WKWebView did not receive the selected file bytes")
         attachScreen("system-file-imported")
+    }
+
+    private func filePickerViewport(_ fileView: XCUIElement) -> CGRect {
+        var visible = fileView.frame.intersection(app.frame)
+        let navigation = app.navigationBars["FullDocumentManagerViewControllerNavigationBar"].firstMatch
+        let tabBar = app.tabBars["DOC.browsingModeTabBar"].firstMatch
+        if navigation.exists && visible.intersects(navigation.frame) {
+            let top = max(visible.minY, navigation.frame.maxY)
+            visible = CGRect(x: visible.minX, y: top, width: visible.width, height: max(0, visible.maxY - top))
+        }
+        if tabBar.exists && visible.intersects(tabBar.frame) {
+            visible.size.height = max(0, min(visible.maxY, tabBar.frame.minY) - visible.minY)
+        }
+        return visible
+    }
+
+    private func revealFixtureCell(named label: String) -> XCUIElement {
+        let cell = app.cells.containing(.staticText, identifier: label).firstMatch
+        let fileView = app.collectionViews["File View"].firstMatch
+        XCTAssertTrue(fileView.waitForExistence(timeout: 10), "The Files collection is missing")
+        XCTAssertTrue(cell.waitForExistence(timeout: 10), "Fixture file cell is missing")
+        var observations: [String] = []
+        defer {
+            let evidence = XCTAttachment(string: observations.joined(separator: "\n"))
+            evidence.name = "system-file-reveal-geometry"
+            evidence.lifetime = .keepAlways
+            add(evidence)
+        }
+        // Files exposes cells below its viewport through accessibility. Scroll
+        // the real collection before selecting; existence alone is insufficient.
+        // Refresh all geometry after each gesture, with at most six scrolls.
+        for attempt in 0...6 {
+            let fileFrame = fileView.frame
+            let visible = filePickerViewport(fileView)
+            let cellFrame = cell.frame
+            let thumbnail = cell.images.firstMatch
+            observations.append("attempt=\(attempt), app=\(app.frame), fileView=\(fileFrame), visible=\(visible), cell=\(cellFrame), thumbnail=\(thumbnail.exists ? thumbnail.frame : .zero)")
+            guard visible.width > 0, visible.height > 0, cellFrame.width > 0, cellFrame.height > 0 else { break }
+            if visible.contains(cellFrame) && cell.isHittable { return cell }
+            guard attempt < 6 else { break }
+            let direction: CGFloat
+            if cellFrame.maxY > visible.maxY { direction = -1 }
+            else if cellFrame.minY < visible.minY { direction = 1 }
+            else { break } // Do not guess a gesture for an otherwise obscured cell.
+            let origin = fileView.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+            let distance = visible.height * 0.3
+            let start = origin.withOffset(CGVector(dx: visible.midX - fileFrame.minX,
+                dy: visible.midY - direction * distance - fileFrame.minY))
+            let end = origin.withOffset(CGVector(dx: visible.midX - fileFrame.minX,
+                dy: visible.midY + direction * distance - fileFrame.minY))
+            observations.append("scroll=\(attempt + 1), start=\(start.screenPoint), end=\(end.screenPoint)")
+            attachScreen("system-file-before-scroll-\(attempt + 1)")
+            start.press(forDuration: 0.1, thenDragTo: end)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        }
+        attachScreen("system-file-could-not-reveal")
+        XCTFail("The exact fixture file row did not become fully visible and hittable after bounded Files scrolling")
+        return cell
     }
 
     private func openDocumentPicker(_ input: XCUIElement) -> XCUIElement {
