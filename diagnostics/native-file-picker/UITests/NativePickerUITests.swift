@@ -46,7 +46,11 @@ final class NativePickerUITests: XCTestCase {
         app.buttons["open-picker"].tap()
         XCTAssertTrue(cancel.waitForExistence(timeout: 90), "Reopened UIDocumentPicker did not become ready")
         evidence("picker-reopened")
-        let fixture = app.staticTexts.matching(NSPredicate(format: "label == %@ OR label == %@", filename, stem)).firstMatch
+        // The presenting native filename label remains in the AX tree behind the sheet.
+        // Search only the real File View collection observed in the system picker.
+        let fileView = app.collectionViews["File View"].firstMatch
+        XCTAssertTrue(fileView.waitForExistence(timeout: 15), "System Files collection is missing")
+        let fixture = fileView.staticTexts.matching(NSPredicate(format: "label == %@ OR label == %@", filename, stem)).firstMatch
         if !fixture.waitForExistence(timeout: 3) {
             for _ in 0..<5 {
                 let location = app.staticTexts.matching(NSPredicate(format: "label == 'On My iPhone' OR label == 'On My iPad'")).firstMatch
@@ -62,14 +66,14 @@ final class NativePickerUITests: XCTestCase {
             folder.tap()
         }
         XCTAssertTrue(fixture.waitForExistence(timeout: 30), "App-created JSON is absent from the system picker")
-        let cell = app.cells.containing(.staticText, identifier: fixture.label).firstMatch
+        let cell = fileView.cells.containing(.staticText, identifier: fixture.label).firstMatch
         XCTAssertTrue(cell.waitForExistence(timeout: 10), "The exact fixture file cell was not available")
         XCTAssertTrue(cell.isEnabled, "The JSON content type was rejected")
         evidence("before-real-file-touch")
         let thumbnail = cell.images.firstMatch
         if thumbnail.exists {
             let frame = thumbnail.frame
-            XCTAssertTrue(frame.width > 0 && frame.height > 0 && cell.frame.contains(frame) && app.frame.contains(frame))
+            XCTAssertTrue(frame.width > 0 && frame.height > 0 && cell.frame.contains(frame) && fileView.frame.contains(frame) && app.frame.contains(frame))
             let coordinate = thumbnail.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
             XCTAssertTrue(frame.contains(coordinate.screenPoint), "Touch lies outside the observed file thumbnail")
             let geometry = XCTAttachment(string: "thumbnail=\(frame); touch=\(coordinate.screenPoint); filename=\(filename)")
@@ -89,6 +93,7 @@ final class NativePickerUITests: XCTestCase {
         evidence("delegate-result")
         XCTAssertEqual(result, .completed,
                        "Expected real delegate callback and exact source bytes; current native status=\(status.exists ? status.label : "not-visible"). Cancellation, missing callback, and read errors are separate failures.")
-        XCTAssertFalse(app.otherElements["Browse View (Picker)"].firstMatch.exists, "System picker remained visible after success")
+        XCTAssertFalse(cancel.exists, "System picker remained visible after success")
+        XCTAssertTrue(app.buttons["open-picker"].isHittable, "Native app did not regain interaction after selection")
     }
 }

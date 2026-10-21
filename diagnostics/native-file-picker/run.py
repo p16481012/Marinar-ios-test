@@ -111,7 +111,10 @@ def main():
                   "-parallel-testing-enabled", "NO", "CODE_SIGNING_ALLOWED=NO", "CODE_SIGNING_REQUIRED=NO", "CODE_SIGN_IDENTITY="]
         run(["xcodebuild", "build-for-testing", *common], "build-for-testing", timeout=480)
         executable = derived / "Build" / "Products" / "Debug-iphonesimulator" / "NativePicker.app" / "NativePicker"
-        report["linkedLibraries"] = run(["otool", "-L", str(executable)], "linked-libraries").strip()
+        # Xcode 26 places Debug app code in a sibling .debug.dylib; inspect that too.
+        binaries = [executable, *sorted(executable.parent.glob("*.dylib"))]
+        report["inspectedBinaries"] = [p.name for p in binaries]
+        report["linkedLibraries"] = run(["otool", "-L", *[str(p) for p in binaries]], "linked-libraries").strip()
         if "NodeMobile" in report["linkedLibraries"] or "WebKit.framework" in report["linkedLibraries"]:
             raise RuntimeError("The control unexpectedly links NodeMobile or WebKit")
         # XCTest installs/launches the app before the app creates its unique fixture.
