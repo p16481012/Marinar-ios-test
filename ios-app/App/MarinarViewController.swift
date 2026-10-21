@@ -119,7 +119,7 @@ final class MarinarViewController: UIViewController, WKNavigationDelegate, WKUID
         timer?.invalidate()
         elapsed = 0
         lastPoll = Date()
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self.poll() }
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.poll() }
         poll()
     }
 
