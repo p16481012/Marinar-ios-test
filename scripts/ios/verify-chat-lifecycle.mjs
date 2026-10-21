@@ -157,11 +157,15 @@ export async function runChatPhase({ phase, baseUrl, providerUrl, stateFile, tok
   assert.equal(cookieOnly.status, 403, "The WebView session cookie alone must not authorize the native flush endpoint");
   const unsupported = await request("/api/sidecar/status");
   assert.equal(unsupported.status, 501, "Unsupported local runtimes must return an explicit unavailable status");
+  for (const route of ["/api/import/pick-folder", "/api/game-assets/pick-local-music-folder", "/api/game-assets/open-folder", "/api/fonts/open-folder"]) {
+    const result = await request(route, {});
+    assert.equal(result.status, 501, `${route} must not launch a desktop program`);
+  }
   const capabilities = await json("/api/ios/capabilities");
   assert.equal(capabilities.remoteApiChat, true);
   assert.equal(capabilities.fileStorage, true);
   assert.equal(capabilities.localModels, false);
-  state.checks.push("session-and-origin-isolation", "unsupported-capabilities-explicit");
+  state.checks.push("session-and-origin-isolation", "unsupported-capabilities-explicit", "desktop-folder-actions-unavailable");
 
   const normal = await generate(state.chatId, STREAM_PROMPT);
   assertReply(normal, STREAM_REPLY);

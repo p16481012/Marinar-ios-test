@@ -30,6 +30,10 @@ const result = await build({
 });
 await cp(path.join(root, 'scripts/bootstrap.cjs'), path.join(runtime, 'bootstrap.cjs'));
 await cp(path.join(repo, 'packages/server/src/db/default-preset.json'), path.join(runtime, 'default-preset.json'));
+// Assets are generated under this fixed runtime path; drop upstream removals too.
+const assetDestination = path.resolve(runtime, 'assets');
+if (path.relative(runtime, assetDestination) !== 'assets') throw new Error('Invalid generated asset path');
+await rm(assetDestination, { recursive: true, force: true });
 await cp(path.join(repo, 'packages/server/src/assets'), path.join(runtime, 'assets'), { recursive: true });
 await cp(path.join(repo, 'LICENSE'), path.join(runtime, 'LICENSE'));
 await cp(path.join(root, 'third-party/NodeMobile-LICENSE.txt'), path.join(runtime, 'NodeMobile-LICENSE.txt'));

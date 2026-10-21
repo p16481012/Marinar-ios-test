@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startMockProvider, STREAM_PROMPT, STREAM_REPLY } from '../../scripts/ios/mock-openai-provider.mjs';
@@ -20,8 +20,10 @@ let deviceId = option('--device-id');
 let ownedDevice = false;
 let mock;
 let container;
+let launchNumber = 0;
+const launchLogs = [];
 const report = { formatVersion: 1, status: 'running', checks: [], coverage: {
-  actualEmbeddedNode: true, actualWKWebView: true, nativeSendInteraction: true,
+  actualEmbeddedNode: false, actualWKWebView: false, nativeSendInteraction: false,
   externalProvider: false, physicalDevice: false, provider: 'local OpenAI-compatible fixture',
 } };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -46,7 +48,15 @@ async function run(command, commandArgs, { log, allowFailure = false } = {}) {
 }
 
 async function launch() {
-  await run('xcrun', ['simctl', 'launch', deviceId, bundleId]);
+  launchNumber += 1;
+  // The simulator can remap /tmp and /var paths. Its real app-container path
+  // avoids that ambiguity; copy the logs out before deleting our simulator.
+  const logs = path.join(container, 'Library/Logs');
+  await mkdir(logs, { recursive: true });
+  const stdout = path.join(logs, `app-${launchNumber}-stdout.log`);
+  const stderr = path.join(logs, `app-${launchNumber}-stderr.log`);
+  launchLogs.push(stdout, stderr);
+  await run('xcrun', ['simctl', 'launch', `--stdout=${stdout}`, `--stderr=${stderr}`, deviceId, bundleId]);
   const deadline = Date.now() + 300_000;
   let lastFailure = 'runtime preparation has not completed';
   while (Date.now() < deadline) {
@@ -74,6 +84,9 @@ async function stop() { await run('xcrun', ['simctl', 'terminate', deviceId, bun
 try {
   assert.equal(process.platform, 'darwin', 'This validation requires macOS and Xcode');
   assert.equal(process.arch, 'arm64', 'The pinned Node framework has an ARM64 simulator slice only');
+  const launchHelp = await run('xcrun', ['simctl', 'help', 'launch']);
+  await writeFile(path.join(reportDir, 'simctl-launch-help.txt'), launchHelp + '\n');
+  assert.ok(launchHelp.includes('--stdout') && launchHelp.includes('--stderr'), 'Installed simctl lacks file output redirection');
   if (!deviceId) {
     const { runtimes } = JSON.parse(await run('xcrun', ['simctl', 'list', 'runtimes', '-j']));
     const runtime = runtimes.filter((item) => item.isAvailable && item.identifier.includes('.iOS-'))
@@ -97,6 +110,7 @@ try {
   await run('xcrun', ['simctl', 'install', deviceId, path.join(derived, 'Build/Products/Debug-iphonesimulator/Marinar.app')]);
   container = await run('xcrun', ['simctl', 'get_app_container', deviceId, bundleId, 'data']);
   let config = await launch();
+  report.coverage.actualEmbeddedNode = true;
   report.checks.push('native-node-startup-and-authenticated-health');
   mock = await startMockProvider();
   const baseUrl = 'http://127.0.0.1:7860';
@@ -134,7 +148,11 @@ try {
     '-parallel-testing-enabled', 'NO', '-maximum-concurrent-test-simulator-destinations', '1',
     '-only-testing:MarinarUITests/MarinarUITests/testSendPersistsAfterProcessRelaunch',
     '-resultBundlePath', path.join(reportDir, 'MarinarUITests.xcresult')], { log: 'simulator-ui-tests.log' });
-  assert.ok(mock.calls.slice(callsBeforeUI).some((call) => call.kind === 'stream' && call.completed), 'UI test did not call the mock provider');
+  assert.ok(mock.calls.slice(callsBeforeUI).some((call) => call.kind === 'stream' && call.completed
+    && call.messages.some((message) => message.role === 'user' && JSON.stringify(message.content).includes(STREAM_PROMPT))),
+  'UI test did not send its typed prompt to the mock provider');
+  report.coverage.actualWKWebView = true;
+  report.coverage.nativeSendInteraction = true;
   await stop();
   config = await launch();
   const response = await fetch(`${baseUrl}/api/chats/${uiState.chatId}/messages`, {
@@ -155,10 +173,14 @@ try {
   process.exitCode = 1;
   console.error(error.message);
 } finally {
+  if (deviceId && process.platform === 'darwin') {
+    await run('xcrun', ['simctl', 'io', deviceId, 'screenshot', path.join(reportDir, `${report.status}-screen.png`)], { allowFailure: true }).catch(() => {});
+  }
   if (container) {
     // Preserve only test diagnostics, not launch-config.json or its boot token.
     await run('xcrun', ['simctl', 'spawn', deviceId, 'log', 'show', '--last', '15m', '--style', 'compact', '--predicate', 'process == "Marinar"'], { log: 'simulator-app.log', allowFailure: true }).catch(() => {});
     await stop().catch(() => {});
+    for (const file of launchLogs) await copyFile(file, path.join(reportDir, path.basename(file))).catch(() => {});
   }
   if (mock) await mock.close();
   if (ownedDevice) {

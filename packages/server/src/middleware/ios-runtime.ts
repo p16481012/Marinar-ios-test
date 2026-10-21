@@ -36,6 +36,10 @@ const UNSUPPORTED_PATHS = [
   "/api/multiplayer",
   "/api/sprites",
   "/api/admin/restart",
+  "/api/import/pick-folder",
+  "/api/game-assets/pick-local-music-folder",
+  "/api/game-assets/open-folder",
+  "/api/fonts/open-folder",
 ];
 
 export async function iosRuntimeHook(request: FastifyRequest, reply: FastifyReply) {

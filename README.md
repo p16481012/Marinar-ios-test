@@ -25,7 +25,7 @@ IPA는 서명되지 않은 파일입니다. 파일을 iPhone에 복사하는 것
 
 ### Mac에서 직접 빌드
 
-Apple Silicon Mac, Xcode 16 이상, Node.js 24, Corepack이 필요합니다. 대상 기기는 iOS/iPadOS 16 이상입니다. 현재 포함하는 Node 프레임워크의 시뮬레이터 아키텍처는 ARM64입니다.
+Apple Silicon Mac, Xcode 16 이상, Node.js 24, Corepack이 필요합니다. 빌드 대상은 iOS/iPadOS 16.4 이상입니다. 화면에 사용하는 [Tailwind의 Safari 요구 버전](https://tailwindcss.com/docs/compatibility)에 맞춘 최소 조건이며, 해당 버전 실기기의 동작 검증이 완료되었다는 뜻은 아닙니다. 현재 포함하는 Node 프레임워크의 시뮬레이터 아키텍처는 ARM64입니다.
 
 ```sh
 git clone https://github.com/p16481012/Marinar-ios-test.git
