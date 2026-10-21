@@ -116,8 +116,10 @@ node scripts/ios/run-transfer-lifecycle.mjs --entry ios-app/Resources/runtime/bo
 node scripts/ios/run-backup-ui.mjs --browser-channel chrome
 
 # Apple Silicon Mac: 내장 Node와 WKWebView를 실제 iOS 시뮬레이터에서 검사
-node ios-app/scripts/validate-simulator.mjs
+node ios-app/scripts/validate-simulator.mjs --simulator-ui --profile all
 ```
+
+화면 검사를 실행할 때는 Simulator의 **I/O → Keyboard → Connect Hardware Keyboard**를 끄고 소프트웨어 키보드가 표시되도록 설정하세요.
 
 검사는 localhost의 모의 API를 사용합니다. 실제 API 키나 유료 호출이 필요하지 않습니다. 호스트 서버 검사, 시뮬레이터 검사, 실기기 검증은 서로 구분하며, 검사 결과와 화면은 Actions 산출물에 보관합니다.
 

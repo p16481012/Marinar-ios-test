@@ -14,7 +14,7 @@ Pick the guide that matches the device you want to run Marinara on.
 | macOS or Linux | [macOS and Linux installation](installation/macos-linux.md) |
 | Docker or Podman | [Container installation](installation/containers.md) |
 | Android phone or tablet | [Download APK](https://github.com/Pasta-Devs/Marinara-Engine/releases/latest/download/marinara-engine-android.apk) · [Android installation guide](installation/android-termux.md) |
-| iPhone or iPad | [iOS and iPadOS](installation/ios-pwa.md) |
+| iPhone or iPad | [기기 내 실행형 iOS 앱](../README.md#설치) · [Safari/PWA 방식](installation/ios-pwa.md) |
 
 A few things to know before you pick:
 

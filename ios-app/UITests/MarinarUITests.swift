@@ -562,12 +562,23 @@ final class MarinarUITests: XCTestCase {
 
         let location = files.staticTexts.matching(NSPredicate(format:
             "label == 'On My iPhone' OR label == 'On My iPad'")).firstMatch
+        // iPad Files can open Recents with its locations sidebar collapsed.
+        // Open the observed sidebar once; Back there navigates history, not
+        // the folder hierarchy, and otherwise loops between Recents/Browse.
+        let sidebar = files.buttons["ToggleSideBar"].firstMatch
+        if !(location.exists && location.isHittable), sidebar.exists && sidebar.isEnabled && sidebar.isHittable {
+            sidebar.tap()
+            let visibleLocation = XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "exists == true AND hittable == true"), object: location)
+            _ = XCTWaiter.wait(for: [visibleLocation], timeout: 10)
+            attachSystemFilesEvidence("system-files-sidebar-opened")
+        }
         // Files may start in Recents or retain a browsed folder. Navigate
         // only through native elements actually exposed by the current UI.
         for _ in 0..<6 {
             if location.exists && location.isHittable { break }
             let back = files.navigationBars.buttons.matching(NSPredicate(format:
-                "label == 'Browse' OR label == 'Locations' OR label == 'Back' OR label == 'On My iPhone' OR label == 'On My iPad'")).firstMatch
+                "(label == 'Browse' OR label == 'Locations' OR label == 'Back' OR label == 'On My iPhone' OR label == 'On My iPad') AND identifier != 'DOC.navBarButton.backInHistory'")).firstMatch
             let browseTab = files.tabBars.buttons["Browse"].firstMatch
             let browse = files.buttons["Browse"].firstMatch
             if back.exists && back.isEnabled && back.isHittable { back.tap() }
