@@ -222,10 +222,27 @@ final class MarinarUITests: XCTestCase {
         // Select the restored chat from the real list even if DEBUG setup also
         // selected it. Merely reaching the restore-success banner is not enough.
         hittableWebElement(named: "Chats").tap()
-        let chat = app.webViews.staticTexts["iOS full restore UI original chat"].firstMatch
+        // WebKit exposes the sidebar's role=button row as one Button whose
+        // name combines the avatar initial, full chat name and Delete label.
+        // Require the exact observed fixture row, not a nonexistent StaticText.
+        let chatLabel = "i iOS full restore UI original chat Delete iOS full restore UI original chat"
+        let chatRows = app.webViews.buttons.matching(NSPredicate(format: "label == %@", chatLabel))
+        let chat = chatRows.firstMatch
         XCTAssertTrue(chat.waitForExistence(timeout: 30), "The original backup chat did not return to the actual chat list")
-        XCTAssertTrue(chat.isHittable, "The restored chat cannot be selected")
+        XCTAssertEqual(chatRows.count, 1, "The exact restored chat row is not unique")
+        XCTAssertTrue(chat.isEnabled && chat.isHittable, "The restored chat cannot be selected")
+        let closeChats = app.webViews.buttons["Close chats"].firstMatch
+        XCTAssertTrue(closeChats.exists && closeChats.isHittable, "The actual mobile chat list is not open")
+        attachScreen("settings-restore-before-selecting-original-chat")
+        let selectedChatEvidence = XCTAttachment(string: chat.label)
+        selectedChatEvidence.name = "settings-restore-selected-chat-row"
+        selectedChatEvidence.lifetime = .keepAlways
+        add(selectedChatEvidence)
         chat.tap()
+        // A successful mobile row selection closes the sidebar. Check that
+        // before prepareComposerForInput, which can itself dismiss the list.
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: closeChats)
+        waitForExpectations(timeout: 20)
         let input = prepareComposerForInput()
         let originalReply = "The blue lantern is remembered. 대화 저장을 확인했습니다."
         let restored = app.webViews.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", originalReply)).firstMatch
